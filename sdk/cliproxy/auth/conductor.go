@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -114,6 +115,104 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
 
+// usageExpirationTracker tracks trigger attempts per auth (in-memory only).
+// Thread-safe: all public methods acquire mu before accessing attempts map.
+type usageExpirationTracker struct {
+	mu       sync.Mutex
+	attempts map[string]*triggerAttempts // key: auth ID
+}
+
+// newUsageExpirationTracker creates an initialized tracker.
+func newUsageExpirationTracker() *usageExpirationTracker {
+	return &usageExpirationTracker{
+		attempts: make(map[string]*triggerAttempts),
+	}
+}
+
+// getOrCreate returns the triggerAttempts for an auth, creating if needed.
+// Caller must hold t.mu.
+func (t *usageExpirationTracker) getOrCreate(authID string) *triggerAttempts {
+	ta := t.attempts[authID]
+	if ta == nil {
+		ta = &triggerAttempts{}
+		t.attempts[authID] = ta
+	}
+	return ta
+}
+
+// tryBeginInFlight atomically sets inFlight if not already set.
+// Returns true if the caller acquired the in-flight guard.
+// Thread-safe: acquires mutex internally.
+func (t *usageExpirationTracker) tryBeginInFlight(authID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ta := t.getOrCreate(authID)
+	if ta.inFlight {
+		return false
+	}
+	ta.setInFlight(true)
+	return true
+}
+
+// tryRecordAttempt atomically checks the rate limit and records an attempt.
+// Returns true if under the limit and the attempt was recorded.
+// Thread-safe: acquires mutex internally.
+func (t *usageExpirationTracker) tryRecordAttempt(authID string, now time.Time, maxPerHour int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ta := t.getOrCreate(authID)
+	if !ta.canTriggerRateLimit(now, maxPerHour) {
+		return false
+	}
+	ta.recordAttempt(now)
+	return true
+}
+
+// clearInFlightForAuth clears the in-flight guard after trigger completes.
+// Thread-safe: acquires mutex internally.
+func (t *usageExpirationTracker) clearInFlightForAuth(authID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ta := t.attempts[authID]
+	if ta != nil {
+		ta.setInFlight(false)
+	}
+}
+
+type triggerAttempts struct {
+	count       int       // attempts in current hour window
+	windowStart time.Time // start of current hour window
+	lastAttempt time.Time // last trigger attempt time
+	inFlight    bool      // prevents overlapping trigger attempts
+}
+
+// canTriggerRateLimit checks if trigger is allowed based on rate limit only
+// (resets count if hour has passed).
+// Boundary rules:
+// - Use >= time.Hour for window reset (not >) to avoid off-by-one
+// - Initialize windowStart to now on first attempt (zero time check)
+func (t *triggerAttempts) canTriggerRateLimit(now time.Time, maxPerHour int) bool {
+	if t.windowStart.IsZero() {
+		t.windowStart = now // initialize on first use
+	}
+	if now.Sub(t.windowStart) >= time.Hour {
+		t.count = 0
+		t.windowStart = now
+	}
+	return t.count < maxPerHour
+}
+
+// recordAttempt increments the attempt count and updates lastAttempt time.
+func (t *triggerAttempts) recordAttempt(now time.Time) {
+	t.count++
+	t.lastAttempt = now
+}
+
+// setInFlight sets the in-flight guard to prevent concurrent triggers.
+func (t *triggerAttempts) setInFlight(inFlight bool) {
+	t.inFlight = inFlight
+}
+
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store     Store
@@ -154,6 +253,17 @@ type Manager struct {
 	pendingRefreshes map[string]bool
 	// quotaRefreshSettings stores the quota refresh configuration for 429 handler integration.
 	quotaRefreshSettings QuotaRefreshSettings
+
+	// Usage expiration trigger state
+	usageTracker   *usageExpirationTracker
+	usageTriggerMu sync.RWMutex // protects usageConfig and lastUsageCheck
+	usageConfig    internalconfig.UsageExpirationTriggerConfig
+	// lastUsageCheck tracks when each auth was last checked for usage expiration (key: auth ID)
+	lastUsageCheck map[string]time.Time
+	// lastUsageSweepLog throttles sweep-level logging for usage trigger checks.
+	lastUsageSweepLog time.Time
+	// usageTriggerSem limits concurrent usage trigger goroutines (capacity: 5)
+	usageTriggerSem chan struct{}
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -174,11 +284,32 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		quotaRefreshQueue:     make(chan string, 100),
 		unknownProviderLogged: make(map[string]bool),
 		pendingRefreshes:      make(map[string]bool),
+		usageTracker:          newUsageExpirationTracker(),
+		lastUsageCheck:        make(map[string]time.Time),
+		usageTriggerSem:       make(chan struct{}, 5), // bounded concurrency: 5 max
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	return manager
+}
+
+// SetUsageExpirationConfig updates the usage expiration trigger configuration.
+func (m *Manager) SetUsageExpirationConfig(cfg internalconfig.UsageExpirationTriggerConfig) {
+	if m == nil {
+		return
+	}
+	m.usageTriggerMu.Lock()
+	m.usageConfig = cfg
+	m.usageTriggerMu.Unlock()
+	log.Debugf(
+		"usage expiration trigger: config updated enabled=%t model=%s codex_model=%s max_retries_per_hour=%d check_interval=%s",
+		cfg.Enabled,
+		cfg.Model,
+		cfg.CodexModel,
+		cfg.MaxRetriesPerHour,
+		cfg.CheckInterval,
+	)
 }
 
 // SetQuotaRefreshSettings updates the quota refresh configuration for 429 handler integration.
@@ -477,11 +608,18 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	m.auths = make(map[string]*Auth, len(items))
+
+	// Validate persisted quota windows for all loaded auths.
+	// This clears stale windows older than StaleThreshold.
+	now := time.Now()
+	staleThreshold := m.quotaRefreshSettings.StaleThreshold
+
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
 		auth.EnsureIndex()
+		auth.validateQuotaWindows(now, staleThreshold)
 		m.auths[auth.ID] = auth.Clone()
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -489,6 +627,10 @@ func (m *Manager) Load(ctx context.Context) error {
 		cfg = &internalconfig.Config{}
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
+
+	// Validate quota providers after loading auths
+	go m.validateQuotaProviders()
+
 	return nil
 }
 
@@ -1171,9 +1313,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	var authProvider string
+	var quotaCfg QuotaRefreshSettings
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		authProvider = auth.Provider
+		quotaCfg = m.quotaRefreshSettings
 		now := time.Now()
 
 		if result.Success {
@@ -1281,6 +1427,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 
+	// Enqueue quota refresh on 429 if feature is enabled and provider is in enabled list.
+	// setModelQuota indicates a 429 was received for this auth.
+	if setModelQuota && quotaCfg.Enabled && slices.Contains(quotaCfg.EnabledProviders, authProvider) {
+		m.EnqueueQuotaRefresh([]string{result.AuthID})
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -1573,6 +1724,13 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	selType := ""
+	if m.selector != nil {
+		selType = fmt.Sprintf("%T", m.selector)
+	}
+	log.WithFields(log.Fields{
+		"selector": selType,
+	}).Debug("selector: pickNextMixed")
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
 		p := strings.TrimSpace(strings.ToLower(provider))
@@ -1692,6 +1850,13 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+	// Start quota refresh worker (processes 429-triggered requests) if queue is initialized
+	// Derive from ctx so worker stops when refreshCancel() is called
+	if m.quotaRefreshQueue != nil {
+		go m.quotaRefreshWorker(ctx)
+		// Trigger initial quota refresh for eligible auths on startup.
+		go m.enqueueInitialQuotaRefresh(ctx)
+	}
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1782,6 +1947,19 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 	// log.Debugf("checking refreshes")
 	now := time.Now()
 	snapshot := m.snapshotAuths()
+	m.usageTriggerMu.Lock()
+	cfg := m.usageConfig
+	lastSweep := m.lastUsageSweepLog
+	shouldLogSweep := cfg.Enabled && (cfg.CheckInterval <= 0 || lastSweep.IsZero() || now.Sub(lastSweep) >= cfg.CheckInterval)
+	if shouldLogSweep {
+		m.lastUsageSweepLog = now
+	}
+	m.usageTriggerMu.Unlock()
+	if shouldLogSweep {
+		log.WithFields(log.Fields{
+			"auth_count": len(snapshot),
+		}).Debug("usage expiration trigger: sweep")
+	}
 	for _, a := range snapshot {
 		typ, _ := a.AccountInfo()
 		if typ != "api_key" {
@@ -1797,6 +1975,8 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 				go m.refreshAuth(ctx, a.ID)
 			}
 		}
+		// Check usage expiration trigger for Claude OAuth accounts
+		m.checkAndTriggerUsageExpiration(ctx, a, now)
 	}
 }
 
@@ -2119,6 +2299,363 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+const claudeAPIBaseURL = "https://api.anthropic.com"
+const codexDefaultBaseURL = "https://chatgpt.com"
+
+// checkAndTriggerUsageExpiration checks if a Claude OAuth auth needs a usage trigger
+// and spawns an async goroutine to send a minimal prompt if so.
+// Runs async with bounded concurrency (max 5 concurrent) without blocking the auth refresh loop.
+func (m *Manager) checkAndTriggerUsageExpiration(ctx context.Context, auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+
+	// Read config atomically
+	m.usageTriggerMu.RLock()
+	cfg := m.usageConfig
+	lastCheck := m.lastUsageCheck[auth.ID]
+	m.usageTriggerMu.RUnlock()
+	loggable := cfg.Enabled && (cfg.CheckInterval <= 0 || lastCheck.IsZero() || now.Sub(lastCheck) >= cfg.CheckInterval)
+
+	// 1. Check if feature enabled
+	if !cfg.Enabled {
+		if loggable {
+			log.WithFields(log.Fields{"auth_id": auth.ID}).Debug("usage expiration trigger: skipped (disabled)")
+		}
+		return
+	}
+
+	// 2. Check if auth is Claude or Codex OAuth (not API key)
+	provider := ""
+	if m.isClaudeOAuth(auth) {
+		provider = "claude"
+	} else if m.isCodexOAuth(auth) {
+		provider = "codex"
+	}
+	if provider == "" {
+		if loggable {
+			typ, label := auth.AccountInfo()
+			email := ""
+			if auth.Metadata != nil {
+				if v, ok := auth.Metadata["email"].(string); ok {
+					email = strings.TrimSpace(v)
+				}
+			}
+			log.WithFields(log.Fields{
+				"auth_id":   auth.ID,
+				"provider":  auth.Provider,
+				"type":      typ,
+				"label":     label,
+				"has_email": email != "",
+			}).Debug("usage expiration trigger: skipped (not claude/codex oauth)")
+		}
+		return
+	}
+
+	// Emit a one-time eligibility log for Claude OAuth accounts to aid debugging.
+	if loggable {
+		expiry, hasExpiry := auth.ExpirationTime()
+		expiryStr := ""
+		if hasExpiry {
+			expiryStr = expiry.UTC().Format(time.RFC3339)
+		}
+		log.WithFields(log.Fields{
+			"auth_id":    auth.ID,
+			"provider":   auth.Provider,
+			"expires_at": expiryStr,
+			"has_expiry": hasExpiry,
+		}).Debug("usage expiration trigger: eligible auth")
+	}
+
+	// Skip if auth status is Error or Disabled
+	if auth.Status == StatusError || auth.Status == StatusDisabled || auth.Disabled {
+		if loggable {
+			log.WithFields(log.Fields{"auth_id": auth.ID}).Debug("usage expiration trigger: skipped (auth disabled)")
+		}
+		return
+	}
+
+	// 3. Check if check_interval has passed since last check
+	if cfg.CheckInterval > 0 && !lastCheck.IsZero() && now.Sub(lastCheck) < cfg.CheckInterval {
+		return
+	}
+
+	accessToken, _ := auth.Metadata["access_token"].(string)
+	if accessToken == "" {
+		if loggable {
+			log.WithFields(log.Fields{"auth_id": auth.ID}).Debug("usage expiration trigger: skipped (missing access_token)")
+		}
+		return
+	}
+
+	if loggable {
+		log.WithFields(log.Fields{
+			"auth_id":  auth.ID,
+			"provider": auth.Provider,
+		}).Debug("usage expiration trigger: eligible")
+	}
+
+	// Acquire semaphore slot (non-blocking check)
+	select {
+	case m.usageTriggerSem <- struct{}{}:
+		// Got slot, continue
+	default:
+		// Max concurrent triggers reached, skip this cycle (don't update lastUsageCheck)
+		log.WithFields(log.Fields{
+			"auth_id": auth.ID,
+			"reason":  "max_concurrent",
+		}).Debug("usage expiration trigger: skipped (max concurrent)")
+		return
+	}
+
+	// Update last check time only after acquiring semaphore
+	m.usageTriggerMu.Lock()
+	m.lastUsageCheck[auth.ID] = now
+	m.usageTriggerMu.Unlock()
+
+	// Spawn async goroutine for trigger check (semaphore release is in runUsageTrigger)
+	accountID := ""
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["account_id"].(string); ok {
+			accountID = strings.TrimSpace(v)
+		}
+	}
+	baseURL := ""
+	if provider == "codex" {
+		baseURL = codexBaseURL(auth)
+	}
+	go m.runUsageTrigger(ctx, auth, provider, accessToken, accountID, baseURL, cfg)
+}
+
+// isClaudeOAuth checks if an auth is a Claude OAuth account (not API key).
+func (m *Manager) isClaudeOAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider != "claude" {
+		return false
+	}
+	typ, _ := auth.AccountInfo()
+	return typ == "oauth"
+}
+
+// isCodexOAuth checks if an auth is a Codex OAuth account (not API key).
+func (m *Manager) isCodexOAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider != "codex" {
+		return false
+	}
+	typ, _ := auth.AccountInfo()
+	return typ == "oauth"
+}
+
+func codexBaseURL(auth *Auth) string {
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["base_url"]); v != "" {
+			return v
+		}
+	}
+	return codexDefaultBaseURL
+}
+
+// usageTriggerTimeout is the maximum time allowed for a usage trigger operation.
+const usageTriggerTimeout = 30 * time.Second
+
+// runUsageTrigger performs the async usage trigger workflow.
+// It checks usage, sends minimal prompt if needed, and logs results.
+// Releases the semaphore slot when done.
+func (m *Manager) runUsageTrigger(ctx context.Context, auth *Auth, provider, accessToken, accountID, baseURL string, cfg internalconfig.UsageExpirationTriggerConfig) {
+	defer func() {
+		<-m.usageTriggerSem // release semaphore slot
+	}()
+
+	authID := auth.ID
+
+	// Acquire in-flight guard so only one trigger runs per auth.
+	if !m.usageTracker.tryBeginInFlight(authID) {
+		log.WithFields(log.Fields{
+			"auth_id":  authID,
+			"eligible": false,
+			"reason":   "in_flight",
+		}).Debug("usage expiration trigger: already in flight")
+		return
+	}
+	defer m.usageTracker.clearInFlightForAuth(authID)
+
+	// Add timeout to prevent indefinite blocking
+	ctx, cancel := context.WithTimeout(ctx, usageTriggerTimeout)
+	defer cancel()
+
+	// Create usage client with auth's transport (respects proxy config)
+	var httpClient *http.Client
+	if rt := m.roundTripperFor(auth); rt != nil {
+		httpClient = &http.Client{Transport: rt}
+	}
+	clientBaseURL := claudeAPIBaseURL
+	model := cfg.Model
+	if provider == "codex" {
+		clientBaseURL = baseURL
+		model = cfg.CodexModel
+	}
+	client := NewUsageClient(httpClient, clientBaseURL)
+
+	switch provider {
+	case "codex":
+		usage, err := client.FetchCodexUsage(ctx, accessToken)
+		if err != nil {
+			log.Debugf("usage expiration trigger: fetch usage failed auth_id=%s err=%v", authID, err)
+			return
+		}
+		if !NeedsCodexUsageTrigger(usage) {
+			log.WithFields(log.Fields{
+				"auth_id":  authID,
+				"eligible": false,
+				"reason":   "no_trigger_needed",
+			}).Debug("usage expiration trigger: no trigger needed")
+			return
+		}
+		if !m.usageTracker.tryRecordAttempt(authID, time.Now(), cfg.MaxRetriesPerHour) {
+			log.WithFields(log.Fields{
+				"auth_id":  authID,
+				"eligible": false,
+				"reason":   "rate_limited",
+			}).Debug("usage expiration trigger: rate limited")
+			return
+		}
+		window := m.determineCodexWindow(usage)
+		log.WithFields(log.Fields{
+			"auth_id": authID,
+			"reason":  "null_reset_at",
+			"window":  window,
+			"model":   model,
+		}).Info("usage expiration trigger: sending minimal prompt")
+		err = client.SendCodexMinimalPrompt(ctx, model, accessToken, accountID)
+		if err != nil {
+			result := "network_error"
+			if strings.Contains(err.Error(), "429") {
+				result = "http_429"
+			} else if strings.Contains(err.Error(), "401") {
+				result = "http_401"
+			}
+			log.Debugf("usage expiration trigger: send prompt failed auth_id=%s window=%s result=%s model=%s err=%v", authID, window, result, model, err)
+			return
+		}
+		usageAfter, err := client.FetchCodexUsage(ctx, accessToken)
+		if err != nil {
+			log.Debugf("usage expiration trigger: verify fetch failed auth_id=%s window=%s model=%s err=%v", authID, window, model, err)
+			return
+		}
+		if NeedsCodexUsageTrigger(usageAfter) {
+			log.Debugf("usage expiration trigger: reset_at still invalid after prompt auth_id=%s window=%s model=%s", authID, window, model)
+			return
+		}
+		log.WithFields(log.Fields{
+			"auth_id": authID,
+			"reason":  "null_reset_at",
+			"window":  window,
+			"result":  "success",
+			"model":   model,
+		}).Info("usage expiration trigger: success")
+	default:
+		usage, err := client.FetchUsage(ctx, "", accessToken)
+		if err != nil {
+			log.Debugf("usage expiration trigger: fetch usage failed auth_id=%s err=%v", authID, err)
+			return
+		}
+		if !NeedsUsageTrigger(usage) {
+			log.WithFields(log.Fields{
+				"auth_id":  authID,
+				"eligible": false,
+				"reason":   "no_trigger_needed",
+			}).Debug("usage expiration trigger: no trigger needed")
+			return
+		}
+		if !m.usageTracker.tryRecordAttempt(authID, time.Now(), cfg.MaxRetriesPerHour) {
+			log.WithFields(log.Fields{
+				"auth_id":  authID,
+				"eligible": false,
+				"reason":   "rate_limited",
+			}).Debug("usage expiration trigger: rate limited")
+			return
+		}
+		window := m.determineWindow(usage)
+		log.WithFields(log.Fields{
+			"auth_id": authID,
+			"reason":  "null_resets_at",
+			"window":  window,
+			"model":   model,
+		}).Info("usage expiration trigger: sending minimal prompt")
+		err = client.SendMinimalPrompt(ctx, model, accessToken)
+		if err != nil {
+			result := "network_error"
+			if strings.Contains(err.Error(), "429") {
+				result = "http_429"
+			} else if strings.Contains(err.Error(), "401") {
+				result = "http_401"
+			}
+			log.Debugf("usage expiration trigger: send prompt failed auth_id=%s window=%s result=%s model=%s err=%v", authID, window, result, model, err)
+			return
+		}
+		usageAfter, err := client.FetchUsage(ctx, "", accessToken)
+		if err != nil {
+			log.Debugf("usage expiration trigger: verify fetch failed auth_id=%s window=%s model=%s err=%v", authID, window, model, err)
+			return
+		}
+		if NeedsUsageTrigger(usageAfter) {
+			log.Debugf("usage expiration trigger: resets_at still null after prompt auth_id=%s window=%s model=%s", authID, window, model)
+			return
+		}
+		log.WithFields(log.Fields{
+			"auth_id": authID,
+			"reason":  "null_resets_at",
+			"window":  window,
+			"result":  "success",
+			"model":   model,
+		}).Info("usage expiration trigger: success")
+	}
+}
+
+// determineWindow returns which window(s) need triggering based on usage response.
+func (m *Manager) determineWindow(usage *UsageResponse) string {
+	if usage == nil {
+		return "both"
+	}
+	fiveHourNull := usage.FiveHour == nil || usage.FiveHour.ResetsAt == nil || *usage.FiveHour.ResetsAt == ""
+	sevenDayNull := usage.SevenDay == nil || usage.SevenDay.ResetsAt == nil || *usage.SevenDay.ResetsAt == ""
+	if fiveHourNull && sevenDayNull {
+		return "both"
+	}
+	if fiveHourNull {
+		return "five_hour"
+	}
+	if sevenDayNull {
+		return "seven_day"
+	}
+	return "none"
+}
+
+func (m *Manager) determineCodexWindow(usage *CodexUsageResponse) string {
+	if usage == nil {
+		return "both"
+	}
+	primaryNull := usage.RateLimit.PrimaryWindow == nil || usage.RateLimit.PrimaryWindow.ResetAt <= 0
+	secondaryNull := usage.RateLimit.SecondaryWindow == nil || usage.RateLimit.SecondaryWindow.ResetAt <= 0
+	if primaryNull && secondaryNull {
+		return "both"
+	}
+	if primaryNull {
+		return "primary"
+	}
+	if secondaryNull {
+		return "secondary"
+	}
+	return "none"
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

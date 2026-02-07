@@ -82,6 +82,13 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+# Usage expiration trigger: sends minimal prompts to refresh null resets_at timestamps.
+# usage-expiration-trigger:
+#   enabled: false                        # Enable the feature (default: false)
+#   model: "claude-3-5-haiku-latest"      # Model to use for minimal prompt (default: claude-3-5-haiku-latest)
+#   codex_model: "gpt-5-codex-mini"       # Codex model to use for minimal prompt (default: gpt-5-codex-mini)
+#   max_retries_per_hour: 3               # Max trigger attempts per auth per hour (default: 3)
+#   check_interval: 5m                    # How often to check for null resets_at (default: 5m)
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
