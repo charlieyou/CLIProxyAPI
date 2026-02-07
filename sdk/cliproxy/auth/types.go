@@ -58,6 +58,8 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// QuotaWindows tracks quota window information fetched on 429 responses.
+	QuotaWindows QuotaWindowState `json:"quota_windows,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -75,6 +77,26 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+}
+
+// QuotaWindow represents a single usage window with its reset time.
+type QuotaWindow struct {
+	// Name identifies the window (e.g., "primary", "secondary", "five_hour", "seven_day", "gemini:<modelId>")
+	Name string `json:"name"`
+	// ResetAt is when this window resets.
+	ResetAt time.Time `json:"reset_at"`
+	// UsedPercent is the current usage percentage (0-100).
+	UsedPercent float64 `json:"used_percent,omitempty"`
+}
+
+// QuotaWindowState tracks quota window information fetched on 429 responses.
+type QuotaWindowState struct {
+	// Windows contains all known quota windows for this credential.
+	Windows []QuotaWindow `json:"windows,omitempty"`
+	// LastFetchedAt is when quota info was last successfully fetched (on 429).
+	LastFetchedAt time.Time `json:"last_fetched_at,omitempty"`
+	// LastFetchError stores the last fetch failure for debugging.
+	LastFetchError *Error `json:"last_fetch_error,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -119,8 +141,36 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
 	}
+	// Deep copy QuotaWindows to avoid sharing slice backing array and pointer.
+	if len(a.QuotaWindows.Windows) > 0 {
+		copyAuth.QuotaWindows.Windows = make([]QuotaWindow, len(a.QuotaWindows.Windows))
+		copy(copyAuth.QuotaWindows.Windows, a.QuotaWindows.Windows)
+	}
+	if a.QuotaWindows.LastFetchError != nil {
+		copyAuth.QuotaWindows.LastFetchError = &Error{
+			Code:       a.QuotaWindows.LastFetchError.Code,
+			Message:    a.QuotaWindows.LastFetchError.Message,
+			Retryable:  a.QuotaWindows.LastFetchError.Retryable,
+			HTTPStatus: a.QuotaWindows.LastFetchError.HTTPStatus,
+		}
+	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// validateQuotaWindows clears stale quota window data.
+// NOTE: Takes `now time.Time` parameter for consistent time comparisons and testability
+// (allows injection of a fake clock in tests). Caller should pass time.Now() at the edge.
+func (a *Auth) validateQuotaWindows(now time.Time, staleThreshold time.Duration) {
+	if a == nil {
+		return
+	}
+	if a.QuotaWindows.LastFetchedAt.IsZero() {
+		return
+	}
+	if now.Sub(a.QuotaWindows.LastFetchedAt) > staleThreshold {
+		a.QuotaWindows.Windows = nil // Treat as unknown
+	}
 }
 
 func stableAuthIndex(seed string) string {

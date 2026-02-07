@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,6 +145,15 @@ type Manager struct {
 
 	// Auto refresh state
 	refreshCancel context.CancelFunc
+
+	// Quota refresh work queue for async refresh requests (capacity: 100).
+	quotaRefreshQueue chan string
+	// Tracks which auths have logged unknown provider warning (prevents log spam).
+	unknownProviderLogged map[string]bool
+	// Tracks auth IDs currently pending or in-flight for quota refresh (prevents duplicate enqueues).
+	pendingRefreshes map[string]bool
+	// quotaRefreshSettings stores the quota refresh configuration for 429 handler integration.
+	quotaRefreshSettings QuotaRefreshSettings
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -155,17 +165,30 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:           store,
-		executors:       make(map[string]ProviderExecutor),
-		selector:        selector,
-		hook:            hook,
-		auths:           make(map[string]*Auth),
-		providerOffsets: make(map[string]int),
+		store:                 store,
+		executors:             make(map[string]ProviderExecutor),
+		selector:              selector,
+		hook:                  hook,
+		auths:                 make(map[string]*Auth),
+		providerOffsets:       make(map[string]int),
+		quotaRefreshQueue:     make(chan string, 100),
+		unknownProviderLogged: make(map[string]bool),
+		pendingRefreshes:      make(map[string]bool),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	return manager
+}
+
+// SetQuotaRefreshSettings updates the quota refresh configuration for 429 handler integration.
+func (m *Manager) SetQuotaRefreshSettings(cfg QuotaRefreshSettings) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.quotaRefreshSettings = cfg
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -586,7 +609,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
-			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
@@ -642,7 +664,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
-			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
@@ -698,7 +719,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
-			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
@@ -758,7 +778,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return out, nil
 	}
 }
-
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
@@ -1044,7 +1063,6 @@ func (m *Manager) normalizeProviders(providers []string) []string {
 	}
 	return result
 }
-
 func (m *Manager) retrySettings() (int, time.Duration) {
 	if m == nil {
 		return 0, 0
@@ -1142,7 +1160,6 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 		return nil
 	}
 }
-
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -1263,6 +1280,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -1554,62 +1572,6 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	}
 	return auth.Clone(), true
 }
-
-func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
-	m.mu.RLock()
-	executor, okExecutor := m.executors[provider]
-	if !okExecutor {
-		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
-	}
-	candidates := make([]*Auth, 0, len(m.auths))
-	modelKey := strings.TrimSpace(model)
-	// Always use base model name (without thinking suffix) for auth matching.
-	if modelKey != "" {
-		parsed := thinking.ParseSuffix(modelKey)
-		if parsed.ModelName != "" {
-			modelKey = strings.TrimSpace(parsed.ModelName)
-		}
-	}
-	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate.Provider != provider || candidate.Disabled {
-			continue
-		}
-		if _, used := tried[candidate.ID]; used {
-			continue
-		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-	if len(candidates) == 0 {
-		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	selected, errPick := m.selector.Pick(ctx, provider, model, opts, candidates)
-	if errPick != nil {
-		m.mu.RUnlock()
-		return nil, nil, errPick
-	}
-	if selected == nil {
-		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	authCopy := selected.Clone()
-	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
-		}
-		m.mu.Unlock()
-	}
-	return authCopy, executor, nil
-}
-
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -1660,6 +1622,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	// Get quota snapshots while holding RLock to avoid deadlock in Pick.
+	// Pass via opts.Metadata so Pick doesn't need to re-acquire the lock.
+	quotaSnapshots := m.getQuotaSnapshotsLocked(candidates)
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
+	opts.Metadata["quotaSnapshots"] = quotaSnapshots
 	selected, errPick := m.selector.Pick(ctx, "mixed", model, opts, candidates)
 	if errPick != nil {
 		m.mu.RUnlock()
@@ -1738,12 +1707,75 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}()
 }
 
-// StopAutoRefresh cancels the background refresh loop, if running.
+// StopAutoRefresh cancels the background refresh loop and quota worker, if running.
 func (m *Manager) StopAutoRefresh() {
 	if m.refreshCancel != nil {
 		m.refreshCancel()
 		m.refreshCancel = nil
 	}
+}
+
+// enqueueInitialQuotaRefresh queues initial quota refreshes for eligible auths.
+// This runs once at startup to populate quota windows before any 429s occur.
+func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+
+	m.mu.RLock()
+	cfg := m.quotaRefreshSettings
+	auths := make([]*Auth, 0, len(m.auths))
+	for _, a := range m.auths {
+		auths = append(auths, a.Clone())
+	}
+	m.mu.RUnlock()
+
+	if !cfg.Enabled || len(cfg.EnabledProviders) == 0 {
+		return
+	}
+
+	ids := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		if !slices.Contains(cfg.EnabledProviders, auth.Provider) {
+			continue
+		}
+		ids = append(ids, auth.ID)
+	}
+
+	if len(ids) == 0 {
+		log.WithFields(log.Fields{
+			"providers": cfg.EnabledProviders,
+		}).Debug("quota refresh initial check: no eligible auths")
+		return
+	}
+
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+	log.WithFields(log.Fields{
+		"count":     len(ids),
+		"providers": cfg.EnabledProviders,
+	}).Debug("quota refresh initial check: enqueuing auths")
+	for _, id := range ids {
+		log.WithFields(log.Fields{
+			"auth_id": id,
+		}).Debug("quota refresh initial enqueue")
+	}
+	m.EnqueueQuotaRefresh(ids)
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {
@@ -1753,18 +1785,17 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 	for _, a := range snapshot {
 		typ, _ := a.AccountInfo()
 		if typ != "api_key" {
-			if !m.shouldRefresh(a, now) {
-				continue
-			}
-			log.Debugf("checking refresh for %s, %s, %s", a.Provider, a.ID, typ)
+			if m.shouldRefresh(a, now) {
+				log.Debugf("checking refresh for %s, %s, %s", a.Provider, a.ID, typ)
 
-			if exec := m.executorFor(a.Provider); exec == nil {
-				continue
+				if exec := m.executorFor(a.Provider); exec == nil {
+					continue
+				}
+				if !m.markRefreshPending(a.ID, now) {
+					continue
+				}
+				go m.refreshAuth(ctx, a.ID)
 			}
-			if !m.markRefreshPending(a.ID, now) {
-				continue
-			}
-			go m.refreshAuth(ctx, a.ID)
 		}
 	}
 }
@@ -1777,6 +1808,50 @@ func (m *Manager) snapshotAuths() []*Auth {
 		out = append(out, a.Clone())
 	}
 	return out
+}
+
+// GetQuotaSnapshots returns immutable copies of QuotaWindowState for thread-safe reading.
+// Called by selector; Manager holds m.mu briefly to copy.
+//
+// WARNING: This method acquires RLock. Do NOT call from Selector.Pick while
+// pickNext already holds RLock, as this will deadlock when a writer is waiting.
+// Selectors should call this BEFORE pickNext or cache snapshots externally.
+// Nil auth entries are skipped.
+func (m *Manager) GetQuotaSnapshots(auths []*Auth) map[string]QuotaWindowState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getQuotaSnapshotsLocked(auths)
+}
+
+// getQuotaSnapshotsLocked returns immutable copies of QuotaWindowState.
+// REQUIRES: caller holds m.mu.RLock() or m.mu.Lock()
+// This is the lock-free version for use within pickNext which already holds RLock.
+func (m *Manager) getQuotaSnapshotsLocked(auths []*Auth) map[string]QuotaWindowState {
+	snapshots := make(map[string]QuotaWindowState, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		// Deep copy to ensure immutability
+		snap := QuotaWindowState{
+			LastFetchedAt: auth.QuotaWindows.LastFetchedAt,
+		}
+		// Deep copy LastFetchError pointer (same pattern as Auth.Clone)
+		if auth.QuotaWindows.LastFetchError != nil {
+			snap.LastFetchError = &Error{
+				Code:       auth.QuotaWindows.LastFetchError.Code,
+				Message:    auth.QuotaWindows.LastFetchError.Message,
+				Retryable:  auth.QuotaWindows.LastFetchError.Retryable,
+				HTTPStatus: auth.QuotaWindows.LastFetchError.HTTPStatus,
+			}
+		}
+		if len(auth.QuotaWindows.Windows) > 0 {
+			snap.Windows = make([]QuotaWindow, len(auth.QuotaWindows.Windows))
+			copy(snap.Windows, auth.QuotaWindows.Windows)
+		}
+		snapshots[auth.ID] = snap
+	}
+	return snapshots
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
@@ -2052,8 +2127,23 @@ func (m *Manager) executorFor(provider string) ProviderExecutor {
 	return m.executors[provider]
 }
 
-// roundTripperContextKey is an unexported context key type to avoid collisions.
-type roundTripperContextKey struct{}
+// RoundTripperContextKey is the context key type for storing HTTP RoundTripper.
+// Using a struct type avoids collisions with string keys.
+type RoundTripperContextKey struct{}
+
+// roundTripperContextKey is an alias for backward compatibility within this package.
+type roundTripperContextKey = RoundTripperContextKey
+
+// GetRoundTripperFromContext retrieves the HTTP RoundTripper from the context if present.
+func GetRoundTripperFromContext(ctx context.Context) (http.RoundTripper, bool) {
+	rt, ok := ctx.Value(RoundTripperContextKey{}).(http.RoundTripper)
+	return rt, ok && rt != nil
+}
+
+// WithRoundTripper returns a new context with the given RoundTripper stored.
+func WithRoundTripper(ctx context.Context, rt http.RoundTripper) context.Context {
+	return context.WithValue(ctx, RoundTripperContextKey{}, rt)
+}
 
 // roundTripperFor retrieves an HTTP RoundTripper for the given auth if a provider is registered.
 func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
@@ -2125,6 +2215,28 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 		ident := formatOauthIdentity(auth, provider, accountInfo)
 		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
+
+	// Log quota context for the selected auth to validate routing decisions.
+	if auth.QuotaWindows.LastFetchedAt.IsZero() && len(auth.QuotaWindows.Windows) == 0 {
+		entry.Debugf("quota selection: chosen auth provider=%s auth_id=%s model=%s window_count=0 last_fetched= preferred_window= preferred_reset=",
+			provider, auth.ID, model,
+		)
+		return
+	}
+
+	now := time.Now()
+	preferredWindow, preferredReset, _ := preferredResetAt(auth.QuotaWindows, model, now)
+	preferredResetStr := ""
+	if !preferredReset.IsZero() {
+		preferredResetStr = preferredReset.Format(time.RFC3339)
+	}
+	lastFetchedStr := ""
+	if !auth.QuotaWindows.LastFetchedAt.IsZero() {
+		lastFetchedStr = auth.QuotaWindows.LastFetchedAt.UTC().Format(time.RFC3339)
+	}
+	entry.Debugf("quota selection: chosen auth provider=%s auth_id=%s model=%s window_count=%d last_fetched=%s preferred_window=%s preferred_reset=%s",
+		provider, auth.ID, model, len(auth.QuotaWindows.Windows), lastFetchedStr, preferredWindow, preferredResetStr,
+	)
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {
@@ -2256,4 +2368,175 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
 	return exec.HttpRequest(ctx, auth, req)
+}
+
+// EnqueueQuotaRefresh adds auth IDs to the refresh work queue (non-blocking).
+// Uses pendingRefreshes map to deduplicate: if an auth ID is already pending
+// or in-flight, it won't be enqueued again. This prevents wasted work when
+// high QPS causes the same auth ID to be enqueued multiple times.
+func (m *Manager) EnqueueQuotaRefresh(authIDs []string) {
+	var deduped, dropped int
+
+	m.mu.Lock()
+	for _, id := range authIDs {
+		// Skip if already pending or in-flight
+		if m.pendingRefreshes[id] {
+			deduped++
+			continue
+		}
+
+		select {
+		case m.quotaRefreshQueue <- id:
+			// Enqueued successfully, mark as pending
+			m.pendingRefreshes[id] = true
+		default:
+			// Queue full, skip (will retry on next request)
+			dropped++
+		}
+	}
+	m.mu.Unlock()
+
+	// Increment metrics outside the lock to avoid coupling metrics
+	// instrumentation to core manager synchronization
+}
+
+// quotaRefreshWorker processes quota refresh requests from the queue.
+// Requests are enqueued when a 429 is received.
+// This is the single writer for QuotaWindows state.
+func (m *Manager) quotaRefreshWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case authID, ok := <-m.quotaRefreshQueue:
+			if !ok {
+				return // Channel closed
+			}
+			m.doQuotaRefresh(ctx, authID)
+		}
+	}
+}
+
+// doQuotaRefresh performs the actual quota fetch and updates state under lock.
+// Called by the worker when processing 429-triggered refresh requests.
+func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
+	// Clear pending flag immediately so new requests can be queued.
+	m.mu.Lock()
+	delete(m.pendingRefreshes, authID)
+	m.mu.Unlock()
+
+	// Step 1: Get auth info under lock and clone for use outside lock
+	m.mu.RLock()
+	auth := m.auths[authID]
+	if auth == nil {
+		m.mu.RUnlock()
+		return
+	}
+	providerKey := auth.Provider
+	authClone := auth.Clone() // Full clone preserves Attributes, Metadata, etc.
+	m.mu.RUnlock()
+
+	// Step 2: Perform network I/O outside lock
+	provider, ok := GetQuotaProvider(providerKey)
+	if !ok {
+		// Log once per auth to avoid spam
+		m.mu.Lock()
+		if !m.unknownProviderLogged[authID] {
+			log.WithFields(log.Fields{
+				"auth_id":  authID,
+				"provider": providerKey,
+			}).Warn("unknown provider for quota refresh, skipping")
+			m.unknownProviderLogged[authID] = true
+		}
+		m.mu.Unlock()
+		return
+	}
+
+	windows, err := provider.FetchWindows(ctx, authClone, "")
+
+	// Step 3: Apply results under lock
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	auth = m.auths[authID] // Re-find in case it was removed
+	if auth == nil {
+		return
+	}
+
+	// Check provider consistency: if provider changed during fetch, discard results
+	if auth.Provider != providerKey {
+		return
+	}
+
+	now := time.Now()
+
+	if err != nil {
+			auth.QuotaWindows.LastFetchedAt = now // Track when fetch was attempted (for staleness)
+			auth.QuotaWindows.LastFetchError = &Error{Message: err.Error()}
+			return
+		}
+
+	auth.QuotaWindows.Windows = windows
+	auth.QuotaWindows.LastFetchedAt = now
+	auth.QuotaWindows.LastFetchError = nil
+
+	// Debug log for successful quota fetches (useful for validating routing inputs).
+	soonestReset := time.Time{}
+	for _, window := range windows {
+		if window.ResetAt.IsZero() {
+			continue
+		}
+		if soonestReset.IsZero() || window.ResetAt.Before(soonestReset) {
+			soonestReset = window.ResetAt
+		}
+	}
+	soonestStr := ""
+	if !soonestReset.IsZero() {
+		soonestStr = soonestReset.Format(time.RFC3339)
+	}
+	log.WithFields(log.Fields{
+		"auth_id":       authID,
+		"provider":      providerKey,
+		"window_count":  len(windows),
+		"soonest_reset": soonestStr,
+	}).Debug("quota refresh success")
+}
+
+// validateQuotaProviders logs registered providers and warns about configuration issues.
+// Called during initialization to detect misconfiguration early.
+func (m *Manager) validateQuotaProviders() {
+	m.mu.RLock()
+	cfg := m.quotaRefreshSettings
+	m.mu.RUnlock()
+
+	if !cfg.Enabled {
+		return
+	}
+
+	registered := ListQuotaProviders()
+
+	// Log registered providers at startup for visibility
+	if len(registered) > 0 {
+		log.WithFields(log.Fields{
+			"count":     len(registered),
+			"providers": registered,
+		}).Info("quota providers registered")
+	} else {
+		// Critical warning: quota refresh enabled but no providers available
+		log.WithFields(log.Fields{
+			"enabled_providers": cfg.EnabledProviders,
+		}).Warn("quota-refresh.enabled=true but no quota providers registered; " +
+			"all providers will report unknown quota windows. " +
+			"Ensure blank import of quota package or call quota.InitQuotaProviders()")
+	}
+
+	// Warn about enabled providers that aren't registered
+	for _, provider := range cfg.EnabledProviders {
+		if _, ok := GetQuotaProvider(provider); !ok {
+			log.WithFields(log.Fields{
+				"provider":   provider,
+				"registered": registered,
+			}).Warn("enabled provider not registered")
+		}
+	}
 }
