@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -163,6 +164,72 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// QuotaRefresh configures reactive quota window fetching behavior.
+	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh" json:"quota-refresh"`
+
+	// UsageExpirationTrigger configures the usage expiration trigger feature.
+	UsageExpirationTrigger UsageExpirationTriggerConfig `yaml:"usage-expiration-trigger" json:"usage-expiration-trigger"`
+}
+
+// QuotaRefreshConfig configures reactive quota window fetching (on 429).
+// With the reactive approach, config is simplified: no polling intervals needed.
+type QuotaRefreshConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	ReadOnlyMode     bool          `yaml:"read_only_mode"`
+	StaleThreshold   time.Duration `yaml:"stale_threshold"` // Treat data older than this as unknown
+	EnabledProviders []string      `yaml:"enabled_providers"`
+}
+
+// DefaultQuotaRefreshConfig returns a QuotaRefreshConfig with default values.
+func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
+	return QuotaRefreshConfig{
+		Enabled:          false,
+		ReadOnlyMode:     false,
+		StaleThreshold:   1 * time.Hour, // Quota windows valid for 1 hour before considered stale
+		EnabledProviders: []string{},    // Empty by default; must be explicitly set
+	}
+}
+
+// Validate checks that enabled_providers contains only known provider keys.
+func (c *QuotaRefreshConfig) Validate() error {
+	// Validate provider keys match known providers.
+	// NOTE: We use string literals here instead of importing auth.ProviderKeyCodex etc.
+	// to avoid a circular import: config -> auth -> config.
+	validProviders := map[string]bool{"codex": true, "gemini-cli": true, "claude": true}
+	for _, p := range c.EnabledProviders {
+		if !validProviders[p] {
+			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: codex, gemini-cli, claude)", p)
+		}
+	}
+	return nil
+}
+
+// UsageExpirationTriggerConfig configures the usage expiration trigger feature.
+// When enabled, the system sends minimal prompts to refresh null resets_at timestamps.
+type UsageExpirationTriggerConfig struct {
+	// Enabled enables the usage expiration trigger feature (default: false)
+	Enabled bool `yaml:"enabled" mapstructure:"enabled"`
+	// Model specifies which model to use for the minimal prompt (default: "claude-3-5-haiku-latest")
+	Model string `yaml:"model" mapstructure:"model"`
+	// CodexModel specifies which model to use for the Codex minimal prompt (default: "gpt-5-codex-mini")
+	CodexModel string `yaml:"codex_model" mapstructure:"codex_model"`
+	// MaxRetriesPerHour limits trigger attempts per auth (default: 3)
+	MaxRetriesPerHour int `yaml:"max_retries_per_hour" mapstructure:"max_retries_per_hour"`
+	// CheckInterval controls how often to check for null resets_at (default: 5m)
+	// Note: This is independent of the 5s auth refresh loop - usage checks run on this slower cadence
+	CheckInterval time.Duration `yaml:"check_interval" mapstructure:"check_interval"`
+}
+
+// DefaultUsageExpirationTriggerConfig returns a UsageExpirationTriggerConfig with default values.
+func DefaultUsageExpirationTriggerConfig() UsageExpirationTriggerConfig {
+	return UsageExpirationTriggerConfig{
+		Enabled:           false,
+		Model:             "claude-3-5-haiku-latest",
+		CodexModel:        "gpt-5-codex-mini",
+		MaxRetriesPerHour: 3,
+		CheckInterval:     5 * time.Minute,
+	}
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -533,6 +600,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.Routing.UsageExpirationTrigger = DefaultUsageExpirationTriggerConfig()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -630,6 +698,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
 	// 	}
 	// }
+
+	// Validate quota refresh configuration.
+	if err := cfg.Routing.QuotaRefresh.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil
