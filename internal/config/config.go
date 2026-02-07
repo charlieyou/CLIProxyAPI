@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -163,7 +164,44 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// QuotaRefresh configures reactive quota window fetching behavior.
+	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh" json:"quota-refresh"`
 }
+
+// QuotaRefreshConfig configures reactive quota window fetching (on 429).
+// With the reactive approach, config is simplified: no polling intervals needed.
+type QuotaRefreshConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	ReadOnlyMode     bool          `yaml:"read_only_mode"`
+	StaleThreshold   time.Duration `yaml:"stale_threshold"` // Treat data older than this as unknown
+	EnabledProviders []string      `yaml:"enabled_providers"`
+}
+
+// DefaultQuotaRefreshConfig returns a QuotaRefreshConfig with default values.
+func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
+	return QuotaRefreshConfig{
+		Enabled:          false,
+		ReadOnlyMode:     false,
+		StaleThreshold:   1 * time.Hour, // Quota windows valid for 1 hour before considered stale
+		EnabledProviders: []string{},    // Empty by default; must be explicitly set
+	}
+}
+
+// Validate checks that enabled_providers contains only known provider keys.
+func (c *QuotaRefreshConfig) Validate() error {
+	// Validate provider keys match known providers.
+	// NOTE: We use string literals here instead of importing auth.ProviderKeyCodex etc.
+	// to avoid a circular import: config -> auth -> config.
+	validProviders := map[string]bool{"codex": true, "gemini-cli": true, "claude": true}
+	for _, p := range c.EnabledProviders {
+		if !validProviders[p] {
+			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: codex, gemini-cli, claude)", p)
+		}
+	}
+	return nil
+}
+
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
 // It maps the upstream model name (Name) to the client-visible alias (Alias).
@@ -630,6 +668,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
 	// 	}
 	// }
+
+	// Validate quota refresh configuration.
+	if err := cfg.Routing.QuotaRefresh.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil
