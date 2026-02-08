@@ -1693,6 +1693,12 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+	// Start quota refresh worker (processes 429-triggered requests) if queue is initialized.
+	// Derives from ctx so worker stops when refreshCancel() is called.
+	if m.quotaRefreshQueue != nil {
+		go m.quotaRefreshWorker(ctx)
+		go m.enqueueInitialQuotaRefresh(ctx)
+	}
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -2480,6 +2486,20 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	auth.QuotaWindows.Windows = windows
 	auth.QuotaWindows.LastFetchedAt = now
 	auth.QuotaWindows.LastFetchError = nil
+
+	// Propagate metadata updates from clone (e.g., refreshed access tokens).
+	// Quota providers may refresh tokens during fetch (e.g., gemini 401 retry).
+	// Only update if metadata actually changed to avoid unnecessary writes.
+	if authClone.Metadata != nil && auth.Metadata != nil {
+		if cloneToken, _ := authClone.Metadata["access_token"].(string); cloneToken != "" {
+			if origToken, _ := auth.Metadata["access_token"].(string); origToken != cloneToken {
+				auth.Metadata["access_token"] = cloneToken
+				if cloneTokenMap, ok := authClone.Metadata["token"].(map[string]any); ok {
+					auth.Metadata["token"] = cloneTokenMap
+				}
+			}
+		}
+	}
 
 	// Debug log for successful quota fetches (useful for validating routing inputs).
 	soonestReset := time.Time{}
