@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -556,15 +557,17 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		previousStrategy = normalizeStrategy(previousStrategy)
 		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
+		if s.coreManager != nil && (previousStrategy != nextStrategy || nextStrategy == "fill-first") {
+			quotaSettings := quotaSettingsFromConfig(newCfg)
 			var selector coreauth.Selector
 			switch nextStrategy {
 			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
+				selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
 			default:
 				selector = &coreauth.RoundRobinSelector{}
 			}
 			s.coreManager.SetSelector(selector)
+			s.coreManager.SetQuotaRefreshSettings(quotaSettings)
 		}
 
 		s.applyRetryConfig(newCfg)
@@ -578,6 +581,7 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.SetConfig(newCfg)
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+			s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(newCfg))
 		}
 		s.rebindExecutors()
 	}

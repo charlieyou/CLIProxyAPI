@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth/quota"
 	log "github.com/sirupsen/logrus"
 )
 

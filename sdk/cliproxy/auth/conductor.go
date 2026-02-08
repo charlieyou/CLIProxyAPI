@@ -1160,6 +1160,7 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 		return nil
 	}
 }
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -2471,10 +2472,10 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	now := time.Now()
 
 	if err != nil {
-			auth.QuotaWindows.LastFetchedAt = now // Track when fetch was attempted (for staleness)
-			auth.QuotaWindows.LastFetchError = &Error{Message: err.Error()}
-			return
-		}
+		auth.QuotaWindows.LastFetchedAt = now // Track when fetch was attempted (for staleness)
+		auth.QuotaWindows.LastFetchError = &Error{Message: err.Error()}
+		return
+	}
 
 	auth.QuotaWindows.Windows = windows
 	auth.QuotaWindows.LastFetchedAt = now

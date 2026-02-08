@@ -5,9 +5,11 @@ package cliproxy
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -152,6 +154,22 @@ func (b *Builder) WithLocalManagementPassword(password string) *Builder {
 	return b
 }
 
+func quotaSettingsFromConfig(cfg *config.Config) coreauth.QuotaRefreshSettings {
+	if cfg == nil {
+		return coreauth.QuotaRefreshSettings{}
+	}
+	qr := cfg.Routing.QuotaRefresh
+	if qr.StaleThreshold == 0 {
+		qr.StaleThreshold = internalconfig.DefaultQuotaRefreshConfig().StaleThreshold
+	}
+	return coreauth.QuotaRefreshSettings{
+		Enabled:          qr.Enabled,
+		ReadOnlyMode:     qr.ReadOnlyMode,
+		StaleThreshold:   qr.StaleThreshold,
+		EnabledProviders: qr.EnabledProviders,
+	}
+}
+
 // Build validates inputs, applies defaults, and returns a ready-to-run service.
 func (b *Builder) Build() (*Service, error) {
 	if b.cfg == nil {
@@ -203,15 +221,17 @@ func (b *Builder) Build() (*Service, error) {
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
 		}
+		quotaSettings := quotaSettingsFromConfig(b.cfg)
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
+			selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		coreManager.SetQuotaRefreshSettings(quotaSettings)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

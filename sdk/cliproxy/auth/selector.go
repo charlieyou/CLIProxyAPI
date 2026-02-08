@@ -540,12 +540,12 @@ func quotaMetricsFromSnapshot(snap QuotaWindowState, model string, now time.Time
 	// Fallback: Gemini model requested but no exact window match exists
 	// In this case, use soonest-expiring gemini:* window
 	useFallback := isGeminiModel && !hasExactGeminiMatch
-		if useFallback {
-			if logger != nil {
-				// Collect available model IDs for debugging
-				var availableModels []string
-				for _, w := range snap.Windows {
-					if strings.HasPrefix(w.Name, "gemini:") {
+	if useFallback {
+		if logger != nil {
+			// Collect available model IDs for debugging
+			var availableModels []string
+			for _, w := range snap.Windows {
+				if strings.HasPrefix(w.Name, "gemini:") {
 					availableModels = append(availableModels, strings.TrimPrefix(w.Name, "gemini:"))
 				}
 			}
