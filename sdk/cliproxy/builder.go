@@ -291,6 +291,9 @@ func (b *Builder) Build() (*Service, error) {
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
 	}
+	if b.cfg != nil {
+		coreManager.SetUsageExpirationConfig(b.cfg.Routing.UsageExpirationTrigger)
+	}
 
 	service := &Service{
 		cfg:            b.cfg,

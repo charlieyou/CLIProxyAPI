@@ -1336,6 +1336,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 		s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(newCfg))
+		s.coreManager.SetUsageExpirationConfig(newCfg.Routing.UsageExpirationTrigger)
 	}
 	ctx := coreauth.WithSkipPersist(context.Background())
 	s.syncPluginRuntimeConfig(ctx)

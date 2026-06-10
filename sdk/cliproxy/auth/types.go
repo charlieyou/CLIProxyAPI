@@ -206,6 +206,12 @@ type QuotaWindowState struct {
 	LastFetchedAt time.Time `json:"last_fetched_at,omitempty"`
 	// LastFetchError stores the last fetch failure for debugging.
 	LastFetchError *Error `json:"last_fetch_error,omitempty"`
+	// NextFetchAfter gates calls to the provider usage endpoint for this auth.
+	// Set when the provider returns 429; populated with Retry-After duration
+	// if the header is present, or a minimum floor otherwise. Shared between
+	// quota-refresh and usage-expiration-trigger since both hit the same
+	// endpoint.
+	NextFetchAfter time.Time `json:"next_fetch_after,omitempty"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
