@@ -259,6 +259,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
 	bodyForUpstream := body
+	var oauthOriginalToolNameMap map[string]string
+	if isClaudeOAuthToken(apiKey) {
+		oauthOriginalToolNameMap = util.ToolNameMapFromClaudeRequest(body)
+	}
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
@@ -405,7 +409,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 				streamUsage.PublishFailure(ctx, reporter, errRestore)
 				return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errRestore)
 			}
-			lines[i] = restoredLine
+			lines[i] = restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap)
 		}
 		streamUsage.Publish(ctx, reporter)
 		data = bytes.Join(lines, []byte("\n"))
@@ -420,6 +424,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, errRestore)
 			return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errRestore)
 		}
+	}
+	if !upstreamStream {
+		data = restoreOAuthToolNames(data, oauthOriginalToolNameMap)
 	}
 	data = e.restoreResponseModel(data, req.Model)
 	cacheClaudeThinkingReplayResponse(ctx, replayScope, data)

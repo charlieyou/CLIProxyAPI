@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // rewriteHostTransport rewrites the outbound request URL to hit a test server

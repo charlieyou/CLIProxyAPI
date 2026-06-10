@@ -251,6 +251,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
 	bodyForUpstream := body
+	var oauthOriginalToolNameMap map[string]string
+	if isClaudeOAuthToken(apiKey) {
+		oauthOriginalToolNameMap = util.ToolNameMapFromClaudeRequest(body)
+	}
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
@@ -430,7 +434,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
 					return
 				}
-				line = e.restoreResponseModel(restoredLine, req.Model)
+				line = e.restoreResponseModel(restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap), req.Model)
 				event.Write(line)
 				event.WriteByte('\n')
 				if len(bytes.TrimSpace(line)) == 0 {
@@ -485,7 +489,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
 				return
 			}
-			line = e.restoreResponseModel(restoredLine, req.Model)
+			line = e.restoreResponseModel(restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap), req.Model)
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
