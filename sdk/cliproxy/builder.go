@@ -9,6 +9,7 @@ import (
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -16,6 +17,24 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+// quotaSettingsFromConfig extracts the quota refresh settings from config.
+// Centralizes the config-to-settings mapping and defaults StaleThreshold when zero.
+func quotaSettingsFromConfig(cfg *config.Config) coreauth.QuotaRefreshSettings {
+	if cfg == nil {
+		return coreauth.QuotaRefreshSettings{}
+	}
+	qr := cfg.Routing.QuotaRefresh
+	if qr.StaleThreshold == 0 {
+		qr.StaleThreshold = internalconfig.DefaultQuotaRefreshConfig().StaleThreshold
+	}
+	return coreauth.QuotaRefreshSettings{
+		Enabled:          qr.Enabled,
+		ReadOnlyMode:     qr.ReadOnlyMode,
+		StaleThreshold:   qr.StaleThreshold,
+		EnabledProviders: qr.EnabledProviders,
+	}
+}
 
 // Builder constructs a Service instance with customizable providers.
 // It provides a fluent interface for configuring all aspects of the service
@@ -262,11 +281,12 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		routingState := normalizedRoutingRuntimeState(b.cfg)
-		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
+		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState, quotaSettingsFromConfig(b.cfg)), nil)
 		appliedRoutingState = &routingState
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
+	coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(b.cfg))
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 	if pluginHost != nil {

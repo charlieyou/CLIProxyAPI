@@ -201,6 +201,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Validate quota refresh configuration.
+	if err := cfg.Routing.QuotaRefresh.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
+
 	// Return the populated configuration struct.
 	return &cfg, nil
 }

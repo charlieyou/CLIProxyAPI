@@ -64,6 +64,14 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	m.refreshLoop = loop
 	m.mu.Unlock()
 
+	// Start quota refresh worker so reactive quota fetches (on 429) are actually processed.
+	if m.quotaRefreshQueue != nil {
+		go m.quotaRefreshWorker(ctx)
+		if m.quotaRefreshEnabled("") {
+			go m.enqueueInitialQuotaRefresh(ctx)
+		}
+	}
+
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
 }

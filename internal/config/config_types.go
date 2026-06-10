@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	"gopkg.in/yaml.v3"
@@ -371,7 +372,46 @@ type RoutingConfig struct {
 	// Antigravity, Gemini), maximizing prompt and KV cache reuse.
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
+
+	// QuotaRefresh configures reactive quota window fetching behavior.
+	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh" json:"quota-refresh"`
+
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+}
+
+// QuotaRefreshConfig configures reactive quota window fetching (on 429).
+// With the reactive approach, config is simplified: no polling intervals needed.
+type QuotaRefreshConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	ReadOnlyMode     bool          `yaml:"read_only_mode"`
+	StaleThreshold   time.Duration `yaml:"stale_threshold"`
+	EnabledProviders []string      `yaml:"enabled_providers"`
+}
+
+// DefaultQuotaRefreshConfig returns a QuotaRefreshConfig with default values.
+func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
+	return QuotaRefreshConfig{
+		Enabled:          false,
+		ReadOnlyMode:     false,
+		StaleThreshold:   1 * time.Hour,
+		EnabledProviders: []string{},
+	}
+}
+
+// Validate checks that enabled_providers contains only known provider keys.
+func (c *QuotaRefreshConfig) Validate() error {
+	validProviders := map[string]bool{
+		constant.Codex:     true,
+		constant.GeminiCLI: true,
+		constant.Claude:    true,
+	}
+	validKeys := []string{constant.Codex, constant.GeminiCLI, constant.Claude}
+	for _, p := range c.EnabledProviders {
+		if !validProviders[p] {
+			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: %s)", p, strings.Join(validKeys, ", "))
+		}
+	}
+	return nil
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

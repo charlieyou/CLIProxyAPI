@@ -197,6 +197,15 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+	// Quota refresh work queue for async refresh requests (capacity: 100).
+	quotaRefreshQueue chan string
+	// Tracks which providers have logged unknown provider warning (prevents log spam).
+	unknownProviderLogged map[string]bool
+	// Tracks auth IDs currently pending or in-flight for quota refresh.
+	pendingRefreshes map[string]bool
+	// quotaRefreshSettings stores the quota refresh configuration for 429 handler integration.
+	quotaRefreshSettings QuotaRefreshSettings
+
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
 	persistLocks sync.Map
 }
@@ -220,6 +229,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeRuntimeAuthOwners: make(map[string]map[string]*HomeDispatchSelection),
 		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
 		providerOffsets:       make(map[string]int),
+		quotaRefreshQueue:     make(chan string, 100),
+		unknownProviderLogged: make(map[string]bool),
+		pendingRefreshes:      make(map[string]bool),
 		modelPoolOffsets:      make(map[string]int),
 	}
 	// atomic.Value requires non-nil initial value.

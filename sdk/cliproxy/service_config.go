@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -62,13 +63,17 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+func newRoutingSelector(state routingRuntimeState, settings ...coreauth.QuotaRefreshSettings) coreauth.Selector {
+	var quotaSettings coreauth.QuotaRefreshSettings
+	if len(settings) > 0 {
+		quotaSettings = settings[0]
+	}
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
-		selector = &coreauth.FillFirstSelector{}
+		selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
@@ -214,8 +219,8 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
-	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState || routingState.strategy == "fill-first" {
+		s.coreManager.SetSelector(newRoutingSelector(routingState, quotaSettingsFromConfig(commit.cfg)))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
@@ -223,6 +228,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	if !s.coreManager.ApplyConfigWithCooldownStateStore(ctx, commit.cfg, store) {
 		return false
 	}
+	s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(commit.cfg))
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
 	return true
 }
