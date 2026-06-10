@@ -176,6 +176,12 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Quota refresh: fetch usage windows on 429 to drive fill-first routing.
+  # quota-refresh:
+  #   enabled: false              # Enable quota refresh (default: false)
+  #   read_only_mode: false       # If true, never modify auth state (default: false)
+  #   stale_threshold: 1h         # Treat cached windows older than this as unknown
+  #   enabled_providers: []       # Providers to enable (claude, codex, gemini-cli)
 
 # Codex provider behavior.
 codex:

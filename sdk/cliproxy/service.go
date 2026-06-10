@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -1295,11 +1296,13 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		previousSessionAffinity != nextSessionAffinity ||
 		previousSessionAffinityTTL != nextSessionAffinityTTL
 
-	if s.coreManager != nil && selectorChanged {
+	// Rebuild the fill-first selector on any reload so quota settings are picked up.
+	if s.coreManager != nil && (selectorChanged || nextStrategy == "fill-first") {
+		quotaSettings := quotaSettingsFromConfig(newCfg)
 		var selector coreauth.Selector
 		switch nextStrategy {
 		case "fill-first":
-			selector = &coreauth.FillFirstSelector{}
+			selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
@@ -1332,6 +1335,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+		s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(newCfg))
 	}
 	ctx := coreauth.WithSkipPersist(context.Background())
 	s.syncPluginRuntimeConfig(ctx)

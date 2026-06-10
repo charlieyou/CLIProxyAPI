@@ -12,7 +12,9 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
@@ -347,6 +349,44 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// QuotaRefresh configures reactive quota window fetching behavior.
+	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh" json:"quota-refresh"`
+}
+
+// QuotaRefreshConfig configures reactive quota window fetching (on 429).
+// With the reactive approach, config is simplified: no polling intervals needed.
+type QuotaRefreshConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	ReadOnlyMode     bool          `yaml:"read_only_mode"`
+	StaleThreshold   time.Duration `yaml:"stale_threshold"`
+	EnabledProviders []string      `yaml:"enabled_providers"`
+}
+
+// DefaultQuotaRefreshConfig returns a QuotaRefreshConfig with default values.
+func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
+	return QuotaRefreshConfig{
+		Enabled:          false,
+		ReadOnlyMode:     false,
+		StaleThreshold:   1 * time.Hour,
+		EnabledProviders: []string{},
+	}
+}
+
+// Validate checks that enabled_providers contains only known provider keys.
+func (c *QuotaRefreshConfig) Validate() error {
+	validProviders := map[string]bool{
+		constant.Codex:     true,
+		constant.GeminiCLI: true,
+		constant.Claude:    true,
+	}
+	validKeys := []string{constant.Codex, constant.GeminiCLI, constant.Claude}
+	for _, p := range c.EnabledProviders {
+		if !validProviders[p] {
+			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: %s)", p, strings.Join(validKeys, ", "))
+		}
+	}
+	return nil
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -819,6 +859,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
+
+	// Validate quota refresh configuration.
+	if err := cfg.Routing.QuotaRefresh.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil

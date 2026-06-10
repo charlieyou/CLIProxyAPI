@@ -89,6 +89,8 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// QuotaWindows tracks quota window information fetched on 429 responses.
+	QuotaWindows QuotaWindowState `json:"quota_windows,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -162,6 +164,48 @@ type RecentRequestBucket struct {
 	Time    string `json:"time"`
 	Success int64  `json:"success"`
 	Failed  int64  `json:"failed"`
+}
+
+type quotaRefreshTokenSink func(authID, accessToken string)
+
+type quotaRefreshTokenSinkKey struct{}
+
+// WithQuotaRefreshTokenSink stores a token update callback in the context for quota refreshes.
+// Quota providers can use this to persist refreshed access tokens without mutating auth clones.
+func WithQuotaRefreshTokenSink(ctx context.Context, sink quotaRefreshTokenSink) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, quotaRefreshTokenSinkKey{}, sink)
+}
+
+// QuotaRefreshTokenSinkFromContext retrieves the token update callback from context.
+func QuotaRefreshTokenSinkFromContext(ctx context.Context) (quotaRefreshTokenSink, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	sink, ok := ctx.Value(quotaRefreshTokenSinkKey{}).(quotaRefreshTokenSink)
+	return sink, ok && sink != nil
+}
+
+// QuotaWindow represents a single usage window with its reset time.
+type QuotaWindow struct {
+	// Name identifies the window (e.g., "primary", "secondary", "five_hour", "seven_day", "gemini:<modelId>")
+	Name string `json:"name"`
+	// ResetAt is when this window resets.
+	ResetAt time.Time `json:"reset_at"`
+	// UsedPercent is the current usage percentage (0-100).
+	UsedPercent float64 `json:"used_percent,omitempty"`
+}
+
+// QuotaWindowState tracks quota window information fetched on 429 responses.
+type QuotaWindowState struct {
+	// Windows contains all known quota windows for this credential.
+	Windows []QuotaWindow `json:"windows,omitempty"`
+	// LastFetchedAt is when quota info was last successfully fetched (on 429).
+	LastFetchedAt time.Time `json:"last_fetched_at,omitempty"`
+	// LastFetchError stores the last fetch failure for debugging.
+	LastFetchError *Error `json:"last_fetch_error,omitempty"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -280,6 +324,18 @@ func (a *Auth) Clone() *Auth {
 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
+		}
+	}
+	if len(a.QuotaWindows.Windows) > 0 {
+		copyAuth.QuotaWindows.Windows = make([]QuotaWindow, len(a.QuotaWindows.Windows))
+		copy(copyAuth.QuotaWindows.Windows, a.QuotaWindows.Windows)
+	}
+	if a.QuotaWindows.LastFetchError != nil {
+		copyAuth.QuotaWindows.LastFetchError = &Error{
+			Code:       a.QuotaWindows.LastFetchError.Code,
+			Message:    a.QuotaWindows.LastFetchError.Message,
+			Retryable:  a.QuotaWindows.LastFetchError.Retryable,
+			HTTPStatus: a.QuotaWindows.LastFetchError.HTTPStatus,
 		}
 	}
 	copyAuth.Runtime = a.Runtime

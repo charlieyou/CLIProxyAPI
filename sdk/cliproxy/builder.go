@@ -6,11 +6,13 @@ package cliproxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -18,6 +20,24 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+// quotaSettingsFromConfig extracts the quota refresh settings from config.
+// Centralizes the config-to-settings mapping and defaults StaleThreshold when zero.
+func quotaSettingsFromConfig(cfg *config.Config) coreauth.QuotaRefreshSettings {
+	if cfg == nil {
+		return coreauth.QuotaRefreshSettings{}
+	}
+	qr := cfg.Routing.QuotaRefresh
+	if qr.StaleThreshold == 0 {
+		qr.StaleThreshold = internalconfig.DefaultQuotaRefreshConfig().StaleThreshold
+	}
+	return coreauth.QuotaRefreshSettings{
+		Enabled:          qr.Enabled,
+		ReadOnlyMode:     qr.ReadOnlyMode,
+		StaleThreshold:   qr.StaleThreshold,
+		EnabledProviders: qr.EnabledProviders,
+	}
+}
 
 // Builder constructs a Service instance with customizable providers.
 // It provides a fluent interface for configuring all aspects of the service
@@ -236,7 +256,7 @@ func (b *Builder) Build() (*Service, error) {
 		sessionAffinityTTL := time.Hour
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
-			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
+			// Use universal session affinity when enabled.
 			sessionAffinity = b.cfg.Routing.SessionAffinity
 			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
 				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
@@ -244,10 +264,11 @@ func (b *Builder) Build() (*Service, error) {
 				}
 			}
 		}
+		quotaSettings := quotaSettingsFromConfig(b.cfg)
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
+			selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
@@ -261,6 +282,7 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		coreManager.SetQuotaRefreshSettings(quotaSettings)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

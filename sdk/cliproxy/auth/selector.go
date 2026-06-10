@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,10 +31,32 @@ type RoundRobinSelector struct {
 	maxKeys int
 }
 
-// FillFirstSelector selects the first available credential (deterministic ordering).
-// This "burns" one account before moving to the next, which can help stagger
-// rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+// QuotaRefreshSettings holds the quota refresh configuration values needed by the selector.
+// This mirrors the relevant fields from internal/config.QuotaRefreshConfig to avoid
+// a circular import between auth and config packages.
+type QuotaRefreshSettings struct {
+	Enabled          bool
+	ReadOnlyMode     bool
+	StaleThreshold   time.Duration
+	EnabledProviders []string
+}
+
+// FillFirstSelector routes requests to credentials based on quota window expiration.
+// When quota-aware routing is disabled, it falls back to deterministic ID ordering
+// ("burn" one account before moving to the next to stagger rolling-window subscription caps).
+type FillFirstSelector struct {
+	quotaSettings QuotaRefreshSettings
+	logger        *slog.Logger
+}
+
+// NewFillFirstSelector creates a FillFirstSelector with the required dependencies.
+// Pass an empty QuotaRefreshSettings (and nil logger) to disable quota-aware routing.
+func NewFillFirstSelector(quotaSettings QuotaRefreshSettings, logger *slog.Logger) *FillFirstSelector {
+	return &FillFirstSelector{
+		quotaSettings: quotaSettings,
+		logger:        logger,
+	}
+}
 
 type blockReason int
 
@@ -290,16 +314,373 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	}
 }
 
-// Pick selects the first available auth for the provider in a deterministic manner.
+// Pick selects the first available auth for the provider.
+// When quota-aware routing is enabled, quota snapshots are passed via
+// opts.Metadata["quotaSnapshots"] by the caller (pickNext) to avoid re-acquiring
+// the Manager lock and causing deadlock.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+
+	qs := s.quotaSettings
+
+	// If quota-aware routing is disabled or in read-only mode, use ID ordering.
+	if !qs.Enabled || qs.ReadOnlyMode {
+		sort.Slice(available, func(i, j int) bool {
+			return available[i].ID < available[j].ID
+		})
+		return available[0], nil
+	}
+
+	// Get snapshots from opts.Metadata (passed by pickNext to avoid lock re-entry).
+	var snapshots map[string]QuotaWindowState
+	if opts.Metadata != nil {
+		if snap, ok := opts.Metadata["quotaSnapshots"].(map[string]QuotaWindowState); ok {
+			snapshots = snap
+		}
+	}
+	if snapshots == nil {
+		// No snapshots provided - fall back to ID ordering for safety.
+		sort.Slice(available, func(i, j int) bool {
+			return available[i].ID < available[j].ID
+		})
+		return available[0], nil
+	}
+
+	staleThreshold := qs.StaleThreshold
+	enabledProviders := qs.EnabledProviders
+
+	type authSortData struct {
+		metrics quotaMetrics
+		tier    int
+	}
+	sortData := make(map[string]authSortData, len(available))
+
+	// Tier 0: enabled + known + has expiration (use first - drain expiring quotas)
+	// Tier 1: enabled + known + NO expiration  (use last among known - no urgency)
+	// Tier 2: enabled + unknown                (no quota data yet)
+	// Tier 3: disabled
+	getTier := func(enabled, known bool, metrics quotaMetrics) int {
+		if !enabled {
+			return 3
+		}
+		if !known {
+			return 2
+		}
+		if metrics.hasExpiration {
+			return 0
+		}
+		return 1
+	}
+
+	for _, auth := range available {
+		enabled := slices.Contains(enabledProviders, auth.Provider)
+		var metrics quotaMetrics
+		var known bool
+		if enabled {
+			metrics, known = quotaMetricsFromSnapshot(snapshots[auth.ID], model, now, staleThreshold, s.logger)
+		}
+		sortData[auth.ID] = authSortData{
+			metrics: metrics,
+			tier:    getTier(enabled, known, metrics),
+		}
+	}
+
+	for _, auth := range available {
+		data := sortData[auth.ID]
+		soonest, hasSoonest := soonestResetAt(snapshots[auth.ID], model, now)
+		soonestStr := ""
+		if hasSoonest {
+			soonestStr = soonest.Format(time.RFC3339)
+		}
+		log.Debugf("quota selection candidate auth_id=%s provider=%s tier=%d known=%t has_expiration=%t used_percent=%.2f soonest_reset=%s",
+			auth.ID,
+			auth.Provider,
+			data.tier,
+			data.tier < 2,
+			data.metrics.hasExpiration,
+			data.metrics.usedPercent,
+			soonestStr,
+		)
+	}
+
+	sort.Slice(available, func(i, j int) bool {
+		di := sortData[available[i].ID]
+		dj := sortData[available[j].ID]
+
+		if di.tier != dj.tier {
+			return di.tier < dj.tier
+		}
+
+		if di.tier == 0 {
+			cmp := compareQuotaMetrics(di.metrics, dj.metrics)
+			if cmp != 0 {
+				return cmp < 0
+			}
+		} else if di.tier == 1 {
+			if di.metrics.usedPercent != dj.metrics.usedPercent {
+				return di.metrics.usedPercent < dj.metrics.usedPercent
+			}
+		}
+
+		return available[i].ID < available[j].ID
+	})
+
 	return available[0], nil
+}
+
+// quotaMetrics holds the extracted quota window metrics for an auth.
+type quotaMetrics struct {
+	timeToReset   time.Duration
+	usedPercent   float64
+	hasExpiration bool
+}
+
+// quotaMetricsFromSnapshot extracts routing metrics from an immutable QuotaWindowState snapshot.
+// Returns the metrics for the soonest-expiring window and whether the data is known (not stale).
+func quotaMetricsFromSnapshot(snap QuotaWindowState, model string, now time.Time, staleThreshold time.Duration, logger *slog.Logger) (metrics quotaMetrics, known bool) {
+	if snap.LastFetchedAt.IsZero() || now.Sub(snap.LastFetchedAt) > staleThreshold {
+		return quotaMetrics{timeToReset: math.MaxInt64, usedPercent: 100, hasExpiration: false}, false
+	}
+
+	if len(snap.Windows) == 0 {
+		return quotaMetrics{timeToReset: math.MaxInt64, usedPercent: 100, hasExpiration: false}, false
+	}
+
+	isGeminiModel := model != "" && strings.HasPrefix(model, "gemini")
+
+	var hasExactGeminiMatch bool
+	if isGeminiModel {
+		for _, w := range snap.Windows {
+			if w.Name == "gemini:"+model {
+				hasExactGeminiMatch = true
+				break
+			}
+		}
+	}
+
+	useFallback := isGeminiModel && !hasExactGeminiMatch
+	if useFallback {
+		if logger != nil {
+			var availableModels []string
+			for _, w := range snap.Windows {
+				if strings.HasPrefix(w.Name, "gemini:") {
+					availableModels = append(availableModels, strings.TrimPrefix(w.Name, "gemini:"))
+				}
+			}
+			logger.Debug("gemini model filter fallback: no exact match, using soonest-expiring window",
+				"requested_model", model,
+				"available_models", availableModels,
+			)
+		}
+	}
+
+	// Prefer seven_day for Claude and secondary window for Codex to avoid 5-hour/primary bias.
+	if !isGeminiModel {
+		preferred := ""
+		for _, w := range snap.Windows {
+			switch w.Name {
+			case "seven_day", "five_hour":
+				preferred = "seven_day"
+			case "primary", "secondary":
+				if preferred == "" {
+					preferred = "secondary"
+				}
+			}
+		}
+		if preferred != "" {
+			for _, w := range snap.Windows {
+				if w.Name != preferred {
+					continue
+				}
+				if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+					break
+				}
+				timeToReset := w.ResetAt.Sub(now)
+				return quotaMetrics{timeToReset: timeToReset, usedPercent: w.UsedPercent, hasExpiration: true}, true
+			}
+		}
+	}
+
+	var bestTimeToReset time.Duration = -1
+	var bestUsedPercent float64 = -1
+
+	for _, w := range snap.Windows {
+		if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+			continue
+		}
+
+		if model != "" && strings.HasPrefix(w.Name, "gemini:") {
+			if !isGeminiModel {
+				continue
+			}
+			if !useFallback && w.Name != "gemini:"+model {
+				continue
+			}
+		}
+
+		timeToReset := w.ResetAt.Sub(now)
+
+		if bestTimeToReset < 0 || timeToReset < bestTimeToReset {
+			bestTimeToReset = timeToReset
+			bestUsedPercent = w.UsedPercent
+		} else if timeToReset == bestTimeToReset && w.UsedPercent < bestUsedPercent {
+			bestUsedPercent = w.UsedPercent
+		}
+	}
+
+	if bestTimeToReset < 0 {
+		var lowestUsedPercent float64 = -1
+		for _, w := range snap.Windows {
+			if model != "" && strings.HasPrefix(w.Name, "gemini:") {
+				if !isGeminiModel {
+					continue
+				}
+				if !useFallback && w.Name != "gemini:"+model {
+					continue
+				}
+			}
+			if lowestUsedPercent < 0 || w.UsedPercent < lowestUsedPercent {
+				lowestUsedPercent = w.UsedPercent
+			}
+		}
+		if lowestUsedPercent >= 0 {
+			return quotaMetrics{timeToReset: math.MaxInt64, usedPercent: lowestUsedPercent, hasExpiration: false}, true
+		}
+		return quotaMetrics{timeToReset: math.MaxInt64, usedPercent: 100, hasExpiration: false}, false
+	}
+
+	return quotaMetrics{timeToReset: bestTimeToReset, usedPercent: bestUsedPercent, hasExpiration: true}, true
+}
+
+// compareQuotaMetrics compares two quota metrics using 5-minute bucket equivalence.
+// Returns -1 if a is better, +1 if b is better, 0 if equal.
+func compareQuotaMetrics(a, b quotaMetrics) int {
+	if a.hasExpiration && !b.hasExpiration {
+		return -1
+	}
+	if !a.hasExpiration && b.hasExpiration {
+		return 1
+	}
+
+	if a.hasExpiration && b.hasExpiration {
+		const bucketSize = 5 * time.Minute
+		bucketA := a.timeToReset / bucketSize
+		bucketB := b.timeToReset / bucketSize
+		if bucketA < bucketB {
+			return -1
+		}
+		if bucketA > bucketB {
+			return 1
+		}
+	}
+
+	if a.usedPercent < b.usedPercent {
+		return -1
+	}
+	if a.usedPercent > b.usedPercent {
+		return 1
+	}
+
+	return 0
+}
+
+// soonestResetAt returns the earliest reset time (for fallback/debugging)
+// All windows are stored at Auth.QuotaWindows level; use name-based filtering for Gemini.
+func soonestResetAt(snap QuotaWindowState, model string, now time.Time) (time.Time, bool) {
+	isGeminiModel := model != "" && strings.HasPrefix(model, "gemini")
+
+	var hasExactGeminiMatch bool
+	if isGeminiModel {
+		for _, w := range snap.Windows {
+			if w.Name == "gemini:"+model {
+				hasExactGeminiMatch = true
+				break
+			}
+		}
+	}
+	useFallback := isGeminiModel && !hasExactGeminiMatch
+
+	var earliest time.Time
+	if !isGeminiModel {
+		preferred := ""
+		for _, w := range snap.Windows {
+			switch w.Name {
+			case "seven_day", "five_hour":
+				preferred = "seven_day"
+			case "primary", "secondary":
+				if preferred == "" {
+					preferred = "secondary"
+				}
+			}
+		}
+		if preferred != "" {
+			for _, w := range snap.Windows {
+				if w.Name != preferred {
+					continue
+				}
+				if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+					break
+				}
+				return w.ResetAt, true
+			}
+		}
+	}
+	for _, w := range snap.Windows {
+		if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+			continue
+		}
+		if model != "" && strings.HasPrefix(w.Name, "gemini:") {
+			if !isGeminiModel {
+				continue
+			}
+			if !useFallback && w.Name != "gemini:"+model {
+				continue
+			}
+		}
+		if earliest.IsZero() || w.ResetAt.Before(earliest) {
+			earliest = w.ResetAt
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
+// preferredResetAt returns the provider-specific preferred window reset time
+// (Claude=seven_day, Codex=secondary). Falls back to soonestResetAt when unavailable.
+func preferredResetAt(snap QuotaWindowState, model string, now time.Time) (string, time.Time, bool) {
+	isGeminiModel := model != "" && strings.HasPrefix(model, "gemini")
+	if !isGeminiModel {
+		preferred := ""
+		for _, w := range snap.Windows {
+			switch w.Name {
+			case "seven_day", "five_hour":
+				preferred = "seven_day"
+			case "primary", "secondary":
+				if preferred == "" {
+					preferred = "secondary"
+				}
+			}
+		}
+		if preferred != "" {
+			for _, w := range snap.Windows {
+				if w.Name != preferred {
+					continue
+				}
+				if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+					break
+				}
+				return preferred, w.ResetAt, true
+			}
+		}
+	}
+	if reset, ok := soonestResetAt(snap, model, now); ok {
+		return "soonest", reset, true
+	}
+	return "", time.Time{}, false
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
