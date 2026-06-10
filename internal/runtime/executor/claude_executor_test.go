@@ -2791,6 +2791,135 @@ func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 	}
 }
 
+func TestRestoreOAuthToolNames_TitleCaseRequestLowercaseResponse(t *testing.T) {
+	toolNameMap := map[string]string{
+		"bash": "Bash",
+		"read": "Read",
+		"task": "Task",
+	}
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{"cmd":"ls"}},{"type":"tool_reference","tool_name":"read"},{"type":"text","text":"ok"}]}`)
+
+	out := restoreOAuthToolNames(resp, toolNameMap)
+
+	if got := gjson.GetBytes(out, "content.0.name").String(); got != "Bash" {
+		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "content.1.tool_name").String(); got != "Read" {
+		t.Fatalf("content.1.tool_name = %q, want %q", got, "Read")
+	}
+	if got := gjson.GetBytes(out, "content.2.text").String(); got != "ok" {
+		t.Fatalf("content.2.text = %q, want %q", got, "ok")
+	}
+}
+
+func TestRestoreOAuthToolNames_LowercaseRequestTitleCaseResponse(t *testing.T) {
+	toolNameMap := map[string]string{"bash": "bash"}
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
+
+	out := restoreOAuthToolNames(resp, toolNameMap)
+
+	if got := gjson.GetBytes(out, "content.0.name").String(); got != "bash" {
+		t.Fatalf("content.0.name = %q, want %q", got, "bash")
+	}
+}
+
+func TestRestoreOAuthToolNamesFromStreamLine(t *testing.T) {
+	toolNameMap := map[string]string{"bash": "Bash", "read": "Read"}
+
+	t.Run("tool_use", func(t *testing.T) {
+		line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"bash","id":"toolu_01","input":{}},"index":0}`)
+		out := restoreOAuthToolNamesFromStreamLine(line, toolNameMap)
+		payload := bytes.TrimSpace(out)
+		if bytes.HasPrefix(payload, []byte("data:")) {
+			payload = bytes.TrimSpace(payload[len("data:"):])
+		}
+		if got := gjson.GetBytes(payload, "content_block.name").String(); got != "Bash" {
+			t.Fatalf("content_block.name = %q, want %q", got, "Bash")
+		}
+	})
+
+	t.Run("tool_reference", func(t *testing.T) {
+		line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_reference","tool_name":"read"},"index":0}`)
+		out := restoreOAuthToolNamesFromStreamLine(line, toolNameMap)
+		payload := bytes.TrimSpace(out)
+		if bytes.HasPrefix(payload, []byte("data:")) {
+			payload = bytes.TrimSpace(payload[len("data:"):])
+		}
+		if got := gjson.GetBytes(payload, "content_block.tool_name").String(); got != "Read" {
+			t.Fatalf("content_block.tool_name = %q, want %q", got, "Read")
+		}
+	})
+}
+
+func TestClaudeExecutor_Execute_OAuthRestoresOriginalToolNameCasing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet-20241022","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{"cmd":"printf hi"}},{"type":"tool_reference","tool_name":"read"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-oat-test-token",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","tools":[{"name":"Bash","input_schema":{"type":"object"}},{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "content.0.name").String(); got != "Bash" {
+		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.1.tool_name").String(); got != "Read" {
+		t.Fatalf("content.1.tool_name = %q, want %q", got, "Read")
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_OAuthRestoresOriginalToolNameCasing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"bash\",\"input\":{}},\"index\":0}\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_reference\",\"tool_name\":\"read\"},\"index\":1}\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-oat-test-token",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","tools":[{"name":"Bash","input_schema":{"type":"object"}},{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var out bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		out.Write(chunk.Payload)
+	}
+
+	if !strings.Contains(out.String(), `"name":"Bash"`) {
+		t.Fatalf("stream output missing restored Bash tool name: %s", out.String())
+	}
+	if !strings.Contains(out.String(), `"tool_name":"Read"`) {
+		t.Fatalf("stream output missing restored Read tool_reference name: %s", out.String())
+	}
+}
+
 func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
