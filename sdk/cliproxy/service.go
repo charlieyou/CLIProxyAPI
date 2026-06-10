@@ -736,6 +736,25 @@ func (s *Service) completeModelRegistrationForAuthWithCache(ctx context.Context,
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
 }
 
+func (s *Service) registerLoadedAuthModels(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	for _, item := range s.coreManager.List() {
+		if item == nil || item.ID == "" {
+			continue
+		}
+		auth, ok := s.coreManager.GetByID(item.ID)
+		if !ok || auth == nil {
+			continue
+		}
+		if !auth.Disabled {
+			s.ensureExecutorsForAuth(auth)
+		}
+		s.completeModelRegistrationForAuth(ctx, auth)
+	}
+}
+
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	if s == nil || id == "" {
 		return
@@ -1647,6 +1666,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.coreManager != nil && !homeEnabled {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
+		} else {
+			s.registerLoadedAuthModels(ctx)
 		}
 		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
 		if s.cfg.SaveCooldownStatus {

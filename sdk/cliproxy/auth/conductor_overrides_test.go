@@ -984,6 +984,156 @@ func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter403(t *testing.T) {
 	}
 }
 
+func TestManager_Execute_429WithoutRetryAfterDoesNotRetryWithinRequest(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(3, 30*time.Second, 0)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-429-no-retryafter": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "rate limit exceeded",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{ID: "auth-429-no-retryafter", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-429-no-retryafter"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	req := cliproxyexecutor.Request{Model: model}
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected execute error")
+	}
+	if statusCodeFromError(errExecute) != http.StatusTooManyRequests {
+		t.Fatalf("execute status = %d, want %d", statusCodeFromError(errExecute), http.StatusTooManyRequests)
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != 1 {
+		t.Fatalf("execute calls = %d, want 1", len(calls))
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected model cooldown to be set, got %#v", state)
+	}
+	if wait := time.Until(state.NextRetryAfter); wait <= 30*time.Second {
+		t.Fatalf("expected cooldown to exceed max retry interval, got %v", wait)
+	}
+	if count := reg.GetModelCount(model); count != 0 {
+		t.Fatalf("expected quota-exceeded model count 0, got %d", count)
+	}
+}
+
+func TestManager_ReconcileRegistryModelStates_MirrorsActiveQuotaCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	model := "test-model-reconcile-active-quota"
+	next := time.Now().Add(10 * time.Minute)
+	auth := &Auth{
+		ID:       "auth-reconcile-active-quota",
+		Provider: "codex",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Unavailable:    true,
+				Status:         StatusError,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	m.ReconcileRegistryModelStates(context.Background(), auth.ID)
+
+	if count := reg.GetModelCount(model); count != 0 {
+		t.Fatalf("expected reconciled quota model count 0, got %d", count)
+	}
+	for _, listed := range reg.GetAvailableModelsByProvider("codex") {
+		if listed != nil && listed.ID == model {
+			t.Fatalf("expected reconciled quota model to be hidden, got %+v", listed)
+		}
+	}
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil || updated.ModelStates[model] == nil || updated.ModelStates[model].NextRetryAfter.IsZero() {
+		t.Fatalf("expected active model state to be preserved, got %+v", updated)
+	}
+}
+
+func TestManager_ReconcileRegistryModelStates_ClearsExpiredQuotaCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	model := "test-model-reconcile-expired-quota"
+	expired := time.Now().Add(-time.Minute)
+	auth := &Auth{
+		ID:       "auth-reconcile-expired-quota",
+		Provider: "codex",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Unavailable:    true,
+				Status:         StatusError,
+				NextRetryAfter: expired,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: expired,
+				},
+			},
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.SetModelQuotaExceeded(auth.ID, model)
+	reg.SuspendClientModel(auth.ID, model, "quota")
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	m.ReconcileRegistryModelStates(context.Background(), auth.ID)
+
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("expected expired quota model count 1, got %d", count)
+	}
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !modelStateIsClean(state) {
+		t.Fatalf("expected expired model state to be reset, got %#v", state)
+	}
+}
+
 func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter429RetryAfter(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

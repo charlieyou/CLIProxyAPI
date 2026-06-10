@@ -400,15 +400,8 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 				reg.InfoByProvider[provider] = cloneModelInfo(model)
 			}
 			reg.LastUpdated = now
-			// Re-registering an existing client/model binding starts a fresh registry
-			// snapshot for that binding. Cooldown and suspension are transient
-			// scheduling state and must not survive this reconciliation step.
-			if reg.QuotaExceededClients != nil {
-				delete(reg.QuotaExceededClients, clientID)
-			}
-			if reg.SuspendedClients != nil {
-				delete(reg.SuspendedClients, clientID)
-			}
+			// Preserve transient quota/suspension state across catalog refreshes.
+			// Runtime success and expiry paths clear it explicitly.
 			if providerChanged && provider != "" {
 				if _, newlyAdded := addedSet[id]; newlyAdded {
 					continue
@@ -801,38 +794,36 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 	for _, registration := range r.models {
 		availableClients := registration.Count
 
-		expiredClients := 0
+		recentQuotaClients := 0
 		for _, quotaTime := range registration.QuotaExceededClients {
 			if quotaTime == nil {
 				continue
 			}
 			recoveryAt := quotaTime.Add(modelQuotaExceededWindow)
 			if now.Before(recoveryAt) {
-				expiredClients++
+				recentQuotaClients++
 				if expiresAt.IsZero() || recoveryAt.Before(expiresAt) {
 					expiresAt = recoveryAt
 				}
 			}
 		}
 
-		cooldownSuspended := 0
 		otherSuspended := 0
 		if registration.SuspendedClients != nil {
 			for _, reason := range registration.SuspendedClients {
 				if strings.EqualFold(reason, "quota") {
-					cooldownSuspended++
 					continue
 				}
 				otherSuspended++
 			}
 		}
 
-		effectiveClients := availableClients - expiredClients - otherSuspended
+		effectiveClients := availableClients - recentQuotaClients - otherSuspended
 		if effectiveClients < 0 {
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 {
 			model := r.convertModelToMap(registration.Info, handlerType)
 			if model != nil {
 				models = append(models, model)
@@ -950,8 +941,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 		}
 		registration, ok := r.models[modelID]
 
-		expiredClients := 0
-		cooldownSuspended := 0
+		recentQuotaClients := 0
 		otherSuspended := 0
 		if ok && registration != nil {
 			if registration.QuotaExceededClients != nil {
@@ -963,7 +953,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 						continue
 					}
 					if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
-						expiredClients++
+						recentQuotaClients++
 					}
 				}
 			}
@@ -976,7 +966,6 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 						continue
 					}
 					if strings.EqualFold(reason, "quota") {
-						cooldownSuspended++
 						continue
 					}
 					otherSuspended++
@@ -985,12 +974,12 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 		}
 
 		availableClients := entry.count
-		effectiveClients := availableClients - expiredClients - otherSuspended
+		effectiveClients := availableClients - recentQuotaClients - otherSuspended
 		if effectiveClients < 0 {
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 {
 			if entry.info != nil {
 				result = append(result, cloneModelInfo(entry.info))
 				continue
@@ -1018,17 +1007,22 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 		now := time.Now()
 
 		// Count clients that have exceeded quota but haven't recovered yet
-		expiredClients := 0
+		recentQuotaClients := 0
 		for _, quotaTime := range registration.QuotaExceededClients {
 			if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
-				expiredClients++
+				recentQuotaClients++
 			}
 		}
 		suspendedClients := 0
 		if registration.SuspendedClients != nil {
-			suspendedClients = len(registration.SuspendedClients)
+			for _, reason := range registration.SuspendedClients {
+				if strings.EqualFold(reason, "quota") {
+					continue
+				}
+				suspendedClients++
+			}
 		}
-		result := registration.Count - expiredClients - suspendedClients
+		result := registration.Count - recentQuotaClients - suspendedClients
 		if result < 0 {
 			return 0
 		}

@@ -85,9 +85,12 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
-	transientErrorCooldown    = time.Minute
+	// quotaBackoffBase is used when a provider returns 429 without Retry-After.
+	// Keep it above the default max retry interval so exhausted credentials do not
+	// immediately re-enter the same downstream request.
+	quotaBackoffBase       = time.Minute
+	quotaBackoffMax        = 30 * time.Minute
+	transientErrorCooldown = time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -450,6 +453,14 @@ func (m *Manager) getQuotaSnapshotsLocked(auths []*Auth) map[string]QuotaWindowS
 // enqueueInitialQuotaRefresh queues initial quota refreshes for eligible auths.
 // This runs once at startup to populate quota windows before any 429s occur.
 func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
+	m.enqueueEligibleQuotaRefresh(ctx, "initial check")
+}
+
+// enqueueEligibleQuotaRefresh queues quota refreshes for every eligible auth
+// (quota-refresh enabled, not read-only, provider in EnabledProviders, not
+// disabled). It is the shared body behind both the startup population and the
+// periodic refresh loop; reason is only used for log context.
+func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string) {
 	if m == nil {
 		return
 	}
@@ -487,7 +498,8 @@ func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
 	if len(ids) == 0 {
 		log.WithFields(log.Fields{
 			"providers": cfg.EnabledProviders,
-		}).Debug("quota refresh initial check: no eligible auths")
+			"reason":    reason,
+		}).Debug("quota refresh: no eligible auths")
 		return
 	}
 
@@ -501,8 +513,48 @@ func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
 	log.WithFields(log.Fields{
 		"count":     len(ids),
 		"providers": cfg.EnabledProviders,
-	}).Debug("quota refresh initial check: enqueuing auths")
+		"reason":    reason,
+	}).Debug("quota refresh: enqueuing auths")
 	m.EnqueueQuotaRefresh(ids)
+}
+
+// quotaRefreshInterval returns the cadence for the periodic proactive quota
+// refresh. It is derived from StaleThreshold so refreshes land at roughly the
+// half-life of the routing-staleness window, keeping QuotaWindows "known" for
+// expiry-based selection. Returns 0 (disabled) when no usable threshold is set.
+func (m *Manager) quotaRefreshInterval() time.Duration {
+	m.mu.RLock()
+	stale := m.quotaRefreshSettings.StaleThreshold
+	m.mu.RUnlock()
+	if stale <= 0 {
+		return 0
+	}
+	return stale / 2
+}
+
+// periodicQuotaRefresh re-enqueues eligible auths on a fixed cadence so the
+// quota-window snapshots used by FillFirstSelector stay fresh between 429s.
+// Without this, snapshots only refresh at startup and reactively on 429, so
+// after StaleThreshold elapses every auth collapses to the "unknown" tier and
+// selection silently falls back to ID ordering instead of soonest-expiring.
+func (m *Manager) periodicQuotaRefresh(ctx context.Context) {
+	interval := m.quotaRefreshInterval()
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !m.quotaRefreshEnabled("") {
+				continue
+			}
+			m.enqueueEligibleQuotaRefresh(ctx, "periodic refresh")
+		}
+	}
 }
 
 // quotaRefreshWorker processes quota refresh requests from the queue.
@@ -532,16 +584,33 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		m.mu.RUnlock()
 		return
 	}
+	cfg := m.quotaRefreshSettings
 	providerKey := auth.Provider
 	authClone := auth.Clone()
 	originalToken, _ := authClone.Metadata["access_token"].(string)
 	m.mu.RUnlock()
 
-	if !authClone.QuotaWindows.NextFetchAfter.IsZero() && authClone.QuotaWindows.NextFetchAfter.After(time.Now()) {
+	now := time.Now()
+	if !authClone.QuotaWindows.NextFetchAfter.IsZero() && authClone.QuotaWindows.NextFetchAfter.After(now) {
 		log.WithFields(log.Fields{
 			"auth_id":       authID,
 			"cooling_until": authClone.QuotaWindows.NextFetchAfter.Format(time.RFC3339),
 		}).Debug("quota refresh: skip, cooling from prior 429")
+		return
+	}
+	// Refetch once the cached windows reach half the routing-staleness window.
+	// Using StaleThreshold/2 (matching the periodic refresh cadence) keeps the
+	// snapshot inside StaleThreshold at all times, so FillFirstSelector always
+	// sees "known" data and routes by soonest-expiring rather than ID order.
+	freshWindow := cfg.StaleThreshold / 2
+	if freshWindow > 0 && len(authClone.QuotaWindows.Windows) > 0 &&
+		!authClone.QuotaWindows.LastFetchedAt.IsZero() && now.Sub(authClone.QuotaWindows.LastFetchedAt) < freshWindow {
+		log.WithFields(log.Fields{
+			"auth_id":         authID,
+			"provider":        providerKey,
+			"last_fetched_at": authClone.QuotaWindows.LastFetchedAt.Format(time.RFC3339),
+			"fresh_window":    freshWindow.String(),
+		}).Debug("quota refresh: skip, cached windows still fresh")
 		return
 	}
 
@@ -607,7 +676,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		return
 	}
 
-	now := time.Now()
+	now = time.Now()
 
 	if err != nil {
 		auth.QuotaWindows.LastFetchedAt = now
@@ -1235,12 +1304,10 @@ func (m *Manager) RefreshSchedulerAll() {
 }
 
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
-// registry snapshot for one auth.
-//
-// Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
-// renamed/removed models cannot keep auth-level status stale.
+// registry snapshot for one auth. ModelStates for models that are no longer
+// present in the registry are pruned entirely so renamed/removed models cannot
+// keep auth-level status stale. Active cooldowns are mirrored back into the
+// registry so model listing remains consistent after startup or catalog refresh.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
@@ -1261,6 +1328,9 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 
 	var snapshot *Auth
 	now := time.Now()
+	quotaModels := make(map[string]struct{})
+	suspendedModels := make(map[string]string)
+	resumedModels := make(map[string]struct{})
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
@@ -1285,8 +1355,32 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 			if modelStateIsClean(state) {
 				continue
 			}
+			blocked := false
+			reason := ""
+			switch {
+			case state.Status == StatusDisabled:
+				blocked = true
+				reason = "disabled"
+			case state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now):
+				blocked = true
+				if state.Quota.Exceeded {
+					reason = "quota"
+				} else {
+					reason = "unavailable"
+				}
+			}
+			if blocked {
+				if reason == "quota" {
+					quotaModels[baseModel] = struct{}{}
+				} else {
+					suspendedModels[baseModel] = reason
+				}
+				continue
+			}
+
 			resetModelState(state, now)
 			changed = true
+			resumedModels[baseModel] = struct{}{}
 		}
 		if len(auth.ModelStates) == 0 {
 			auth.ModelStates = nil
@@ -1309,6 +1403,18 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
+	}
+	reg := registry.GetGlobalRegistry()
+	for model := range resumedModels {
+		reg.ClearModelQuotaExceeded(authID, model)
+		reg.ResumeClientModel(authID, model)
+	}
+	for model := range quotaModels {
+		reg.SetModelQuotaExceeded(authID, model)
+		reg.SuspendClientModel(authID, model, "quota")
+	}
+	for model, reason := range suspendedModels {
+		reg.SuspendClientModel(authID, model, reason)
 	}
 }
 
@@ -5056,17 +5162,24 @@ func isCloudflareChallengeResultError(err *Error) bool {
 	return isCloudflareChallengeErrorMessage(err.Message)
 }
 
+// nextCloudflareCooldown computes the retry time for a transient Cloudflare
+// challenge. Cloudflare challenges clear quickly, so they use a short dedicated
+// backoff anchored at cloudflareBackoffBase rather than quotaBackoffBase, which
+// is tuned higher to avoid tight re-loops on generic 429s without Retry-After.
+// The backoff doubles per level and is capped at quotaBackoffMax.
 func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
+	const cloudflareBackoffBase = 10 * time.Second
 	var next time.Time
 	if !disableCooling {
-		cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-		if cooldown < 10*time.Second {
-			cooldown = 10 * time.Second
+		if backoffLevel < 0 {
+			backoffLevel = 0
 		}
-		if cooldown > 0 {
-			next = now.Add(cooldown)
+		cooldown := cloudflareBackoffBase * time.Duration(1<<backoffLevel)
+		if cooldown >= quotaBackoffMax {
+			return now.Add(quotaBackoffMax), backoffLevel
 		}
-		backoffLevel = nextLevel
+		next = now.Add(cooldown)
+		backoffLevel++
 	}
 	return next, backoffLevel
 }
@@ -6366,6 +6479,10 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		go m.quotaRefreshWorker(ctx)
 		if m.quotaRefreshEnabled("") {
 			go m.enqueueInitialQuotaRefresh(ctx)
+			// Keep quota-window snapshots fresh between 429s so expiry-based
+			// routing stays active instead of decaying to ID ordering once the
+			// startup data passes StaleThreshold.
+			go m.periodicQuotaRefresh(ctx)
 		}
 	}
 
