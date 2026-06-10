@@ -229,6 +229,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(commit.cfg))
+	s.coreManager.SetUsageExpirationConfig(commit.cfg.Routing.UsageExpirationTrigger)
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
 	return true
 }

@@ -60,7 +60,7 @@ func (p *ClaudeQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mo
 		return nil, auth.ErrQuotaUnauthorized
 	}
 	if resp.StatusCode == 429 {
-		return nil, auth.ErrQuotaRateLimited
+		return nil, &auth.RateLimitedError{RetryAfter: auth.ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("claude quota API returned %d", resp.StatusCode)

@@ -295,6 +295,9 @@ func (b *Builder) Build() (*Service, error) {
 	if b.resultPolicy != nil {
 		coreManager.SetResultPolicy(b.resultPolicy)
 	}
+	if b.cfg != nil {
+		coreManager.SetUsageExpirationConfig(b.cfg.Routing.UsageExpirationTrigger)
+	}
 
 	service := &Service{
 		cfg:                 b.cfg,

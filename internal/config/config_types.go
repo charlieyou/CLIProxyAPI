@@ -376,7 +376,31 @@ type RoutingConfig struct {
 	// QuotaRefresh configures reactive quota window fetching behavior.
 	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh" json:"quota-refresh"`
 
+	// UsageExpirationTrigger configures the usage expiration trigger feature.
+	UsageExpirationTrigger UsageExpirationTriggerConfig `yaml:"usage-expiration-trigger" json:"usage-expiration-trigger"`
+
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+}
+
+// UsageExpirationTriggerConfig configures the usage expiration trigger feature.
+// When enabled, the system sends minimal prompts to refresh null resets_at timestamps.
+type UsageExpirationTriggerConfig struct {
+	Enabled           bool          `yaml:"enabled" mapstructure:"enabled"`
+	Model             string        `yaml:"model" mapstructure:"model"`
+	CodexModel        string        `yaml:"codex_model" mapstructure:"codex_model"`
+	MaxRetriesPerHour int           `yaml:"max_retries_per_hour" mapstructure:"max_retries_per_hour"`
+	CheckInterval     time.Duration `yaml:"check_interval" mapstructure:"check_interval"`
+}
+
+// DefaultUsageExpirationTriggerConfig returns a UsageExpirationTriggerConfig with default values.
+func DefaultUsageExpirationTriggerConfig() UsageExpirationTriggerConfig {
+	return UsageExpirationTriggerConfig{
+		Enabled:           false,
+		Model:             "claude-haiku-4-5",
+		CodexModel:        "gpt-5.4",
+		MaxRetriesPerHour: 3,
+		CheckInterval:     30 * time.Minute,
+	}
 }
 
 // QuotaRefreshConfig configures reactive quota window fetching (on 429).

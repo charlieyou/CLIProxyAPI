@@ -72,6 +72,9 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		}
 	}
 
+	// Start usage expiration trigger sweeper.
+	go m.usageExpirationSweeper(ctx)
+
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
 }

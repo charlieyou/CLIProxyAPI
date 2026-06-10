@@ -4,8 +4,10 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Sentinel errors for quota provider implementations
@@ -14,6 +16,26 @@ var (
 	ErrQuotaRateLimited    = errors.New("quota: rate limited by provider")
 	ErrQuotaSchemaMismatch = errors.New("quota: response schema mismatch")
 )
+
+// RateLimitedError wraps ErrQuotaRateLimited with the Retry-After duration
+// advertised by the provider, when available. Callers can keep using
+// errors.Is(err, ErrQuotaRateLimited) for category detection, and use
+// errors.As(err, &rl) to read the duration.
+type RateLimitedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitedError) Error() string {
+	if e == nil {
+		return ErrQuotaRateLimited.Error()
+	}
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%s (retry after %s)", ErrQuotaRateLimited.Error(), e.RetryAfter)
+	}
+	return ErrQuotaRateLimited.Error()
+}
+
+func (e *RateLimitedError) Is(target error) bool { return target == ErrQuotaRateLimited }
 
 // QuotaProvider defines the interface for fetching quota windows from a provider.
 // All implementations are in the single sdk/cliproxy/auth/quota/ package (multiple files, one package).

@@ -206,6 +206,17 @@ type Manager struct {
 	// quotaRefreshSettings stores the quota refresh configuration for 429 handler integration.
 	quotaRefreshSettings QuotaRefreshSettings
 
+	// Usage expiration trigger state
+	usageTracker   *usageExpirationTracker
+	usageTriggerMu sync.RWMutex
+	usageConfig    internalconfig.UsageExpirationTriggerConfig
+	// lastUsageCheck tracks when each auth was last checked for usage expiration.
+	lastUsageCheck map[string]time.Time
+	// lastUsageSweepLog throttles sweep-level logging for usage trigger checks.
+	lastUsageSweepLog time.Time
+	// usageTriggerSem limits concurrent usage trigger goroutines (capacity: 5).
+	usageTriggerSem chan struct{}
+
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
 	persistLocks sync.Map
 }
@@ -231,6 +242,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:       make(map[string]int),
 		quotaRefreshQueue:     make(chan string, 100),
 		unknownProviderLogged: make(map[string]bool),
+		usageTracker:          newUsageExpirationTracker(),
+		lastUsageCheck:        make(map[string]time.Time),
+		usageTriggerSem:       make(chan struct{}, 5),
 		pendingRefreshes:      make(map[string]bool),
 		modelPoolOffsets:      make(map[string]int),
 	}

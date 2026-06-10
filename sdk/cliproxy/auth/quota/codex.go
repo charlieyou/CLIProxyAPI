@@ -59,7 +59,7 @@ func (p *CodexQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mod
 		return nil, auth.ErrQuotaUnauthorized // Caller will back off; existing auth loop handles refresh
 	}
 	if resp.StatusCode == 429 {
-		return nil, auth.ErrQuotaRateLimited
+		return nil, &auth.RateLimitedError{RetryAfter: auth.ParseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("codex quota API returned %d", resp.StatusCode)
