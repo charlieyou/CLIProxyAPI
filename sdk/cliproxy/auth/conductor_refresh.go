@@ -32,7 +32,7 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
+	quotaBackoffBase          = time.Minute
 	quotaBackoffMax           = 30 * time.Minute
 	minQuotaCooldownFloor     = 10 * time.Second
 	transientErrorCooldown    = time.Minute
@@ -69,6 +69,10 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		go m.quotaRefreshWorker(ctx)
 		if m.quotaRefreshEnabled("") {
 			go m.enqueueInitialQuotaRefresh(ctx)
+			// Keep quota-window snapshots fresh between 429s so expiry-based
+			// routing stays active instead of decaying to ID ordering once the
+			// startup data passes StaleThreshold.
+			go m.periodicQuotaRefresh(ctx)
 		}
 	}
 

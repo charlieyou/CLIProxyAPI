@@ -87,8 +87,11 @@ func TestCleanupExpiredQuotasInvalidatesAvailableModelsCache(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "m1", Created: 1}})
 	r.SetModelQuotaExceeded("client-1", "m1")
-	if models := r.GetAvailableModels("openai"); len(models) != 1 {
-		t.Fatalf("expected cooldown model to remain listed before cleanup, got %d", len(models))
+	if models := r.GetAvailableModels("openai"); len(models) != 0 {
+		t.Fatalf("expected quota-exceeded model to be hidden before cleanup, got %d", len(models))
+	}
+	if models := r.GetAvailableModelsByProvider("openai"); len(models) != 0 {
+		t.Fatalf("expected provider quota-exceeded model to be hidden before cleanup, got %d", len(models))
 	}
 
 	r.mutex.Lock()
@@ -107,6 +110,59 @@ func TestCleanupExpiredQuotasInvalidatesAvailableModelsCache(t *testing.T) {
 	}
 	if got := models[0]["id"]; got != "m1" {
 		t.Fatalf("expected model id m1, got %v", got)
+	}
+	providerModels := r.GetAvailableModelsByProvider("openai")
+	if len(providerModels) != 1 || providerModels[0].ID != "m1" {
+		t.Fatalf("expected provider model m1 after cleanup, got %+v", providerModels)
+	}
+}
+
+func TestQuotaExceededModelStaysListedWhenAnotherClientIsAvailable(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "m1", Created: 1}})
+	r.RegisterClient("client-2", "openai", []*ModelInfo{{ID: "m1", Created: 1}})
+	r.SetModelQuotaExceeded("client-1", "m1")
+
+	models := r.GetAvailableModels("openai")
+	if len(models) != 1 {
+		t.Fatalf("expected model to stay listed while one client remains available, got %d", len(models))
+	}
+	if got := models[0]["id"]; got != "m1" {
+		t.Fatalf("expected model id m1, got %v", got)
+	}
+
+	providerModels := r.GetAvailableModelsByProvider("openai")
+	if len(providerModels) != 1 || providerModels[0].ID != "m1" {
+		t.Fatalf("expected provider model m1 while one client remains available, got %+v", providerModels)
+	}
+}
+
+func TestQuotaSuspendedModelReappearsAfterQuotaWindowExpires(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "m1", Created: 1}})
+	r.SetModelQuotaExceeded("client-1", "m1")
+	r.SuspendClientModel("client-1", "m1", "quota")
+
+	if models := r.GetAvailableModels("openai"); len(models) != 0 {
+		t.Fatalf("expected quota-suspended model to be hidden, got %d", len(models))
+	}
+
+	r.mutex.Lock()
+	quotaTime := time.Now().Add(-6 * time.Minute)
+	r.models["m1"].QuotaExceededClients["client-1"] = &quotaTime
+	r.invalidateAvailableModelsCacheLocked()
+	r.mutex.Unlock()
+
+	if count := r.GetModelCount("m1"); count != 1 {
+		t.Fatalf("expected model count 1 after quota window expires, got %d", count)
+	}
+	models := r.GetAvailableModels("openai")
+	if len(models) != 1 || models[0]["id"] != "m1" {
+		t.Fatalf("expected model m1 after quota window expires, got %+v", models)
+	}
+	providerModels := r.GetAvailableModelsByProvider("openai")
+	if len(providerModels) != 1 || providerModels[0].ID != "m1" {
+		t.Fatalf("expected provider model m1 after quota window expires, got %+v", providerModels)
 	}
 }
 

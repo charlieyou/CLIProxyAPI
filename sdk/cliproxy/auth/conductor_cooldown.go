@@ -1847,17 +1847,24 @@ func isCloudflareChallengeResultError(err *Error) bool {
 	return isCloudflareChallengeErrorMessage(err.Message)
 }
 
+// nextCloudflareCooldown computes the retry time for a transient Cloudflare
+// challenge. Cloudflare challenges clear quickly, so they use a short dedicated
+// backoff anchored at cloudflareBackoffBase rather than quotaBackoffBase, which
+// is tuned higher to avoid tight re-loops on generic 429s without Retry-After.
+// The backoff doubles per level and is capped at quotaBackoffMax.
 func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
+	const cloudflareBackoffBase = 10 * time.Second
 	var next time.Time
 	if !disableCooling {
-		cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-		if cooldown < 10*time.Second {
-			cooldown = 10 * time.Second
+		if backoffLevel < 0 {
+			backoffLevel = 0
 		}
-		if cooldown > 0 {
-			next = now.Add(cooldown)
+		cooldown := cloudflareBackoffBase * time.Duration(1<<backoffLevel)
+		if cooldown >= quotaBackoffMax {
+			return now.Add(quotaBackoffMax), backoffLevel
 		}
-		backoffLevel = nextLevel
+		next = now.Add(cooldown)
+		backoffLevel++
 	}
 	return next, backoffLevel
 }

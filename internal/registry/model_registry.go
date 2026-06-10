@@ -608,15 +608,8 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 				reg.InfoByProvider[oldProvider].SupportsWebSearch = r.hasClientSupportingWebSearchLocked(id, oldProvider, clientID)
 			}
 			reg.LastUpdated = now
-			// Re-registering an existing client/model binding starts a fresh registry
-			// snapshot for that binding. Cooldown and suspension are transient
-			// scheduling state and must not survive this reconciliation step.
-			if reg.QuotaExceededClients != nil {
-				delete(reg.QuotaExceededClients, clientID)
-			}
-			if reg.SuspendedClients != nil {
-				delete(reg.SuspendedClients, clientID)
-			}
+			// Preserve transient quota/suspension state across catalog refreshes.
+			// Runtime success and expiry paths clear it explicitly.
 			if providerChanged && provider != "" {
 				if _, newlyAdded := addedSet[id]; newlyAdded {
 					continue
@@ -1297,13 +1290,11 @@ func modelRegistrationAvailability(registration *ModelRegistration, now time.Tim
 		}
 	}
 
-	cooldownSuspended := 0
 	otherSuspended := 0
 	quotaAndOtherSuspended := 0
 	if registration.SuspendedClients != nil {
 		for clientID, reason := range registration.SuspendedClients {
 			if strings.EqualFold(reason, "quota") {
-				cooldownSuspended++
 				continue
 			}
 			otherSuspended++
@@ -1320,7 +1311,7 @@ func modelRegistrationAvailability(registration *ModelRegistration, now time.Tim
 		effectiveClients = 0
 	}
 
-	available := effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0)
+	available := effectiveClients > 0
 	return available, expiresAt
 }
 
@@ -1473,8 +1464,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 		}
 		registration, ok := r.models[modelID]
 
-		expiredClients := 0
-		cooldownSuspended := 0
+		recentQuotaClients := 0
 		otherSuspended := 0
 		quotaAndOtherSuspended := 0
 		if ok && registration != nil {
@@ -1487,7 +1477,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 						continue
 					}
 					if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
-						expiredClients++
+						recentQuotaClients++
 					}
 				}
 			}
@@ -1500,7 +1490,6 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 						continue
 					}
 					if strings.EqualFold(reason, "quota") {
-						cooldownSuspended++
 						continue
 					}
 					otherSuspended++
@@ -1512,12 +1501,12 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 		}
 
 		availableClients := entry.count
-		effectiveClients := availableClients - expiredClients - otherSuspended + quotaAndOtherSuspended
+		effectiveClients := availableClients - recentQuotaClients - otherSuspended + quotaAndOtherSuspended
 		if effectiveClients < 0 {
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 {
 			if entry.info != nil {
 				result = append(result, cloneModelInfo(entry.info))
 				continue
@@ -1545,20 +1534,23 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 		now := time.Now()
 
 		// Count clients that have exceeded quota but haven't recovered yet
-		expiredClients := 0
+		recentQuotaClients := 0
 		for _, quotaTime := range registration.QuotaExceededClients {
 			if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
-				expiredClients++
+				recentQuotaClients++
 			}
 		}
 		suspendedClients := 0
-		for clientID := range registration.SuspendedClients {
+		for clientID, reason := range registration.SuspendedClients {
+			if strings.EqualFold(reason, "quota") {
+				continue
+			}
 			if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil && now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
 				continue
 			}
 			suspendedClients++
 		}
-		result := registration.Count - expiredClients - suspendedClients
+		result := registration.Count - recentQuotaClients - suspendedClients
 		if result < 0 {
 			return 0
 		}

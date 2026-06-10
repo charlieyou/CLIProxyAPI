@@ -77,6 +77,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.coreManager != nil && !homeEnabled {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
+		} else {
+			s.registerLoadedAuthModels(ctx)
 		}
 		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
 		if s.cfg.SaveCooldownStatus {

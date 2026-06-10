@@ -224,6 +224,14 @@ func (m *Manager) getQuotaSnapshotsLocked(auths []*Auth) map[string]QuotaWindowS
 // enqueueInitialQuotaRefresh queues initial quota refreshes for eligible auths.
 // This runs once at startup to populate quota windows before any 429s occur.
 func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
+	m.enqueueEligibleQuotaRefresh(ctx, "initial check")
+}
+
+// enqueueEligibleQuotaRefresh queues quota refreshes for every eligible auth
+// (quota-refresh enabled, not read-only, provider in EnabledProviders, not
+// disabled). It is the shared body behind both the startup population and the
+// periodic refresh loop; reason is only used for log context.
+func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string) {
 	if m == nil {
 		return
 	}
@@ -261,7 +269,8 @@ func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
 	if len(ids) == 0 {
 		log.WithFields(log.Fields{
 			"providers": cfg.EnabledProviders,
-		}).Debug("quota refresh initial check: no eligible auths")
+			"reason":    reason,
+		}).Debug("quota refresh: no eligible auths")
 		return
 	}
 
@@ -275,8 +284,48 @@ func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
 	log.WithFields(log.Fields{
 		"count":     len(ids),
 		"providers": cfg.EnabledProviders,
-	}).Debug("quota refresh initial check: enqueuing auths")
+		"reason":    reason,
+	}).Debug("quota refresh: enqueuing auths")
 	m.EnqueueQuotaRefresh(ids)
+}
+
+// quotaRefreshInterval returns the cadence for the periodic proactive quota
+// refresh. It is derived from StaleThreshold so refreshes land at roughly the
+// half-life of the routing-staleness window, keeping QuotaWindows "known" for
+// expiry-based selection. Returns 0 (disabled) when no usable threshold is set.
+func (m *Manager) quotaRefreshInterval() time.Duration {
+	m.mu.RLock()
+	stale := m.quotaRefreshSettings.StaleThreshold
+	m.mu.RUnlock()
+	if stale <= 0 {
+		return 0
+	}
+	return stale / 2
+}
+
+// periodicQuotaRefresh re-enqueues eligible auths on a fixed cadence so the
+// quota-window snapshots used by FillFirstSelector stay fresh between 429s.
+// Without this, snapshots only refresh at startup and reactively on 429, so
+// after StaleThreshold elapses every auth collapses to the "unknown" tier and
+// selection silently falls back to ID ordering instead of soonest-expiring.
+func (m *Manager) periodicQuotaRefresh(ctx context.Context) {
+	interval := m.quotaRefreshInterval()
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !m.quotaRefreshEnabled("") {
+				continue
+			}
+			m.enqueueEligibleQuotaRefresh(ctx, "periodic refresh")
+		}
+	}
 }
 
 // quotaRefreshWorker processes quota refresh requests from the queue.
@@ -306,16 +355,33 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		m.mu.RUnlock()
 		return
 	}
+	cfg := m.quotaRefreshSettings
 	providerKey := auth.Provider
 	authClone := auth.Clone()
 	originalToken, _ := authClone.Metadata["access_token"].(string)
 	m.mu.RUnlock()
 
-	if !authClone.QuotaWindows.NextFetchAfter.IsZero() && authClone.QuotaWindows.NextFetchAfter.After(time.Now()) {
+	now := time.Now()
+	if !authClone.QuotaWindows.NextFetchAfter.IsZero() && authClone.QuotaWindows.NextFetchAfter.After(now) {
 		log.WithFields(log.Fields{
 			"auth_id":       authID,
 			"cooling_until": authClone.QuotaWindows.NextFetchAfter.Format(time.RFC3339),
 		}).Debug("quota refresh: skip, cooling from prior 429")
+		return
+	}
+	// Refetch once the cached windows reach half the routing-staleness window.
+	// Using StaleThreshold/2 (matching the periodic refresh cadence) keeps the
+	// snapshot inside StaleThreshold at all times, so FillFirstSelector always
+	// sees "known" data and routes by soonest-expiring rather than ID order.
+	freshWindow := cfg.StaleThreshold / 2
+	if freshWindow > 0 && len(authClone.QuotaWindows.Windows) > 0 &&
+		!authClone.QuotaWindows.LastFetchedAt.IsZero() && now.Sub(authClone.QuotaWindows.LastFetchedAt) < freshWindow {
+		log.WithFields(log.Fields{
+			"auth_id":         authID,
+			"provider":        providerKey,
+			"last_fetched_at": authClone.QuotaWindows.LastFetchedAt.Format(time.RFC3339),
+			"fresh_window":    freshWindow.String(),
+		}).Debug("quota refresh: skip, cached windows still fresh")
 		return
 	}
 
@@ -381,7 +447,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		return
 	}
 
-	now := time.Now()
+	now = time.Now()
 
 	if err != nil {
 		auth.QuotaWindows.LastFetchedAt = now
