@@ -2388,6 +2388,267 @@ func TestClaudeExecutor_ExecuteStream_ErrorEventReturnsStatusErrorChunk(t *testi
 	}
 }
 
+func TestClaudeExecutor_ExecuteStream_PreContentErrorEventReturnsStatusErrorChunk(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fable-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n"))
+		_, _ = w.Write([]byte("event: ping\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"ping\"}\n"))
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Claude session limit reached\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before emitting error chunk")
+	}
+	if len(chunk.Payload) > 0 {
+		t.Fatalf("got payload before error: %q", chunk.Payload)
+	}
+	if chunk.Err == nil {
+		t.Fatal("chunk.Err = nil, want pre-content stream error")
+	}
+	status, ok := chunk.Err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("chunk.Err = %T, want StatusCode()", chunk.Err)
+	}
+	if got := status.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if _, more := <-result.Chunks; more {
+		t.Fatal("stream produced chunks after terminal error")
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_TranslatedPreContentErrorEventReturnsStatusErrorChunk(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fable-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n"))
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Claude session limit reached\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-fable-5","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before emitting error chunk")
+	}
+	if len(chunk.Payload) > 0 {
+		t.Fatalf("got payload before error: %q", chunk.Payload)
+	}
+	if chunk.Err == nil {
+		t.Fatal("chunk.Err = nil, want pre-content stream error")
+	}
+	status, ok := chunk.Err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("chunk.Err = %T, want StatusCode()", chunk.Err)
+	}
+	if got := status.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if _, more := <-result.Chunks; more {
+		t.Fatal("stream produced chunks after terminal error")
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_FlushesPreContentLinesInOrder(t *testing.T) {
+	lines := []string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, line := range lines {
+			_, _ = w.Write([]byte(line + "\n"))
+		}
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	want := strings.Join(lines, "\n") + "\n"
+	if got.String() != want {
+		t.Fatalf("stream payload mismatch\ngot:  %q\nwant: %q", got.String(), want)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_PreContentErrorRotatesAuth(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	recordCall := func(name string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[name]++
+	}
+
+	limitedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordCall("limited")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_limited\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fable-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n"))
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Claude session limit reached\"}}\n\n"))
+	}))
+	defer limitedServer.Close()
+
+	okLines := []string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_ok","type":"message","role":"assistant","model":"claude-fable-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+	}
+	okServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordCall("ok")
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, line := range okLines {
+			_, _ = w.Write([]byte(line + "\n"))
+		}
+	}))
+	defer okServer.Close()
+
+	reg := registry.GetGlobalRegistry()
+	for _, authID := range []string{"auth-a-limited", "auth-b-ok"} {
+		reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "claude-fable-5"}})
+	}
+	t.Cleanup(func() {
+		for _, authID := range []string{"auth-a-limited", "auth-b-ok"} {
+			reg.UnregisterClient(authID)
+		}
+	})
+
+	manager := cliproxyauth.NewManager(nil, cliproxyauth.NewFillFirstSelector(cliproxyauth.QuotaRefreshSettings{}, nil), nil)
+	manager.RegisterExecutor(NewClaudeExecutor(&config.Config{}))
+	ctx := cliproxyauth.WithSkipPersist(context.Background())
+	if _, err := manager.Register(ctx, &cliproxyauth.Auth{
+		ID:       "auth-a-limited",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "limited-key",
+			"base_url": limitedServer.URL,
+		},
+	}); err != nil {
+		t.Fatalf("Register limited auth: %v", err)
+	}
+	if _, err := manager.Register(ctx, &cliproxyauth.Auth{
+		ID:       "auth-b-ok",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "ok-key",
+			"base_url": okServer.URL,
+		},
+	}); err != nil {
+		t.Fatalf("Register ok auth: %v", err)
+	}
+
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	result, err := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error after auth rotation: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if !strings.Contains(got.String(), `"text":"ok"`) {
+		t.Fatalf("rotated stream missing ok auth payload: %q", got.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["limited"] != 1 {
+		t.Fatalf("limited auth calls = %d, want 1", calls["limited"])
+	}
+	if calls["ok"] != 1 {
+		t.Fatalf("ok auth calls = %d, want 1", calls["ok"])
+	}
+}
+
 func TestClaudeStreamErrorFromPayloadIncludesErrorType(t *testing.T) {
 	streamErr := claudeStreamErrorFromPayload([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"roles must alternate"}}`))
 	if got := streamErr.StatusCode(); got != http.StatusBadRequest {

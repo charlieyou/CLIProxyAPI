@@ -45,6 +45,11 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
+const (
+	claudeStreamPreContentMaxLines = 64
+	claudeStreamPreContentMaxBytes = 32 * 1024
+)
+
 func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
 }
@@ -557,7 +562,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
-			pendingErrorEvent := false
+			var pendingErrorEventLines [][]byte
+			preContentGate := &claudeStreamPreContentGate{}
 			appendLine := func(line []byte) {
 				if oauthToken {
 					line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
@@ -579,21 +585,33 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return false
 				}
 			}
+			emitLine := func(line []byte) bool {
+				appendLine(line)
+				return len(bytes.TrimSpace(line)) != 0 || flushEvent()
+			}
+			flushPending := func() bool {
+				for _, pending := range pendingErrorEventLines {
+					if !preContentGate.Emit(pending, emitLine) {
+						return false
+					}
+				}
+				pendingErrorEventLines = pendingErrorEventLines[:0]
+				return true
+			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
-				if pendingErrorEvent {
+				if len(pendingErrorEventLines) > 0 {
 					if !bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) && isClaudeSSEErrorEventPrefixLine(line) {
-						appendLine(line)
+						pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
 						continue
 					}
 				}
 				if isClaudeSSEErrorEventLine(line) {
-					pendingErrorEvent = true
-					appendLine(line)
+					pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
 					continue
 				}
 				if streamErr, ok := claudeStreamErrorFromLine(line); ok {
@@ -605,9 +623,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					}
 					return
 				}
-				pendingErrorEvent = false
-				appendLine(line)
-				if len(bytes.TrimSpace(line)) == 0 && !flushEvent() {
+				if len(pendingErrorEventLines) > 0 && !flushPending() {
+					return
+				}
+				if !preContentGate.Emit(line, emitLine) {
 					return
 				}
 			}
@@ -620,7 +639,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
-			if pendingErrorEvent {
+			if len(pendingErrorEventLines) > 0 {
 				streamErr := statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream ended before error event data"}
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 				reporter.PublishFailure(ctx, streamErr)
@@ -630,7 +649,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
-			if !flushEvent() {
+			if !preContentGate.Flush(emitLine) || !flushEvent() {
 				return
 			}
 			return
@@ -640,21 +659,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
-			if streamErr, ok := claudeStreamErrorFromLine(line); ok {
-				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-				reporter.PublishFailure(ctx, streamErr)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-				case <-ctx.Done():
-				}
-				return
-			}
+		var pendingErrorEventLines [][]byte
+		preContentGate := &claudeStreamPreContentGate{}
+		sendTranslatedLine := func(line []byte) bool {
 			if oauthToken {
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				line = restoreOAuthToolNamesFromStreamLine(line, oauthOriginalToolNameMap)
@@ -673,8 +680,50 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 				case <-ctx.Done():
-					return
+					return false
 				}
+			}
+			return true
+		}
+		flushPending := func() bool {
+			for _, pending := range pendingErrorEventLines {
+				if !preContentGate.Emit(pending, sendTranslatedLine) {
+					return false
+				}
+			}
+			pendingErrorEventLines = pendingErrorEventLines[:0]
+			return true
+		}
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+				reporter.Publish(ctx, detail)
+			}
+			if len(pendingErrorEventLines) > 0 {
+				if !bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) && isClaudeSSEErrorEventPrefixLine(line) {
+					pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
+					continue
+				}
+			}
+			if isClaudeSSEErrorEventLine(line) {
+				pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
+				continue
+			}
+			if streamErr, ok := claudeStreamErrorFromLine(line); ok {
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			if len(pendingErrorEventLines) > 0 && !flushPending() {
+				return
+			}
+			if !preContentGate.Emit(line, sendTranslatedLine) {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
@@ -684,6 +733,20 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
+			return
+		}
+		if len(pendingErrorEventLines) > 0 {
+			streamErr := statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream ended before error event data"}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if !preContentGate.Flush(sendTranslatedLine) {
+			return
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -771,6 +834,94 @@ func isClaudeSSEErrorEventPrefixLine(line []byte) bool {
 		bytes.HasPrefix(trimmed, []byte("id:")) ||
 		bytes.HasPrefix(trimmed, []byte("retry:")) ||
 		isClaudeSSEErrorEventLine(trimmed)
+}
+
+type claudeStreamPreContentGate struct {
+	committed bool
+	heldLines [][]byte
+	heldBytes int
+}
+
+func (g *claudeStreamPreContentGate) Emit(line []byte, emit func([]byte) bool) bool {
+	if g == nil || g.committed {
+		return emit(line)
+	}
+	if isClaudeStreamPreContentLine(line) {
+		cloned := bytes.Clone(line)
+		g.heldLines = append(g.heldLines, cloned)
+		g.heldBytes += len(cloned)
+		if len(g.heldLines) <= claudeStreamPreContentMaxLines && g.heldBytes <= claudeStreamPreContentMaxBytes {
+			return true
+		}
+		g.committed = true
+		return g.Flush(emit)
+	}
+	g.committed = true
+	if !g.Flush(emit) {
+		return false
+	}
+	return emit(line)
+}
+
+func (g *claudeStreamPreContentGate) Flush(emit func([]byte) bool) bool {
+	if g == nil || len(g.heldLines) == 0 {
+		return true
+	}
+	for _, line := range g.heldLines {
+		if !emit(line) {
+			return false
+		}
+	}
+	g.heldLines = nil
+	g.heldBytes = 0
+	return true
+}
+
+func isClaudeStreamPreContentLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) || bytes.HasPrefix(trimmed, []byte("retry:")) {
+		return true
+	}
+	if event, ok := claudeSSEFieldValue(trimmed, "event"); ok {
+		switch strings.ToLower(event) {
+		case "error", "message_start", "ping":
+			return true
+		default:
+			return false
+		}
+	}
+	payload, ok := claudeSSEDataPayload(trimmed)
+	if !ok {
+		return false
+	}
+	if len(payload) == 0 {
+		return true
+	}
+	if bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return false
+	}
+	switch gjson.ParseBytes(payload).Get("type").String() {
+	case "error", "message_start", "ping":
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeSSEFieldValue(trimmed []byte, field string) (string, bool) {
+	prefix := []byte(field + ":")
+	if !bytes.HasPrefix(trimmed, prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(string(trimmed[len(prefix):])), true
+}
+
+func claudeSSEDataPayload(trimmed []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, false
+	}
+	return bytes.TrimSpace(trimmed[len("data:"):]), true
 }
 
 func claudeStreamErrorFromPayload(payload []byte) statusErr {
