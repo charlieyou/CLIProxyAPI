@@ -967,7 +967,8 @@ func claudeStreamErrorStatus(root gjson.Result, message string) int {
 		strings.Contains(lowerMessage, "payment") || strings.Contains(lowerMessage, "billing") ||
 		strings.Contains(lowerMessage, "credit"):
 		return http.StatusForbidden
-	case strings.Contains(errType, "overloaded") || strings.Contains(errCode, "overloaded"):
+	case strings.Contains(errType, "overloaded") || strings.Contains(errCode, "overloaded") ||
+		errType == "api_error" || errCode == "api_error":
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusBadGateway

@@ -11,6 +11,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -125,6 +126,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
+		if isClaudeCancellationErrorMessage(errMsg) {
+			cliCancel(errMsg.Error)
+			return
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -216,6 +221,10 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
+		if isClaudeCancellationErrorMessage(errMsg) {
+			cliCancel(errMsg.Error)
+			return
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -294,6 +303,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				errChan = nil
 				continue
 			}
+			if isClaudeCancellationErrorMessage(errMsg) {
+				if errMsg != nil {
+					cliCancel(errMsg.Error)
+				} else {
+					cliCancel(nil)
+				}
+				return
+			}
 			// Upstream failed immediately. Return proper error status and JSON.
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
@@ -305,6 +322,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
+					if isClaudeCancellationErrorMessage(errMsg) {
+						if errMsg != nil {
+							cliCancel(errMsg.Error)
+						} else {
+							cliCancel(nil)
+						}
+						return
+					}
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
@@ -368,7 +393,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 }
 
 func (h *ClaudeCodeAPIHandler) writeClaudeTerminalStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) bool {
-	if errMsg == nil || isClaudeCapacityErrorMessage(errMsg) {
+	if errMsg == nil || isClaudeCancellationErrorMessage(errMsg) || isClaudeCapacityErrorMessage(errMsg) {
 		return false
 	}
 	status := http.StatusInternalServerError
@@ -404,6 +429,15 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			if v := strings.TrimSpace(msg.Error.Error()); v != "" {
 				errText = v
 			}
+		}
+	}
+	if msg != nil && isClaudeCancellationError(msg.Error) {
+		return claudeErrorResponse{
+			Type: "error",
+			Error: claudeErrorDetail{
+				Type:    claudeErrorTypeFromStatus(status),
+				Message: "Request was canceled.",
+			},
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
@@ -482,6 +516,14 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 	return errType, message
 }
 
+func isClaudeCancellationErrorMessage(msg *interfaces.ErrorMessage) bool {
+	return msg != nil && isClaudeCancellationError(msg.Error)
+}
+
+func isClaudeCancellationError(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
 func isClaudeCapacityErrorMessage(msg *interfaces.ErrorMessage) bool {
 	if msg == nil {
 		return false
@@ -507,22 +549,8 @@ func isClaudeCapacityError(status int, errText string) bool {
 	if status == http.StatusTooManyRequests {
 		return true
 	}
-	if status != http.StatusServiceUnavailable && status != 529 {
-		return false
-	}
-	patterns := [...]string{
-		"overloaded",
-		"auth_unavailable",
-		"auth_not_found",
-		"no auth available",
-		"no upstream model available",
-		"model_cooldown",
-		"cooling down",
-	}
-	for _, pattern := range patterns {
-		if strings.Contains(lower, pattern) {
-			return true
-		}
+	if status == http.StatusServiceUnavailable || status == 529 {
+		return true
 	}
 	return false
 }

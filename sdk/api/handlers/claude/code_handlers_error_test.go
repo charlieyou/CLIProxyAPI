@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +134,27 @@ func TestClaudeErrorSanitizesOverloadedText(t *testing.T) {
 	}
 }
 
+func TestClaudeErrorSanitizesAnyServiceUnavailableText(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("claude executor: upstream returned error event: api_error: temporary upstream capacity failure"),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "api_error" {
+		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	}
+	lowerMessage := strings.ToLower(got.Error.Message)
+	if strings.Contains(lowerMessage, "temporary") || strings.Contains(lowerMessage, "api_error") {
+		t.Fatalf("error.message leaked upstream service-unavailable details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
 func TestClaudeErrorSanitizesAuthUnavailableText(t *testing.T) {
 	handler := &ClaudeCodeAPIHandler{}
 	msg := &interfaces.ErrorMessage{
@@ -150,6 +172,26 @@ func TestClaudeErrorSanitizesAuthUnavailableText(t *testing.T) {
 		t.Fatalf("error.message leaked auth-pool details: %q", got.Error.Message)
 	}
 	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorSanitizesContextCanceled(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      context.Canceled,
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "api_error" {
+		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "context canceled") {
+		t.Fatalf("error.message leaked raw cancellation details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Request was canceled." {
 		t.Fatalf("error.message = %q", got.Error.Message)
 	}
 }
@@ -236,6 +278,46 @@ func TestWriteClaudeTerminalStreamErrorSuppressesOverloadedEvent(t *testing.T) {
 	}
 	if recorder.Body.Len() != 0 {
 		t.Fatalf("terminal overloaded error leaked body: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorSuppressesServiceUnavailableEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("claude executor: upstream returned error event: api_error: temporary upstream capacity failure"),
+	}
+
+	wrote := handler.writeClaudeTerminalStreamError(c, msg)
+
+	if wrote {
+		t.Fatal("terminal service-unavailable error was written downstream")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("terminal service-unavailable error leaked body: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorSuppressesContextCanceled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      context.Canceled,
+	}
+
+	wrote := handler.writeClaudeTerminalStreamError(c, msg)
+
+	if wrote {
+		t.Fatal("terminal cancellation error was written downstream")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("terminal cancellation error leaked body: %q", recorder.Body.String())
 	}
 }
 
