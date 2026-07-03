@@ -63,6 +63,11 @@ func newClaudeOAuthCancellationError(ctx context.Context, oauth bool, err error)
 	return &claudeOAuthCancellationError{cause: cause}
 }
 
+const (
+	claudeStreamPreContentMaxLines = 64
+	claudeStreamPreContentMaxBytes = 32 * 1024
+)
+
 func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
 }

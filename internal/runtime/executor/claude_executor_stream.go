@@ -403,100 +403,54 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 
-		// If the response target is Claude, directly forward complete SSE events without translation.
-		if responseFormat == to {
-			scanner := bufio.NewScanner(decodedBody)
-			scanner.Buffer(nil, 52_428_800) // 50MB
-			var event bytes.Buffer
-			pendingErrorEvent := false
-			var upstreamMessageID string
-			upstreamCompleted := false
-			flushEvent := func() bool {
-				if event.Len() == 0 {
-					return true
+		var event bytes.Buffer
+		var param any
+		flushEvent := func() bool {
+			if event.Len() == 0 {
+				return true
+			}
+			cloned := bytes.Clone(event.Bytes())
+			event.Reset()
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
+				return true
+			case <-ctx.Done():
+				emitCancellation(ctx.Err())
+				return false
+			}
+		}
+		emitLine := func(line []byte) bool {
+			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
+			if errRestore != nil {
+				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
+				return false
+			}
+			line = e.restoreResponseModel(restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap), req.Model)
+			if responseFormat == to {
+				event.Write(line)
+				event.WriteByte('\n')
+				return len(bytes.TrimSpace(line)) != 0 || flushEvent()
+			}
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, bodyForTranslation, bytes.Clone(line), &param)
+			if responseFormat == sdktranslator.FormatOpenAIResponse {
+				for i, chunk := range chunks {
+					chunks[i] = helps.EnsureResponsesUsageDetails(chunk)
 				}
-				cloned := bytes.Clone(event.Bytes())
-				event.Reset()
+			}
+			for _, chunk := range chunks {
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
-					return true
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
 				case <-ctx.Done():
+					emitCancellation(ctx.Err())
 					return false
 				}
 			}
-			for scanner.Scan() {
-				line := scanner.Bytes()
-				observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				reporter.ObserveResponseModel(line)
-				streamUsage.ObserveClaudeStream(line)
-				if isClaudeSSEErrorEventLine(line) {
-					pendingErrorEvent = true
-					continue
-				}
-				if pendingErrorEvent && !bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) && isClaudeSSEErrorEventPrefixLine(line) {
-					continue
-				}
-				if streamErr, ok := claudeStreamErrorFromLine(line); ok {
-					emitResponseError(streamErr)
-					return
-				}
-				pendingErrorEvent = false
-				if streamErr, ok := claudeStreamErrorFromLine(line); ok {
-					emitResponseError(streamErr)
-					return
-				}
-				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
-				if errRestore != nil {
-					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
-					return
-				}
-				line = e.restoreResponseModel(restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap), req.Model)
-				event.Write(line)
-				event.WriteByte('\n')
-				if len(bytes.TrimSpace(line)) == 0 {
-					if !flushEvent() {
-						emitCancellation(ctx.Err())
-						return
-					}
-					if upstreamCompleted {
-						break
-					}
-				}
-			}
-			if pendingErrorEvent {
-				emitResponseError(statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream ended before error event data"})
-				return
-			}
-			if !flushEvent() {
-				emitCancellation(ctx.Err())
-				return
-			}
-			if !upstreamCompleted {
-				if emitCancellation(scanner.Err()) {
-					return
-				}
-				if errScan := scanner.Err(); errScan != nil {
-					errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					streamUsage.PublishFailure(ctx, reporter, errScan)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-					case <-ctx.Done():
-					}
-					return
-				}
-			}
-			if upstreamCompleted {
-				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
-			}
-			return
+			return true
 		}
-
-		// For other formats, use translation
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
+		var pendingErrorEventLines [][]byte
+		preContentGate := &claudeStreamPreContentGate{}
 		var upstreamMessageID string
 		upstreamCompleted := false
 		for scanner.Scan() {
@@ -505,36 +459,28 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveClaudeStream(line)
-			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
-			if errRestore != nil {
-				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
+			if len(pendingErrorEventLines) > 0 && !bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) && isClaudeSSEErrorEventPrefixLine(line) {
+				pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
+				continue
+			}
+			if isClaudeSSEErrorEventLine(line) {
+				pendingErrorEventLines = append(pendingErrorEventLines, bytes.Clone(line))
+				continue
+			}
+			if streamErr, ok := claudeStreamErrorFromLine(line); ok {
+				emitResponseError(streamErr)
 				return
 			}
-			line = e.restoreResponseModel(restoreOAuthToolNamesFromStreamLine(restoredLine, oauthOriginalToolNameMap), req.Model)
-			chunks := sdktranslator.TranslateStream(
-				ctx,
-				to,
-				responseFormat,
-				req.Model,
-				opts.OriginalRequest,
-				bodyForTranslation,
-				bytes.Clone(line),
-				&param,
-			)
-			if responseFormat == sdktranslator.FormatOpenAIResponse {
-				for i, chunk := range chunks {
-					chunks[i] = helps.EnsureResponsesUsageDetails(chunk)
-				}
-			}
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					emitCancellation(ctx.Err())
+			for _, pending := range pendingErrorEventLines {
+				if !preContentGate.Emit(pending, emitLine) {
 					return
 				}
 			}
-			if upstreamCompleted {
+			pendingErrorEventLines = pendingErrorEventLines[:0]
+			if !preContentGate.Emit(line, emitLine) {
+				return
+			}
+			if upstreamCompleted && (responseFormat != to || len(bytes.TrimSpace(line)) == 0) {
 				break
 			}
 		}
@@ -543,15 +489,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 			if errScan := scanner.Err(); errScan != nil {
-				errScan = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errScan)
-				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				streamUsage.PublishFailure(ctx, reporter, errScan)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-				case <-ctx.Done():
-				}
+				emitResponseError(errScan)
 				return
 			}
+		}
+		if len(pendingErrorEventLines) > 0 {
+			emitResponseError(statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream ended before error event data"})
+			return
+		}
+		if !preContentGate.Flush(emitLine) || !flushEvent() {
+			return
 		}
 		if upstreamCompleted {
 			commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))

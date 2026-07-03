@@ -52,6 +52,94 @@ func isClaudeSSEErrorEventPrefixLine(line []byte) bool {
 		isClaudeSSEErrorEventLine(trimmed)
 }
 
+type claudeStreamPreContentGate struct {
+	committed bool
+	heldLines [][]byte
+	heldBytes int
+}
+
+func (g *claudeStreamPreContentGate) Emit(line []byte, emit func([]byte) bool) bool {
+	if g == nil || g.committed {
+		return emit(line)
+	}
+	if isClaudeStreamPreContentLine(line) {
+		cloned := bytes.Clone(line)
+		g.heldLines = append(g.heldLines, cloned)
+		g.heldBytes += len(cloned)
+		if len(g.heldLines) <= claudeStreamPreContentMaxLines && g.heldBytes <= claudeStreamPreContentMaxBytes {
+			return true
+		}
+		g.committed = true
+		return g.Flush(emit)
+	}
+	g.committed = true
+	if !g.Flush(emit) {
+		return false
+	}
+	return emit(line)
+}
+
+func (g *claudeStreamPreContentGate) Flush(emit func([]byte) bool) bool {
+	if g == nil || len(g.heldLines) == 0 {
+		return true
+	}
+	for _, line := range g.heldLines {
+		if !emit(line) {
+			return false
+		}
+	}
+	g.heldLines = nil
+	g.heldBytes = 0
+	return true
+}
+
+func isClaudeStreamPreContentLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) || bytes.HasPrefix(trimmed, []byte("retry:")) {
+		return true
+	}
+	if event, ok := claudeSSEFieldValue(trimmed, "event"); ok {
+		switch strings.ToLower(event) {
+		case "error", "message_start", "ping":
+			return true
+		default:
+			return false
+		}
+	}
+	payload, ok := claudeSSEDataPayload(trimmed)
+	if !ok {
+		return false
+	}
+	if len(payload) == 0 {
+		return true
+	}
+	if bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return false
+	}
+	switch gjson.ParseBytes(payload).Get("type").String() {
+	case "error", "message_start", "ping":
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeSSEFieldValue(trimmed []byte, field string) (string, bool) {
+	prefix := []byte(field + ":")
+	if !bytes.HasPrefix(trimmed, prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(string(trimmed[len(prefix):])), true
+}
+
+func claudeSSEDataPayload(trimmed []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, false
+	}
+	return bytes.TrimSpace(trimmed[len("data:"):]), true
+}
+
 func claudeStreamErrorFromPayload(payload []byte) statusErr {
 	root := gjson.ParseBytes(payload)
 	message := strings.TrimSpace(root.Get("error.message").String())
