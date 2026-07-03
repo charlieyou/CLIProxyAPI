@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -43,7 +44,71 @@ func TestClaudeErrorExtractsClaudeStyleUpstreamJSON(t *testing.T) {
 	if got.Error.Type != "rate_limit_error" {
 		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
 	}
-	if got.Error.Message != "This request would exceed your account's rate limit. Please try again later." {
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "account") || strings.Contains(strings.ToLower(got.Error.Message), "rate limit") {
+		t.Fatalf("error.message leaked upstream limit details: %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorSanitizesSessionLimitText(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New("claude executor: upstream returned error event: api_error: Claude session limit reached"),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "session limit") {
+		t.Fatalf("error.message leaked session-limit details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorSanitizesModelCooldownText(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"code":"model_cooldown","message":"All credentials for model claude-fable-5 are cooling down via provider claude"}}`),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
+	}
+	lowerMessage := strings.ToLower(got.Error.Message)
+	if strings.Contains(lowerMessage, "credentials") || strings.Contains(lowerMessage, "cooling down") || strings.Contains(lowerMessage, "model_cooldown") {
+		t.Fatalf("error.message leaked pool cooldown details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorSanitizesAny429Text(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"type":"error","error":{"type":"rate_limit_error","message":"Request throttled by upstream"}}`),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "throttled") {
+		t.Fatalf("error.message leaked upstream 429 details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
 		t.Fatalf("error.message = %q", got.Error.Message)
 	}
 }
@@ -90,5 +155,46 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	}
 	if gotErr != wantErr {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorSuppressesLimitEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New("claude executor: upstream returned error event: api_error: Claude session limit reached"),
+	}
+
+	wrote := handler.writeClaudeTerminalStreamError(c, msg)
+
+	if wrote {
+		t.Fatal("terminal limit error was written downstream")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("terminal limit error leaked body: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorWritesNonLimitEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      errors.New("upstream disconnected"),
+	}
+
+	wrote := handler.writeClaudeTerminalStreamError(c, msg)
+
+	if !wrote {
+		t.Fatal("non-limit terminal error was not written")
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "upstream disconnected") {
+		t.Fatalf("terminal error body = %q", body)
 	}
 }

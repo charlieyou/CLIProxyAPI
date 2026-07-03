@@ -362,19 +362,24 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			_, _ = c.Writer.Write(chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			if errMsg == nil {
-				return
-			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			c.Status(status)
-
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
-			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+			h.writeClaudeTerminalStreamError(c, errMsg)
 		},
 	})
+}
+
+func (h *ClaudeCodeAPIHandler) writeClaudeTerminalStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || isClaudeLimitErrorMessage(errMsg) {
+		return false
+	}
+	status := http.StatusInternalServerError
+	if errMsg.StatusCode > 0 {
+		status = errMsg.StatusCode
+	}
+	c.Status(status)
+
+	errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+	_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+	return true
 }
 
 type claudeErrorDetail struct {
@@ -402,6 +407,10 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
+	if isClaudeLimitError(status, errText) {
+		errType = claudeErrorTypeFromStatus(status)
+		message = "Claude upstream capacity is temporarily unavailable. Please retry later."
+	}
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
@@ -471,6 +480,31 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 	}
 
 	return errType, message
+}
+
+func isClaudeLimitErrorMessage(msg *interfaces.ErrorMessage) bool {
+	if msg == nil {
+		return false
+	}
+	status := msg.StatusCode
+	if status <= 0 && msg.Error != nil {
+		if se, ok := msg.Error.(interface{ StatusCode() int }); ok && se != nil {
+			status = se.StatusCode()
+		}
+	}
+	errText := ""
+	if msg.Error != nil {
+		errText = msg.Error.Error()
+	}
+	return isClaudeLimitError(status, errText)
+}
+
+func isClaudeLimitError(status int, errText string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errText))
+	if strings.Contains(lower, "session limit") || strings.Contains(lower, "usage limit") {
+		return true
+	}
+	return status == http.StatusTooManyRequests
 }
 
 func claudeErrorTypeFromStatus(status int) string {
