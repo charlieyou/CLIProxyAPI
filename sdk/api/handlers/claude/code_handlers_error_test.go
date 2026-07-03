@@ -113,6 +113,47 @@ func TestClaudeErrorSanitizesAny429Text(t *testing.T) {
 	}
 }
 
+func TestClaudeErrorSanitizesOverloadedText(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("claude executor: upstream returned error event: overloaded_error: Overloaded"),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "api_error" {
+		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "overloaded") {
+		t.Fatalf("error.message leaked overloaded details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorSanitizesAuthUnavailableText(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("auth_unavailable: no auth available (providers=claude, model=claude-fable-5); check Claude auth/key session and cooldown state via /v0/management/auth-files"),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "api_error" {
+		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	}
+	lowerMessage := strings.ToLower(got.Error.Message)
+	if strings.Contains(lowerMessage, "auth_unavailable") || strings.Contains(lowerMessage, "no auth") || strings.Contains(lowerMessage, "management") {
+		t.Fatalf("error.message leaked auth-pool details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
 func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -175,6 +216,26 @@ func TestWriteClaudeTerminalStreamErrorSuppressesLimitEvent(t *testing.T) {
 	}
 	if recorder.Body.Len() != 0 {
 		t.Fatalf("terminal limit error leaked body: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorSuppressesOverloadedEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("claude executor: upstream returned error event: overloaded_error: Overloaded"),
+	}
+
+	wrote := handler.writeClaudeTerminalStreamError(c, msg)
+
+	if wrote {
+		t.Fatal("terminal overloaded error was written downstream")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("terminal overloaded error leaked body: %q", recorder.Body.String())
 	}
 }
 

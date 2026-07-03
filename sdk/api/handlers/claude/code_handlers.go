@@ -368,7 +368,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 }
 
 func (h *ClaudeCodeAPIHandler) writeClaudeTerminalStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) bool {
-	if errMsg == nil || isClaudeLimitErrorMessage(errMsg) {
+	if errMsg == nil || isClaudeCapacityErrorMessage(errMsg) {
 		return false
 	}
 	status := http.StatusInternalServerError
@@ -407,7 +407,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
-	if isClaudeLimitError(status, errText) {
+	if isClaudeCapacityError(status, errText) {
 		errType = claudeErrorTypeFromStatus(status)
 		message = "Claude upstream capacity is temporarily unavailable. Please retry later."
 	}
@@ -482,7 +482,7 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 	return errType, message
 }
 
-func isClaudeLimitErrorMessage(msg *interfaces.ErrorMessage) bool {
+func isClaudeCapacityErrorMessage(msg *interfaces.ErrorMessage) bool {
 	if msg == nil {
 		return false
 	}
@@ -496,15 +496,35 @@ func isClaudeLimitErrorMessage(msg *interfaces.ErrorMessage) bool {
 	if msg.Error != nil {
 		errText = msg.Error.Error()
 	}
-	return isClaudeLimitError(status, errText)
+	return isClaudeCapacityError(status, errText)
 }
 
-func isClaudeLimitError(status int, errText string) bool {
+func isClaudeCapacityError(status int, errText string) bool {
 	lower := strings.ToLower(strings.TrimSpace(errText))
 	if strings.Contains(lower, "session limit") || strings.Contains(lower, "usage limit") {
 		return true
 	}
-	return status == http.StatusTooManyRequests
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if status != http.StatusServiceUnavailable && status != 529 {
+		return false
+	}
+	patterns := [...]string{
+		"overloaded",
+		"auth_unavailable",
+		"auth_not_found",
+		"no auth available",
+		"no upstream model available",
+		"model_cooldown",
+		"cooling down",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeErrorTypeFromStatus(status int) string {
