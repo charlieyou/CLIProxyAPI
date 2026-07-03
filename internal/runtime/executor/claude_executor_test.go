@@ -1455,7 +1455,7 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 	if err == nil {
 		t.Fatal("Execute error = nil, want upstream error event")
 	}
-	assertStatusErr(t, err, http.StatusBadGateway)
+	assertStatusErr(t, err, http.StatusServiceUnavailable)
 	if !strings.Contains(err.Error(), "upstream overloaded") {
 		t.Fatalf("Execute error = %q, want upstream overloaded", err.Error())
 	}
@@ -2338,6 +2338,109 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	}
 	if !strings.Contains(err.Error(), "stream test error") {
 		t.Errorf("error message should contain decompressed JSON, got: %q", err.Error())
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_ErrorEventReturnsStatusErrorChunk(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Claude session limit reached\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before emitting error chunk")
+	}
+	if chunk.Err == nil {
+		t.Fatalf("chunk.Err = nil, payload=%q", chunk.Payload)
+	}
+	status, ok := chunk.Err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("chunk.Err = %T, want StatusCode()", chunk.Err)
+	}
+	if got := status.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if !strings.Contains(chunk.Err.Error(), "session limit") {
+		t.Fatalf("chunk.Err = %q, want session limit message", chunk.Err.Error())
+	}
+	if _, more := <-result.Chunks; more {
+		t.Fatal("stream produced chunks after terminal error")
+	}
+}
+
+func TestClaudeStreamErrorFromPayloadIncludesErrorType(t *testing.T) {
+	streamErr := claudeStreamErrorFromPayload([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"roles must alternate"}}`))
+	if got := streamErr.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusBadRequest)
+	}
+	if !strings.Contains(streamErr.Error(), "invalid_request_error") {
+		t.Fatalf("Error() = %q, want invalid_request_error", streamErr.Error())
+	}
+	if !strings.Contains(streamErr.Error(), "roles must alternate") {
+		t.Fatalf("Error() = %q, want upstream message", streamErr.Error())
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_TruncatedErrorEventReturnsErrorChunk(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: error\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-fable-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before emitting error chunk")
+	}
+	if chunk.Err == nil {
+		t.Fatalf("chunk.Err = nil, payload=%q", chunk.Payload)
+	}
+	status, ok := chunk.Err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("chunk.Err = %T, want StatusCode()", chunk.Err)
+	}
+	if got := status.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusBadGateway)
+	}
+	if !strings.Contains(chunk.Err.Error(), "ended before error event data") {
+		t.Fatalf("chunk.Err = %q, want truncated error-event message", chunk.Err.Error())
 	}
 }
 
