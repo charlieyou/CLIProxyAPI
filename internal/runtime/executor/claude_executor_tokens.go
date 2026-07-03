@@ -19,6 +19,89 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func claudeStreamErrorFromLine(line []byte) (statusErr, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return statusErr{}, false
+	}
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return statusErr{}, false
+	}
+	root := gjson.ParseBytes(payload)
+	if root.Get("type").String() != "error" {
+		return statusErr{}, false
+	}
+	return claudeStreamErrorFromPayload(payload), true
+}
+
+func isClaudeSSEErrorEventLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("event:")) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(string(trimmed[len("event:"):])), "error")
+}
+
+func isClaudeSSEErrorEventPrefixLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	return len(trimmed) == 0 ||
+		bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) ||
+		bytes.HasPrefix(trimmed, []byte("retry:")) ||
+		isClaudeSSEErrorEventLine(trimmed)
+}
+
+func claudeStreamErrorFromPayload(payload []byte) statusErr {
+	root := gjson.ParseBytes(payload)
+	message := strings.TrimSpace(root.Get("error.message").String())
+	errType := strings.TrimSpace(root.Get("error.type").String())
+	if message == "" {
+		message = errType
+	} else if errType != "" && !strings.Contains(message, errType) {
+		message = errType + ": " + message
+	}
+	if message == "" {
+		message = "unknown upstream error"
+	}
+	return statusErr{
+		code: claudeStreamErrorStatus(root, message),
+		msg:  "claude executor: upstream returned error event: " + message,
+	}
+}
+
+func claudeStreamErrorStatus(root gjson.Result, message string) int {
+	errType := strings.ToLower(strings.TrimSpace(root.Get("error.type").String()))
+	errCode := strings.ToLower(strings.TrimSpace(root.Get("error.code").String()))
+	lowerMessage := strings.ToLower(strings.TrimSpace(message))
+	lowerRaw := strings.ToLower(root.Raw)
+
+	switch {
+	case strings.Contains(errType, "invalid_request") || strings.Contains(errCode, "invalid_request") ||
+		strings.Contains(lowerRaw, "invalid_request_error"):
+		return http.StatusBadRequest
+	case strings.Contains(errType, "rate_limit") || strings.Contains(errType, "usage_limit") ||
+		strings.Contains(errCode, "rate_limit") || strings.Contains(errCode, "usage_limit") ||
+		strings.Contains(lowerMessage, "session limit") || strings.Contains(lowerMessage, "usage limit") ||
+		strings.Contains(lowerMessage, "rate limit") || strings.Contains(lowerMessage, "quota") ||
+		strings.Contains(lowerMessage, "too many requests"):
+		return http.StatusTooManyRequests
+	case strings.Contains(errType, "authentication") || strings.Contains(errCode, "auth") ||
+		strings.Contains(lowerMessage, "invalid api key") || strings.Contains(lowerMessage, "expired token") ||
+		strings.Contains(lowerMessage, "invalid or expired token"):
+		return http.StatusUnauthorized
+	case strings.Contains(errType, "permission") || strings.Contains(errCode, "permission") ||
+		strings.Contains(lowerMessage, "permission") || strings.Contains(lowerMessage, "forbidden") ||
+		strings.Contains(lowerMessage, "payment") || strings.Contains(lowerMessage, "billing") ||
+		strings.Contains(lowerMessage, "credit"):
+		return http.StatusForbidden
+	case strings.Contains(errType, "overloaded") || strings.Contains(errCode, "overloaded"):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadGateway
+	}
+}
+
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {

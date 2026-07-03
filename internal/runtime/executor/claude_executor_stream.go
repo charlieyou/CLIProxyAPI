@@ -408,6 +408,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
+			pendingErrorEvent := false
 			var upstreamMessageID string
 			upstreamCompleted := false
 			flushEvent := func() bool {
@@ -429,6 +430,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				reporter.ObserveResponseModel(line)
 				streamUsage.ObserveClaudeStream(line)
+				if isClaudeSSEErrorEventLine(line) {
+					pendingErrorEvent = true
+					continue
+				}
+				if pendingErrorEvent && !bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) && isClaudeSSEErrorEventPrefixLine(line) {
+					continue
+				}
+				if streamErr, ok := claudeStreamErrorFromLine(line); ok {
+					emitResponseError(streamErr)
+					return
+				}
+				pendingErrorEvent = false
+				if streamErr, ok := claudeStreamErrorFromLine(line); ok {
+					emitResponseError(streamErr)
+					return
+				}
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 				if errRestore != nil {
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
@@ -446,6 +463,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						break
 					}
 				}
+			}
+			if pendingErrorEvent {
+				emitResponseError(statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream ended before error event data"})
+				return
 			}
 			if !flushEvent() {
 				emitCancellation(ctx.Err())
@@ -568,14 +589,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 		root := gjson.ParseBytes(payload)
 		switch root.Get("type").String() {
 		case "error":
-			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
-			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			return claudeStreamErrorFromPayload(payload)
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
