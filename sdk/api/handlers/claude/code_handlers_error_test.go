@@ -123,8 +123,8 @@ func TestClaudeErrorSanitizesOverloadedText(t *testing.T) {
 
 	got := handler.toClaudeError(msg)
 
-	if got.Error.Type != "api_error" {
-		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
 	}
 	if strings.Contains(strings.ToLower(got.Error.Message), "overloaded") {
 		t.Fatalf("error.message leaked overloaded details: %q", got.Error.Message)
@@ -143,8 +143,8 @@ func TestClaudeErrorSanitizesAnyServiceUnavailableText(t *testing.T) {
 
 	got := handler.toClaudeError(msg)
 
-	if got.Error.Type != "api_error" {
-		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
 	}
 	lowerMessage := strings.ToLower(got.Error.Message)
 	if strings.Contains(lowerMessage, "temporary") || strings.Contains(lowerMessage, "api_error") {
@@ -164,12 +164,32 @@ func TestClaudeErrorSanitizesAuthUnavailableText(t *testing.T) {
 
 	got := handler.toClaudeError(msg)
 
-	if got.Error.Type != "api_error" {
-		t.Fatalf("error.type = %q, want api_error", got.Error.Type)
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
 	}
 	lowerMessage := strings.ToLower(got.Error.Message)
 	if strings.Contains(lowerMessage, "auth_unavailable") || strings.Contains(lowerMessage, "no auth") || strings.Contains(lowerMessage, "management") {
 		t.Fatalf("error.message leaked auth-pool details: %q", got.Error.Message)
+	}
+	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorRemaps529CapacityToRateLimit(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: 529,
+		Error:      errors.New("claude executor: upstream returned error event: overloaded_error: Overloaded"),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "overloaded") {
+		t.Fatalf("error.message leaked upstream capacity details: %q", got.Error.Message)
 	}
 	if got.Error.Message != "Claude upstream capacity is temporarily unavailable. Please retry later." {
 		t.Fatalf("error.message = %q", got.Error.Message)
@@ -220,6 +240,113 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+}
+
+func TestWriteClaudeErrorResponseRemapsCapacity503ToRateLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("claude executor: upstream returned error event: api_error: temporary upstream capacity failure"),
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60", got)
+	}
+	body := recorder.Body.Bytes()
+	if got := gjson.GetBytes(body, "error.type").String(); got != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "error.message").String(); got != "Claude upstream capacity is temporarily unavailable. Please retry later." {
+		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+	lowerBody := strings.ToLower(string(body))
+	if strings.Contains(lowerBody, "temporary upstream") || strings.Contains(lowerBody, "api_error") {
+		t.Fatalf("body leaked upstream capacity details: %s", body)
+	}
+}
+
+func TestWriteClaudeErrorResponseKeepsModelCooldownAs429(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"code":"model_cooldown","message":"All credentials for model claude-fable-5 are cooling down via provider claude"}}`),
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want empty without remap", got)
+	}
+	body := recorder.Body.Bytes()
+	if got := gjson.GetBytes(body, "error.type").String(); got != "rate_limit_error" {
+		t.Fatalf("error.type = %q, want rate_limit_error; body=%s", got, body)
+	}
+	if strings.Contains(strings.ToLower(string(body)), "model_cooldown") {
+		t.Fatalf("body leaked cooldown details: %s", body)
+	}
+}
+
+func TestClaudeDownstreamStatusDoesNotRemapNonCapacityErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *interfaces.ErrorMessage
+		want int
+	}{
+		{
+			name: "invalid request",
+			msg: &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadRequest,
+				Error:      errors.New(`{"error":{"message":"bad request","type":"invalid_request_error"}}`),
+			},
+			want: http.StatusBadRequest,
+		},
+		{
+			name: "authentication",
+			msg: &interfaces.ErrorMessage{
+				StatusCode: http.StatusUnauthorized,
+				Error:      errors.New("invalid or expired token"),
+			},
+			want: http.StatusUnauthorized,
+		},
+		{
+			name: "permission",
+			msg: &interfaces.ErrorMessage{
+				StatusCode: http.StatusForbidden,
+				Error:      errors.New("permission denied"),
+			},
+			want: http.StatusForbidden,
+		},
+		{
+			name: "gateway timeout",
+			msg: &interfaces.ErrorMessage{
+				StatusCode: http.StatusGatewayTimeout,
+				Error:      errors.New("upstream timed out"),
+			},
+			want: http.StatusGatewayTimeout,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claudeDownstreamStatus(tc.msg); got != tc.want {
+				t.Fatalf("claudeDownstreamStatus() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
