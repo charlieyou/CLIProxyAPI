@@ -358,13 +358,10 @@ type claudeErrorResponse struct {
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
-	status := http.StatusInternalServerError
-	errText := http.StatusText(status)
+	rawStatus := claudeRawStatus(msg)
+	status := claudeDownstreamStatus(msg)
+	errText := http.StatusText(rawStatus)
 	if msg != nil {
-		if msg.StatusCode > 0 {
-			status = msg.StatusCode
-			errText = http.StatusText(status)
-		}
 		if msg.Error != nil {
 			if v := strings.TrimSpace(msg.Error.Error()); v != "" {
 				errText = v
@@ -395,10 +392,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 }
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status := claudeDownstreamStatus(msg)
 	if msg != nil && msg.DirectResponse {
 		for key, values := range handlers.FilterUpstreamHeaders(msg.Headers) {
 			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
@@ -434,6 +428,9 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			}
 		}
 	}
+	if claudeRemapsCapacityStatus(msg) && c.Writer.Header().Get("Retry-After") == "" {
+		c.Writer.Header().Set("Retry-After", "60")
+	}
 
 	body, err := json.Marshal(h.toClaudeError(msg))
 	if err != nil {
@@ -445,6 +442,28 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	}
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+func claudeRawStatus(msg *interfaces.ErrorMessage) int {
+	if msg != nil && msg.StatusCode > 0 {
+		return msg.StatusCode
+	}
+	return http.StatusInternalServerError
+}
+
+func claudeDownstreamStatus(msg *interfaces.ErrorMessage) int {
+	if claudeRemapsCapacityStatus(msg) {
+		return http.StatusTooManyRequests
+	}
+	return claudeRawStatus(msg)
+}
+
+func claudeRemapsCapacityStatus(msg *interfaces.ErrorMessage) bool {
+	if msg == nil || isClaudeCancellationErrorMessage(msg) {
+		return false
+	}
+	status := claudeRawStatus(msg)
+	return (status == http.StatusServiceUnavailable || status == 529) && isClaudeCapacityErrorMessage(msg)
 }
 
 func claudeErrorDetailFromText(status int, errText string) (string, string) {
