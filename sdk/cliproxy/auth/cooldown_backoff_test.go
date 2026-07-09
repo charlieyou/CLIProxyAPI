@@ -119,8 +119,8 @@ func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
 		t.Fatalf("expected BackoffLevel 1 after first failure, got %d", auth.Quota.BackoffLevel)
 	}
 	firstRecover := auth.Quota.NextRecoverAt
-	if !firstRecover.Equal(now.Add(time.Second)) {
-		t.Fatalf("expected first window to close at %v, got %v", now.Add(time.Second), firstRecover)
+	if !firstRecover.Equal(now.Add(quotaBackoffBase)) {
+		t.Fatalf("expected first window to close at %v, got %v", now.Add(quotaBackoffBase), firstRecover)
 	}
 
 	// In-window failure keeps the current window and level.
@@ -133,22 +133,26 @@ func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
 	}
 
 	// A failure after the window expired escalates to the next level.
-	applyAuthFailureState(auth, quotaErr, nil, now.Add(2*time.Second), false)
+	secondFailureAt := firstRecover.Add(time.Second)
+	applyAuthFailureState(auth, quotaErr, nil, secondFailureAt, false)
 	if auth.Quota.BackoffLevel != 2 {
 		t.Fatalf("expected BackoffLevel 2 after post-window failure, got %d", auth.Quota.BackoffLevel)
 	}
-	if !auth.Quota.NextRecoverAt.Equal(now.Add(4 * time.Second)) {
-		t.Fatalf("expected second window to close at %v, got %v", now.Add(4*time.Second), auth.Quota.NextRecoverAt)
+	secondRecover := secondFailureAt.Add(2 * quotaBackoffBase)
+	if !auth.Quota.NextRecoverAt.Equal(secondRecover) {
+		t.Fatalf("expected second window to close at %v, got %v", secondRecover, auth.Quota.NextRecoverAt)
 	}
 
 	// A provider supplied retry hint always takes effect, even in-window.
 	retryAfter := 10 * time.Second
-	applyAuthFailureState(auth, quotaErr, &retryAfter, now.Add(3*time.Second), false)
+	retryFailureAt := secondFailureAt.Add(time.Second)
+	applyAuthFailureState(auth, quotaErr, &retryAfter, retryFailureAt, false)
 	if auth.Quota.BackoffLevel != 2 {
 		t.Fatalf("expected BackoffLevel to stay 2 with retry hint, got %d", auth.Quota.BackoffLevel)
 	}
-	if !auth.Quota.NextRecoverAt.Equal(now.Add(13 * time.Second)) {
-		t.Fatalf("expected retry hint window to close at %v, got %v", now.Add(13*time.Second), auth.Quota.NextRecoverAt)
+	retryRecover := retryFailureAt.Add(retryAfter)
+	if !auth.Quota.NextRecoverAt.Equal(retryRecover) {
+		t.Fatalf("expected retry hint window to close at %v, got %v", retryRecover, auth.Quota.NextRecoverAt)
 	}
 }
 

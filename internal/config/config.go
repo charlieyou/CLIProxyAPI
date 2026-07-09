@@ -399,12 +399,14 @@ func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
 
 // Validate checks that enabled_providers contains only known provider keys.
 func (c *QuotaRefreshConfig) Validate() error {
+	const geminiCLIProvider = "gemini-cli"
+
 	validProviders := map[string]bool{
-		constant.Codex:     true,
-		constant.GeminiCLI: true,
-		constant.Claude:    true,
+		constant.Codex:    true,
+		geminiCLIProvider: true,
+		constant.Claude:   true,
 	}
-	validKeys := []string{constant.Codex, constant.GeminiCLI, constant.Claude}
+	validKeys := []string{constant.Codex, geminiCLIProvider, constant.Claude}
 	for _, p := range c.EnabledProviders {
 		if !validProviders[p] {
 			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: %s)", p, strings.Join(validKeys, ", "))
