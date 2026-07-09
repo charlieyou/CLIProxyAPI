@@ -2555,6 +2555,23 @@ func codexClientTestMaxTemplatePriority(t *testing.T) int {
 	return maxPriority
 }
 
+func codexClientTestMaxTemplatePriority(t *testing.T) int {
+	t.Helper()
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(registry.GetCodexClientModelsJSON(), &catalog); err != nil {
+		t.Fatalf("failed to parse Codex client model templates: %v", err)
+	}
+	maxPriority := 0
+	for _, model := range catalog.Models {
+		if priority := codexClientTestPriority(model["priority"]); priority > maxPriority {
+			maxPriority = priority
+		}
+	}
+	return maxPriority
+}
+
 func assertCodexSupportedReasoningLevels(t *testing.T, model map[string]any, want []string) {
 	t.Helper()
 
