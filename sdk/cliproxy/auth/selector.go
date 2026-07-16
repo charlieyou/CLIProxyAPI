@@ -408,6 +408,16 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		)
 	}
 
+	var earliestTimeToReset time.Duration
+	for _, data := range sortData {
+		if data.tier != 0 {
+			continue
+		}
+		if earliestTimeToReset == 0 || data.metrics.timeToReset < earliestTimeToReset {
+			earliestTimeToReset = data.metrics.timeToReset
+		}
+	}
+
 	sort.Slice(available, func(i, j int) bool {
 		di := sortData[available[i].ID]
 		dj := sortData[available[j].ID]
@@ -417,7 +427,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		}
 
 		if di.tier == 0 {
-			cmp := compareQuotaMetrics(di.metrics, dj.metrics)
+			cmp := compareQuotaMetrics(di.metrics, dj.metrics, earliestTimeToReset)
 			if cmp != 0 {
 				return cmp < 0
 			}
@@ -557,9 +567,11 @@ func quotaMetricsFromSnapshot(snap QuotaWindowState, model string, now time.Time
 	return quotaMetrics{timeToReset: bestTimeToReset, usedPercent: bestUsedPercent, hasExpiration: true}, true
 }
 
-// compareQuotaMetrics compares two quota metrics using 5-minute bucket equivalence.
+// compareQuotaMetrics compares two quota metrics using 5-minute cohorts anchored
+// to the earliest tier-0 reset. Cohorts remain stable while the eligible credentials
+// and their reset timestamps are unchanged; an exact 5-minute offset starts a new cohort.
 // Returns -1 if a is better, +1 if b is better, 0 if equal.
-func compareQuotaMetrics(a, b quotaMetrics) int {
+func compareQuotaMetrics(a, b quotaMetrics, earliestTimeToReset time.Duration) int {
 	if a.hasExpiration && !b.hasExpiration {
 		return -1
 	}
@@ -569,8 +581,8 @@ func compareQuotaMetrics(a, b quotaMetrics) int {
 
 	if a.hasExpiration && b.hasExpiration {
 		const bucketSize = 5 * time.Minute
-		bucketA := a.timeToReset / bucketSize
-		bucketB := b.timeToReset / bucketSize
+		bucketA := (a.timeToReset - earliestTimeToReset) / bucketSize
+		bucketB := (b.timeToReset - earliestTimeToReset) / bucketSize
 		if bucketA < bucketB {
 			return -1
 		}

@@ -36,6 +36,76 @@ func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	}
 }
 
+func TestCompareQuotaMetrics_NearbyResetsStayInSameCohort(t *testing.T) {
+	t.Parallel()
+
+	earliest := 10*time.Hour + 21*time.Second
+	later := earliest + 47*time.Second
+	lowerUsage := quotaMetrics{timeToReset: later, usedPercent: 65, hasExpiration: true}
+	higherUsage := quotaMetrics{timeToReset: earliest, usedPercent: 67, hasExpiration: true}
+
+	if got := compareQuotaMetrics(lowerUsage, higherUsage, earliest); got != -1 {
+		t.Fatalf("compareQuotaMetrics() = %d, want -1 for lower usage in same reset cohort", got)
+	}
+
+	// Advancing time across an old duration-based bucket boundary must not change selection.
+	advance := 30 * time.Second
+	lowerUsage.timeToReset -= advance
+	higherUsage.timeToReset -= advance
+	if got := compareQuotaMetrics(lowerUsage, higherUsage, earliest-advance); got != -1 {
+		t.Fatalf("compareQuotaMetrics() after time advance = %d, want -1", got)
+	}
+
+	lowerUsage.timeToReset = earliest + 5*time.Minute - time.Nanosecond
+	if got := compareQuotaMetrics(lowerUsage, higherUsage, earliest); got != -1 {
+		t.Fatalf("compareQuotaMetrics() just inside cohort boundary = %d, want -1", got)
+	}
+
+	lowerUsage.timeToReset = earliest + 5*time.Minute
+	if got := compareQuotaMetrics(lowerUsage, higherUsage, earliest); got != 1 {
+		t.Fatalf("compareQuotaMetrics() at next cohort boundary = %d, want 1", got)
+	}
+}
+
+func TestFillFirstSelectorPick_NearbyQuotaResetsStayInSameCohort(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	settings := QuotaRefreshSettings{
+		Enabled:          true,
+		StaleThreshold:   time.Hour,
+		EnabledProviders: []string{"codex"},
+	}
+	snapshots := map[string]QuotaWindowState{
+		"hey": {
+			LastFetchedAt: now,
+			Windows:       []QuotaWindow{{Name: "seven_day", ResetAt: now.Add(10 * time.Hour), UsedPercent: 67}},
+		},
+		"rwa": {
+			LastFetchedAt: now,
+			Windows:       []QuotaWindow{{Name: "seven_day", ResetAt: now.Add(10*time.Hour + 47*time.Second), UsedPercent: 65}},
+		},
+		"plus": {
+			LastFetchedAt: now,
+			Windows:       []QuotaWindow{{Name: "seven_day", ResetAt: now.Add(34 * time.Hour), UsedPercent: 0}},
+		},
+	}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{"quotaSnapshots": snapshots}}
+
+	for _, auths := range [][]*Auth{
+		{{ID: "hey", Provider: "codex"}, {ID: "rwa", Provider: "codex"}, {ID: "plus", Provider: "codex"}},
+		{{ID: "plus", Provider: "codex"}, {ID: "rwa", Provider: "codex"}, {ID: "hey", Provider: "codex"}},
+	} {
+		got, err := NewFillFirstSelector(settings, nil).Pick(context.Background(), "codex", "gpt-5.6-sol", opts, auths)
+		if err != nil {
+			t.Fatalf("Pick() error = %v", err)
+		}
+		if got.ID != "rwa" {
+			t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "rwa")
+		}
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 
