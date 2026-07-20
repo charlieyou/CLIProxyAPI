@@ -434,6 +434,8 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	}
 
 	var persistSnapshot *Auth
+	var resumedModels []string
+	cooldownStateChanged := false
 
 	m.mu.Lock()
 
@@ -476,14 +478,42 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		return
 	}
 
+	var cooldownRecordsBefore []CooldownStateRecord
+	trackCooldownState := m.cooldownStore != nil
+	if trackCooldownState {
+		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+	}
+	previousWindows := auth.QuotaWindows.Windows
 	auth.QuotaWindows.Windows = windows
 	auth.QuotaWindows.LastFetchedAt = now
 	auth.QuotaWindows.LastFetchError = nil
+	resumedModels = reconcileQuotaWindowRollovers(auth, previousWindows, windows, now)
 	persistSnapshot = auth.Clone()
+	if trackCooldownState && len(resumedModels) > 0 {
+		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+	}
 	m.mu.Unlock()
 
 	// Persist outside the lock: store.Save may perform I/O.
 	_ = m.persist(ctx, persistSnapshot)
+	if len(resumedModels) > 0 {
+		reg := registry.GetGlobalRegistry()
+		for _, model := range resumedModels {
+			reg.ClearModelQuotaExceeded(authID, model)
+			reg.ResumeClientModel(authID, model)
+		}
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(persistSnapshot)
+		}
+		if cooldownStateChanged {
+			m.persistCooldownStates(ctx)
+		}
+		log.WithFields(log.Fields{
+			"auth_id": authID,
+			"models":  resumedModels,
+		}).Info("quota window rollover cleared stale model cooldowns")
+	}
 
 	soonestReset := time.Time{}
 	for _, window := range windows {
@@ -504,6 +534,93 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		"window_count":  len(windows),
 		"soonest_reset": soonestStr,
 	}).Debug("quota refresh success")
+}
+
+func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows []QuotaWindow, now time.Time) []string {
+	if auth == nil || len(auth.ModelStates) == 0 || len(previousWindows) == 0 || len(currentWindows) == 0 {
+		return nil
+	}
+
+	resumedModels := make([]string, 0)
+	for model, state := range auth.ModelStates {
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.Quota.Reason != "quota" ||
+			state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) || state.Quota.NextRecoverAt.IsZero() {
+			continue
+		}
+
+		recoverAt := state.Quota.NextRecoverAt
+		if _, matches := quotaWindowMatchingReset(currentWindows, recoverAt); matches > 0 {
+			continue
+		}
+		previousWindow, matches := quotaWindowMatchingReset(previousWindows, recoverAt)
+		if matches != 1 {
+			continue
+		}
+		currentWindow, ok := quotaWindowNamed(currentWindows, previousWindow.Name)
+		if !ok || currentWindow.RequestAllowed == nil || !*currentWindow.RequestAllowed {
+			continue
+		}
+		rolloverBoundary := recoverAt
+		if previousWindow.ResetAt.After(rolloverBoundary) {
+			rolloverBoundary = previousWindow.ResetAt
+		}
+		if !currentWindow.ResetAt.After(rolloverBoundary.Add(quotaWindowResetMatchTolerance)) {
+			continue
+		}
+
+		resetModelState(state, now)
+		resumedModels = append(resumedModels, model)
+	}
+
+	if len(resumedModels) == 0 {
+		return nil
+	}
+	sort.Strings(resumedModels)
+	updateAggregatedAvailability(auth, now)
+	if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
+		auth.LastError = nil
+		auth.StatusMessage = ""
+		auth.Status = StatusActive
+	}
+	auth.UpdatedAt = now
+	return resumedModels
+}
+
+func quotaWindowMatchingReset(windows []QuotaWindow, resetAt time.Time) (QuotaWindow, int) {
+	var matched QuotaWindow
+	matchedDelta := quotaWindowResetMatchTolerance + time.Nanosecond
+	matches := 0
+	for _, window := range windows {
+		if strings.TrimSpace(window.Name) == "" || window.ResetAt.IsZero() {
+			continue
+		}
+		delta := window.ResetAt.Sub(resetAt)
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > quotaWindowResetMatchTolerance {
+			continue
+		}
+		matches++
+		if delta < matchedDelta {
+			matched = window
+			matchedDelta = delta
+		}
+	}
+	return matched, matches
+}
+
+func quotaWindowNamed(windows []QuotaWindow, name string) (QuotaWindow, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return QuotaWindow{}, false
+	}
+	for _, window := range windows {
+		if strings.EqualFold(strings.TrimSpace(window.Name), name) {
+			return window, true
+		}
+	}
+	return QuotaWindow{}, false
 }
 
 // recordUsageEndpointRateLimit stores a per-auth cooldown after a 429 from

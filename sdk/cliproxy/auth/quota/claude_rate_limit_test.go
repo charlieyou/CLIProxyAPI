@@ -108,3 +108,74 @@ func TestCodexProviderRateLimited(t *testing.T) {
 		t.Fatalf("RetryAfter = %v, want 60s", rl.RetryAfter)
 	}
 }
+
+func TestCodexProviderPropagatesRequestAvailability(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		response    string
+		wantAllowed *bool
+	}{
+		{
+			name:        "requests allowed",
+			response:    `{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"reset_at":1785128435,"used_percent":2}}}`,
+			wantAllowed: boolPointer(true),
+		},
+		{
+			name:        "limit reached",
+			response:    `{"rate_limit":{"allowed":true,"limit_reached":true,"primary_window":{"reset_at":1785128435,"used_percent":100}}}`,
+			wantAllowed: boolPointer(false),
+		},
+		{
+			name:     "availability omitted",
+			response: `{"rate_limit":{"primary_window":{"reset_at":1785128435,"used_percent":2}}}`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(testCase.response))
+			}))
+			t.Cleanup(srv.Close)
+
+			target, errParse := url.Parse(srv.URL)
+			if errParse != nil {
+				t.Fatalf("parse test URL: %v", errParse)
+			}
+
+			provider := NewCodexQuotaProvider()
+			provider.client = &http.Client{Transport: &rewriteHostTransport{target: target, base: http.DefaultTransport}}
+			windows, errFetch := provider.FetchWindows(context.Background(), &auth.Auth{
+				ID:       "test-codex-availability",
+				Provider: "codex",
+				Metadata: map[string]any{"access_token": "stub"},
+			}, "")
+			if errFetch != nil {
+				t.Fatalf("FetchWindows() error = %v", errFetch)
+			}
+			if len(windows) != 1 {
+				t.Fatalf("FetchWindows() returned %d windows, want 1", len(windows))
+			}
+			gotAllowed := windows[0].RequestAllowed
+			if testCase.wantAllowed == nil {
+				if gotAllowed != nil {
+					t.Fatalf("RequestAllowed = %v, want nil", *gotAllowed)
+				}
+				return
+			}
+			if gotAllowed == nil || *gotAllowed != *testCase.wantAllowed {
+				t.Fatalf("RequestAllowed = %v, want %v", gotAllowed, *testCase.wantAllowed)
+			}
+		})
+	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
+}

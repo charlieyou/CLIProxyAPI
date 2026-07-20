@@ -72,6 +72,8 @@ func (p *CodexQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mod
 	}
 	var result struct {
 		RateLimit struct {
+			Allowed         *bool       `json:"allowed"`
+			LimitReached    *bool       `json:"limit_reached"`
 			PrimaryWindow   *windowData `json:"primary_window"`
 			SecondaryWindow *windowData `json:"secondary_window"`
 		} `json:"rate_limit"`
@@ -79,15 +81,21 @@ func (p *CodexQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mod
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("codex quota parse failed: %w", err)
 	}
+	var requestAllowed *bool
+	if result.RateLimit.Allowed != nil && result.RateLimit.LimitReached != nil {
+		allowed := *result.RateLimit.Allowed && !*result.RateLimit.LimitReached
+		requestAllowed = &allowed
+	}
 
 	// Best-effort parse: extract windows that are present, skip missing ones
 	var windows []auth.QuotaWindow
 
 	if result.RateLimit.PrimaryWindow != nil && result.RateLimit.PrimaryWindow.ResetAt > 0 {
 		windows = append(windows, auth.QuotaWindow{
-			Name:        "primary",
-			ResetAt:     time.Unix(result.RateLimit.PrimaryWindow.ResetAt, 0),
-			UsedPercent: result.RateLimit.PrimaryWindow.UsedPercent,
+			Name:           "primary",
+			ResetAt:        time.Unix(result.RateLimit.PrimaryWindow.ResetAt, 0),
+			UsedPercent:    result.RateLimit.PrimaryWindow.UsedPercent,
+			RequestAllowed: requestAllowed,
 		})
 	} else {
 		log.Debug("codex quota response missing primary_window, skipping")
@@ -95,9 +103,10 @@ func (p *CodexQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mod
 
 	if result.RateLimit.SecondaryWindow != nil && result.RateLimit.SecondaryWindow.ResetAt > 0 {
 		windows = append(windows, auth.QuotaWindow{
-			Name:        "secondary",
-			ResetAt:     time.Unix(result.RateLimit.SecondaryWindow.ResetAt, 0),
-			UsedPercent: result.RateLimit.SecondaryWindow.UsedPercent,
+			Name:           "secondary",
+			ResetAt:        time.Unix(result.RateLimit.SecondaryWindow.ResetAt, 0),
+			UsedPercent:    result.RateLimit.SecondaryWindow.UsedPercent,
+			RequestAllowed: requestAllowed,
 		})
 	} else {
 		log.Debug("codex quota response missing secondary_window, skipping")

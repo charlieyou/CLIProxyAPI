@@ -201,6 +201,9 @@ type QuotaWindow struct {
 	ResetAt time.Time `json:"reset_at"`
 	// UsedPercent is the current usage percentage (0-100).
 	UsedPercent float64 `json:"used_percent,omitempty"`
+	// RequestAllowed reports whether the provider says this credential can accept requests.
+	// Nil means the provider did not supply an authoritative availability signal.
+	RequestAllowed *bool `json:"request_allowed,omitempty"`
 }
 
 // QuotaWindowState tracks quota window information fetched on 429 responses.
@@ -362,6 +365,12 @@ func (a *Auth) Clone() *Auth {
 	if len(a.QuotaWindows.Windows) > 0 {
 		copyAuth.QuotaWindows.Windows = make([]QuotaWindow, len(a.QuotaWindows.Windows))
 		copy(copyAuth.QuotaWindows.Windows, a.QuotaWindows.Windows)
+		for i := range copyAuth.QuotaWindows.Windows {
+			if a.QuotaWindows.Windows[i].RequestAllowed != nil {
+				requestAllowed := *a.QuotaWindows.Windows[i].RequestAllowed
+				copyAuth.QuotaWindows.Windows[i].RequestAllowed = &requestAllowed
+			}
+		}
 	}
 	if a.QuotaWindows.LastFetchError != nil {
 		copyAuth.QuotaWindows.LastFetchError = &Error{

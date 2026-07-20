@@ -31,11 +31,12 @@ const (
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
-	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Minute
-	quotaBackoffMax           = 30 * time.Minute
-	minQuotaCooldownFloor     = 10 * time.Second
-	transientErrorCooldown    = time.Minute
+	refreshIneffectiveBackoff      = 30 * time.Second
+	quotaBackoffBase               = time.Minute
+	quotaBackoffMax                = 30 * time.Minute
+	quotaWindowResetMatchTolerance = 2 * time.Minute
+	minQuotaCooldownFloor          = 10 * time.Second
+	transientErrorCooldown         = time.Minute
 )
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness
