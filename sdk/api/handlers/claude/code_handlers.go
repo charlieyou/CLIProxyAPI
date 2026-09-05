@@ -285,6 +285,10 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
+					if isClaudeCancellationErrorMessage(errMsg) {
+						cliCancel(errMsg.Error)
+						return
+					}
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)

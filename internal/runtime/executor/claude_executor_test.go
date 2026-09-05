@@ -9882,7 +9882,7 @@ func TestClaudeExecutor_Execute_OAuthRestoresOriginalToolNameCasing(t *testing.T
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-test-token",
 		"base_url": server.URL,
 	}}
@@ -9913,7 +9913,7 @@ func TestClaudeExecutor_ExecuteStream_OAuthRestoresOriginalToolNameCasing(t *tes
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-test-token",
 		"base_url": server.URL,
 	}}

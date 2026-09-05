@@ -146,14 +146,14 @@ func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
 		t.Fatalf("expected second window to close at %v, got %v", secondRecover, auth.Quota.NextRecoverAt)
 	}
 
-	// A provider supplied retry hint always takes effect, even in-window.
+	// A shorter provider retry hint must not shorten an active cooldown.
 	retryAfter := 10 * time.Second
 	retryFailureAt := secondFailureAt.Add(time.Second)
 	applyAuthFailureState(auth, quotaErr, &retryAfter, retryFailureAt, false)
 	if auth.Quota.BackoffLevel != 2 {
 		t.Fatalf("expected BackoffLevel to stay 2 with retry hint, got %d", auth.Quota.BackoffLevel)
 	}
-	retryRecover := retryFailureAt.Add(retryAfter)
+	retryRecover := secondRecover
 	if !auth.Quota.NextRecoverAt.Equal(retryRecover) {
 		t.Fatalf("expected retry hint window to close at %v, got %v", retryRecover, auth.Quota.NextRecoverAt)
 	}

@@ -568,6 +568,10 @@ func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows [
 			continue
 		}
 
+		// Clear only the aggregate cooldown tied to this rolled-over model window.
+		if auth.Quota.Reason == "quota" && auth.Quota.NextRecoverAt.Equal(recoverAt) {
+			applyCooldownFields(&auth.Quota, QuotaState{})
+		}
 		resetModelState(state, now)
 		resumedModels = append(resumedModels, model)
 	}
@@ -576,6 +580,7 @@ func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows [
 		return nil
 	}
 	sort.Strings(resumedModels)
+	auth.Generation++
 	updateAggregatedAvailability(auth, now)
 	if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
 		auth.LastError = nil

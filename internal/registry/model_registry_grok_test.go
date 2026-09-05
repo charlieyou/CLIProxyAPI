@@ -47,9 +47,9 @@ func TestGetAvailableModelInfosHonorsQuotaAndSuspensionAvailability(t *testing.T
 		wantModelAvailable bool
 	}{
 		{
-			name:               "quota cooldown remains listed",
+			name:               "quota cooldown is hidden",
 			quotaExceeded:      true,
-			wantModelAvailable: true,
+			wantModelAvailable: false,
 		},
 		{
 			name:               "quota suspension reason remains listed",

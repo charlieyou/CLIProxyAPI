@@ -528,10 +528,6 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		}
 	}()
 
-	if shouldQueueQuotaRefresh {
-		m.enqueueQuotaRefreshIfEligible(result.AuthID, quotaProvider)
-	}
-
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(authID)
 	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
 	for _, sm := range supportedModels {
@@ -998,6 +994,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
+	}
+
+	if shouldQueueQuotaRefresh {
+		m.enqueueQuotaRefreshIfEligible(result.AuthID, quotaProvider)
 	}
 
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(result.AuthID)

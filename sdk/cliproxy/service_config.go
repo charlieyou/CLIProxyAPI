@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
+	quotaSettings            coreauth.QuotaRefreshSettings
 	strategy                 string
 	sessionAffinity          bool
 	sessionAffinityTTL       time.Duration
@@ -48,6 +50,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
 	}
+	state.quotaSettings = quotaSettingsFromConfig(cfg)
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
@@ -63,17 +66,13 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState, settings ...coreauth.QuotaRefreshSettings) coreauth.Selector {
-	var quotaSettings coreauth.QuotaRefreshSettings
-	if len(settings) > 0 {
-		quotaSettings = settings[0]
-	}
+func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
-		selector = coreauth.NewFillFirstSelector(quotaSettings, slog.Default())
+		selector = coreauth.NewFillFirstSelector(state.quotaSettings, slog.Default())
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
@@ -219,8 +218,8 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
-	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState || routingState.strategy == "fill-first" {
-		s.coreManager.SetSelector(newRoutingSelector(routingState, quotaSettingsFromConfig(commit.cfg)))
+	if s.appliedRoutingState == nil || !reflect.DeepEqual(*s.appliedRoutingState, routingState) {
+		s.coreManager.SetSelector(newRoutingSelector(routingState))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
