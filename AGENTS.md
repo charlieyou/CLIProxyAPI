@@ -22,6 +22,19 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Auth material defaults under `auths/`
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
+## Personal Fly.io deployment
+- App: `cyou-cliproxyapi`, organization: `personal`, primary region: `iad` (Ashburn, Virginia).
+- Public endpoint: `https://cyou-cliproxyapi.fly.dev`; OpenAI-compatible base URL: `https://cyou-cliproxyapi.fly.dev/v1`. Anthropic clients use the root URL, without `/v1`.
+- One always-on shared CPU Machine with 512 MB RAM. Fly terminates HTTPS and forwards to port 8317; proxy idle timeout is 600 seconds, not a total request-duration setting.
+- A 1 GB encrypted volume named `proxy_data` is mounted at `/data`. Runtime config is `/data/config.yaml`, with `auth-dir: /data/auths`. Credentials must persist on this volume, never in Git or a container image.
+- Runtime security settings: `ws-auth: true`, debug logging off, remote management disabled, and control panel disabled. The endpoint uses the existing proxy API key; do not print it in logs or documentation.
+- As of September 26, 2026, Fly holds four Claude accounts and two ChatGPT accounts. Only the local hey.com ChatGPT credential was removed after migration; other local credentials were left intact. Avoid concurrent refreshes of the same OAuth account on separate deployments.
+- The initial deployment packaged the existing `/opt/cliproxyapi/cli-proxy-api` binary using `/home/cyou/.amp/in/cliproxyapi-fly/`. The repository's `fly.toml` instead builds this checkout using its Dockerfile and explicitly starts `/CLIProxyAPI/CLIProxyAPI --config /data/config.yaml`. Redeploying from this repository therefore upgrades to the checked-out source, rather than reusing the initial binary.
+- After explicit deployment authorization, deploy from this directory with `fly deploy --remote-only --ha=false`. Keep one Machine unless credential storage/replication is redesigned; Fly volumes are not automatically replicated. A single Machine has deployment and host-failure downtime; maintain credential backups.
+- Inspect with `fly status -a cyou-cliproxyapi` and `fly ssh console -a cyou-cliproxyapi`. Upload individual credentials with `fly ssh sftp put <local-file> /data/auths/<filename> -a cyou-cliproxyapi -m 0600`; preserve existing credentials unless removal is requested.
+- Claude login on the initial image: `fly ssh console -a cyou-cliproxyapi --pty -C '/CLIProxyAPI/cli-proxy-api --config /data/config.yaml --claude-login --no-browser'`. After a repository-source deployment, use `/CLIProxyAPI/CLIProxyAPI` instead. Use `--codex-login` for ChatGPT.
+- Verify authenticated `/v1/models`, unauthenticated rejection, and an actual streaming inference for each provider. Model listing alone does not prove OAuth credentials work. Both Claude and ChatGPT streaming inference passed on September 26, 2026; the four subsequently copied credentials were not individually inference-tested.
+
 ## Architecture
 - `cmd/server/` — Server entrypoint
 - `internal/api/` — Gin HTTP API (routes, middleware, modules)
