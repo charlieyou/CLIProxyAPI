@@ -873,6 +873,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							}
 						case 429:
 							var next time.Time
+							var credentialNext time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
 								if result.RetryAfter != nil {
@@ -882,7 +883,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 									}
 									next = now.Add(cooldown).Round(0)
 								} else {
-									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
+									quota := state.Quota
+									if result.CredentialScope {
+										quota = QuotaState{}
+										if auth.Quota.Reason == "credential_quota" {
+											quota = auth.Quota
+										}
+									}
+									next, backoffLevel = quotaCooldownAfterFailure(quota, now)
+								}
+								// A model-only deadline must never become a shared deadline.
+								credentialNext = next
+								if result.CredentialScope && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(credentialNext) {
+									credentialNext = auth.Quota.NextRecoverAt
+									next = credentialNext
 								}
 								if state.Quota.Exceeded && state.Quota.NextRecoverAt.After(next) {
 									next = state.Quota.NextRecoverAt
@@ -900,7 +914,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 									if otherState != nil && otherState != state {
 										otherState.Unavailable = true
 										otherState.Status = StatusError
-										otherQuotaNext := next
+										otherQuotaNext := credentialNext
 										if otherState.Quota.Exceeded && otherState.Quota.NextRecoverAt.After(otherQuotaNext) {
 											otherQuotaNext = otherState.Quota.NextRecoverAt
 										}
@@ -922,12 +936,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								auth.Unavailable = true
 								auth.Quota.Exceeded = true
 								auth.Quota.Reason = "credential_quota"
-								authNext := next
-								if auth.Quota.NextRecoverAt.After(authNext) {
-									authNext = auth.Quota.NextRecoverAt
-								}
-								auth.Quota.NextRecoverAt = authNext
-								auth.NextRetryAfter = authNext
+								auth.Quota.NextRecoverAt = credentialNext
+								auth.Quota.BackoffLevel = backoffLevel
+								auth.NextRetryAfter = credentialNext
 							}
 						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
 							state.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, result.RetryAfter, disableCooling)

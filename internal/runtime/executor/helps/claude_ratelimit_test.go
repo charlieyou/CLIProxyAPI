@@ -8,7 +8,7 @@ import (
 )
 
 func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
-	now := time.Now()
+	now := time.Date(2026, time.September, 27, 12, 0, 0, 0, time.UTC)
 
 	t.Run("nil headers returns nil", func(t *testing.T) {
 		if got := ParseClaudeRateLimitReset(nil, now); got != nil {
@@ -113,7 +113,7 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset and retry-after returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection honors the later reset instead of a short retry-after", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -124,27 +124,26 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with retry-after, got %v", *got)
+		if got == nil || *got != 7*24*time.Hour {
+			t.Fatalf("expected 7d cooldown, got %v", got)
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset only returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection honors 7d_oi reset without unified reset", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
 		h.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
 		h.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10))
-		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10))
 
-		got := ParseClaudeRateLimitReset(h, now)
-		if got != nil {
-			t.Fatalf("expected nil for fable-only rejection without retry-after, got %v", *got)
+		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
+		if got == nil || *got != 7*24*time.Hour {
+			t.Fatalf("expected 7d cooldown, got %v", got)
 		}
 	})
 
-	t.Run("fable-only rejection with allowed_warning on shared window returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection honors reset with allowed_warning shared window", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -155,8 +154,41 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with allowed_warning, got %v", *got)
+		if got == nil || *got != 7*24*time.Hour {
+			t.Fatalf("expected 7d cooldown, got %v", got)
+		}
+	})
+
+	t.Run("model-only deadline sources and invalid deadlines", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, reset, unified, retry string
+			want                        time.Duration
+		}{
+			{name: "retry only", retry: "120", want: 120 * time.Second},
+			{name: "unified only", unified: now.Add(3 * time.Hour).Format(time.RFC3339), want: 3 * time.Hour},
+			{name: "later retry wins", reset: now.Add(time.Hour).Format(time.RFC3339), retry: "7200", want: 2 * time.Hour},
+			{name: "invalid and expired", reset: "invalid", unified: now.Add(-time.Hour).Format(time.RFC3339), retry: "invalid"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h := make(http.Header)
+				h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+				h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+				h.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+				h.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "rejected")
+				h.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", tc.reset)
+				h.Set("Anthropic-Ratelimit-Unified-Reset", tc.unified)
+				h.Set("Retry-After", tc.retry)
+				// Healthy shared windows must not extend the model cooldown.
+				h.Set("Anthropic-Ratelimit-Unified-7d-Reset", now.Add(7*24*time.Hour).Format(time.RFC3339))
+				got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
+				if tc.want == 0 {
+					if got != nil {
+						t.Fatalf("expected fallback, got %v", *got)
+					}
+				} else if got == nil || *got != tc.want {
+					t.Fatalf("expected %v, got %v", tc.want, got)
+				}
+			})
 		}
 	})
 

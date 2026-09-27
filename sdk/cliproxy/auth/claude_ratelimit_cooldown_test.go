@@ -10,6 +10,60 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
+func TestAuthManager_ModelDeadlineDoesNotExtendSharedCooldown(t *testing.T) {
+	for _, model := range []string{"claude-opus-5", "claude-fable-5-1"} {
+		for _, hinted := range []bool{true, false} {
+			name := model + "/fallback"
+			if hinted {
+				name = model + "/retry-after"
+			}
+			t.Run(name, func(t *testing.T) {
+				manager := NewManager(nil, nil, nil)
+				a := &Auth{ID: uuid.NewString(), Provider: "claude"}
+				if _, err := manager.Register(context.Background(), a); err != nil {
+					t.Fatal(err)
+				}
+				week := 7 * 24 * time.Hour
+				manager.MarkResult(context.Background(), Result{
+					AuthID: a.ID, Provider: "claude", Model: "claude-fable-5-1",
+					RetryAfter: &week, Error: &Error{HTTPStatus: 429},
+				})
+				manager.MarkResult(context.Background(), Result{
+					AuthID: a.ID, Provider: "claude", Model: "claude-opus-5", Success: true,
+				})
+				before, _ := manager.GetByID(a.ID)
+				fableDeadline := before.ModelStates["claude-fable-5-1"].NextRetryAfter
+				shared := 5 * time.Hour
+				var retryAfter *time.Duration
+				if hinted {
+					retryAfter = &shared
+				}
+				manager.MarkResult(context.Background(), Result{
+					AuthID: a.ID, Provider: "claude", Model: model,
+					CredentialScope: true, RetryAfter: retryAfter, Error: &Error{HTTPStatus: 429},
+				})
+				after, _ := manager.GetByID(a.ID)
+				now := after.UpdatedAt
+				for _, m := range []string{"claude-opus-5", "claude-fable-5-1"} {
+					if blocked, _, _ := isAuthBlockedForModel(after, m, now); !blocked {
+						t.Fatalf("%s must be blocked during shared cooldown", m)
+					}
+				}
+				if hinted && !after.Quota.NextRecoverAt.Equal(now.Add(shared)) {
+					t.Fatalf("shared deadline = %v, want %v", after.Quota.NextRecoverAt, now.Add(shared))
+				}
+				future := now.Add(6 * time.Hour)
+				if blocked, _, next := isAuthBlockedForModel(after, "claude-opus-5", future); blocked {
+					t.Fatalf("Opus blocked after shared cooldown: %v", next)
+				}
+				if blocked, _, next := isAuthBlockedForModel(after, "claude-fable-5-1", future); !blocked || !next.Equal(fableDeadline) {
+					t.Fatalf("Fable blocked=%v deadline=%v, want %v", blocked, next, fableDeadline)
+				}
+			})
+		}
+	}
+}
+
 func TestAuthManager_ConcurrentSuccessDoesNotClearActiveCredentialCooldown(t *testing.T) {
 	now := time.Now()
 	sevenDayReset := now.Add(7 * 24 * time.Hour)

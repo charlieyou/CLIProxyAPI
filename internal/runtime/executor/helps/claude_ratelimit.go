@@ -117,7 +117,6 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	status5h := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Status")))
 	status7d := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")))
 	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
-	overageOnlyRejection := isOverageOrFableOnlyRejection(headers, status5h, status7d, status7dOI)
 
 	var candidateDeadlines []time.Time
 	var rejectedWindows []string
@@ -135,15 +134,15 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		rejectedWindows = append(rejectedWindows, "7d_oi")
 	}
 
-	// 1. Retry-After header (skipped for an overage/Fable-only rejection, which does not describe the credential)
-	if !overageOnlyRejection {
-		if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
-			if !containsString(rejectedWindows, "retry-after") {
-				rejectedWindows = append(rejectedWindows, "retry-after")
-			}
-			if t, ok := parseRetryAfterHeader(rawRetryAfter, now); ok && t.After(now) {
-				candidateDeadlines = append(candidateDeadlines, t)
-			}
+	// 1. Retry-After applies to the rejected request even for a model-only limit.
+	// Credential scope is classified separately; honoring a deadline does not
+	// turn a model cooldown into a credential-wide cooldown.
+	if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
+		if !containsString(rejectedWindows, "retry-after") {
+			rejectedWindows = append(rejectedWindows, "retry-after")
+		}
+		if t, ok := parseRetryAfterHeader(rawRetryAfter, now); ok && t.After(now) {
+			candidateDeadlines = append(candidateDeadlines, t)
 		}
 	}
 
@@ -165,8 +164,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		}
 	}
 
-	// 4. Fable-specific 7-day window reset (only when rejected and not an overage/Fable-only rejection)
-	if status7dOI == "rejected" && !overageOnlyRejection {
+	// 4. Fable-specific 7-day window reset (only when rejected)
+	if status7dOI == "rejected" {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)
@@ -175,8 +174,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	}
 
 	// 5. Unified reset header:
-	unifiedRejected := !overageOnlyRejection && (unifiedStatus == "rejected" || status5h == "rejected" || status7d == "rejected" || status7dOI == "rejected" ||
-		(unifiedStatus == "" && !isClaudeWindowAllowed(status5h) && !isClaudeWindowAllowed(status7d)))
+	unifiedRejected := unifiedStatus == "rejected" || status5h == "rejected" || status7d == "rejected" || status7dOI == "rejected" ||
+		(unifiedStatus == "" && !isClaudeWindowAllowed(status5h) && !isClaudeWindowAllowed(status7d))
 
 	if unifiedRejected {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Reset"); raw != "" {
