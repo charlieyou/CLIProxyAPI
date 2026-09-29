@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -304,6 +305,8 @@ func isOpenRouterProvider(provider string) bool {
 }
 
 func extractOpenAIExplicitSummaryConfig(body []byte) (SummaryConfig, bool) {
+	// All paths below are object members; skip large message/tool arrays once.
+	body = util.CompactGJSONObjectForKeyLookup(body)
 	// Google's documented Chat Completions extension is the authoritative
 	// explicit visibility control when present, ahead of CPA compatibility
 	// aliases and Chat's reasoning_effort fallback.

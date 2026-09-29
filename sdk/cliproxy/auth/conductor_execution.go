@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -153,6 +154,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errExec)})
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -213,6 +215,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errExec)})
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -285,6 +288,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errStream)})
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}

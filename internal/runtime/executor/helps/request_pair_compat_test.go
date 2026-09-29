@@ -45,7 +45,7 @@ func TestTranslateRequestPairWithAPIKeyModelCompatibilityCountsTranslations(t *t
 	if sdktranslator.HasRequestTransformer(from, to) {
 		t.Fatalf("request transformer %s -> %s is already registered", from, to)
 	}
-	if sdktranslator.HasPluginHooks() {
+	if sdktranslator.HasRequestPluginHooks() {
 		t.Fatal("plugin hooks are installed and disable translation reuse")
 	}
 
@@ -111,5 +111,50 @@ func TestCompatibilityRequestPairPreservesHooks(t *testing.T) {
 	base, work := TranslateRequestPairWithAPIKeyModelCompatibility(context.Background(), nil, &config.Config{}, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, "test", request, request, true, true)
 	if hooks.calls != 2 || bytes.Equal(base, work) {
 		t.Fatalf("stateful plugin calls must remain independent, calls=%d", hooks.calls)
+	}
+}
+
+// reportingPairHooks mirrors the plugin host: hooks are installed, but they
+// report whether any request hook is actually active.
+type reportingPairHooks struct {
+	pairRequestPluginHooks
+	requestHooks bool
+}
+
+func (h *reportingPairHooks) HasRequestHooks() bool { return h.requestHooks }
+
+// TestRequestPairReusesTranslationWhenInstalledHooksHaveNoRequestHooks guards the
+// production case: the plugin host is always installed as translator hooks, even
+// with no plugin providing request hooks, which previously disabled reuse and
+// translated multi-megabyte payloads twice before every upstream attempt.
+func TestRequestPairReusesTranslationWhenInstalledHooksHaveNoRequestHooks(t *testing.T) {
+	from := sdktranslator.Format("pair-reporting-hooks-from")
+	to := sdktranslator.Format("pair-reporting-hooks-to")
+	var calls int
+	sdktranslator.Register(from, to, func(_ string, rawJSON []byte, _ bool) []byte {
+		calls++
+		return append([]byte(nil), rawJSON...)
+	}, sdktranslator.ResponseTransform{})
+	t.Cleanup(func() { sdktranslator.Unregister(from, to) })
+
+	hooks := &reportingPairHooks{}
+	sdktranslator.SetPluginHooks(hooks)
+	t.Cleanup(func() { sdktranslator.SetPluginHooks(nil) })
+
+	payload := []byte(`{"model":"m","input":"hello"}`)
+	base, work := TranslateRequestPairWithAPIKeyModelCompatibility(context.Background(), nil, &config.Config{}, from, to, "m", payload, payload, false, false)
+	if calls != 1 {
+		t.Fatalf("translations = %d, want 1 when installed hooks report no request hooks", calls)
+	}
+	if !bytes.Equal(base, work) || &base[0] == &work[0] {
+		t.Fatal("reused working translation must equal and not alias the baseline")
+	}
+
+	hooks.requestHooks = true
+	calls = 0
+	hooks.calls = 0
+	TranslateRequestPairWithAPIKeyModelCompatibility(context.Background(), nil, &config.Config{}, from, to, "m", payload, payload, false, false)
+	if calls != 2 || hooks.calls != 2 {
+		t.Fatalf("translations = %d, normalizer calls = %d, want 2 each when request hooks are active", calls, hooks.calls)
 	}
 }

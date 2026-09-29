@@ -762,3 +762,46 @@ func TestExtractSessionInfoEnhancedHarnesses(t *testing.T) {
 		t.Fatalf("Thread X-Parent-Thread-Id extraction failed: %+v", info)
 	}
 }
+
+// TestExtractSessionInfoLargePayloadMatchesSmallPayload guards the lookup
+// compaction used for multi-megabyte payloads: identifiers placed around large
+// message and tool arrays must resolve exactly as they do in a small payload.
+func TestExtractSessionInfoLargePayloadMatchesSmallPayload(t *testing.T) {
+	t.Parallel()
+	bigMessages := `[` + strings.Repeat(`{"role":"user","content":"history","session_id":"inner-ignored"},`, 500) + `{"role":"user","content":"last"}]`
+	cases := map[string]struct {
+		small string
+		large string
+	}{
+		"top-level session": {
+			small: `{"session_id":"sess-1","metadata":{"agent_id":"worker"},"messages":[]}`,
+			large: `{"messages":` + bigMessages + `,"tools":` + bigMessages + `,"session_id":"sess-1","metadata":{"agent_id":"worker"}}`,
+		},
+		"claude metadata user_id": {
+			small: `{"metadata":{"user_id":"{\"session_id\":\"c1d2e3f4-0000-4000-8000-000000000001\",\"agent_id\":\"sub\"}"},"messages":[]}`,
+			large: `{"messages":` + bigMessages + `,"metadata":{"user_id":"{\"session_id\":\"c1d2e3f4-0000-4000-8000-000000000001\",\"agent_id\":\"sub\"}"}}`,
+		},
+		"nested request prompt cache key": {
+			small: `{"request":{"promptCacheKey":"pck-9","contents":[]}}`,
+			large: `{"request":{"contents":` + bigMessages + `,"promptCacheKey":"pck-9"}}`,
+		},
+		"array-valued conversation is not an id": {
+			small: `{"conversation":[],"conversation_id":"conv-2","messages":[]}`,
+			large: `{"conversation":` + bigMessages + `,"messages":` + bigMessages + `,"conversation_id":"conv-2"}`,
+		},
+		"no identifiers": {
+			small: `{"messages":[]}`,
+			large: `{"messages":` + bigMessages + `}`,
+		},
+	}
+	for name, tc := range cases {
+		wantInfo, wantOK := ExtractSessionInfo(nil, []byte(tc.small), nil)
+		gotInfo, gotOK := ExtractSessionInfo(nil, []byte(tc.large), nil)
+		if gotOK != wantOK || gotInfo.SessionID != wantInfo.SessionID || gotInfo.ParentSessionID != wantInfo.ParentSessionID || gotInfo.AgentName != wantInfo.AgentName || gotInfo.ClientType != wantInfo.ClientType {
+			t.Fatalf("%s: large = %+v/%v, want %+v/%v", name, gotInfo, gotOK, wantInfo, wantOK)
+		}
+		if got, want := hasExplicitSession(nil, []byte(tc.large)), hasExplicitSession(nil, []byte(tc.small)); got != want {
+			t.Fatalf("%s: hasExplicitSession large = %v, want %v", name, got, want)
+		}
+	}
+}

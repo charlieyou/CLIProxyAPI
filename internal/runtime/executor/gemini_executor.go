@@ -862,7 +862,7 @@ func translateGeminiInteractionsRequestBody(ctx context.Context, cfg *config.Con
 // payload first, then the payload-config source.
 func translateGeminiInteractionsRequestPair(ctx context.Context, cfg *config.Config, model string, payload []byte, opts cliproxyexecutor.Options, stream, isCompat bool) (original, working []byte) {
 	source := geminiInteractionsPayloadConfigInput(opts, payload)
-	if geminiInteractionsSameByteSlice(payload, source) && !sdktranslator.HasPluginHooks() {
+	if geminiInteractionsSameByteSlice(payload, source) && !sdktranslator.HasRequestPluginHooks() {
 		original = translateGeminiInteractionsRequestBody(ctx, cfg, model, payload, opts, stream, isCompat)
 		return original, bytes.Clone(original)
 	}

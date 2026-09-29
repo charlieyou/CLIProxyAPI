@@ -53,8 +53,10 @@ func TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx context.Context, headers 
 // normally assign the original payload to the request before translating, so both
 // translations would rescan the same bytes and produce the same result. Built-in
 // request translation is deterministic, so that case is translated once and
-// duplicated when no plugin hooks are installed. Hooks retain two invocations
-// because they may have request-scoped output or side effects. This removes a
+// duplicated when no request plugin hooks are active. Request normalizers and
+// translators retain two invocations because they may have request-scoped
+// output or side effects. The plugin host installs hooks even when no plugin
+// provides request hooks, so installed hooks alone must not disable reuse. This removes a
 // full extra pass over payloads that can reach tens of megabytes.
 func TranslateRequestPairWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, requestPayload []byte, stream bool) (original, working []byte) {
 	req := sdktranslator.RequestEnvelope{Format: from, Model: model, Stream: stream}
@@ -67,7 +69,7 @@ func TranslateRequestEnvelopePairWithCodexMultiAgentV2(ctx context.Context, head
 	originalReq := req
 	originalReq.Body = originalPayload
 	original = TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, originalReq).Body
-	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasPluginHooks() {
+	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasRequestPluginHooks() {
 		// The caller mutates the working copy, so it must not share the baseline array.
 		return original, append([]byte(nil), original...)
 	}
@@ -93,7 +95,7 @@ func sameByteSlice(a, b []byte) bool {
 // inputs twice while retaining separate buffers and stateful plugin invocations.
 func TranslateRequestPairWithAPIKeyModelCompatibility(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, requestPayload []byte, stream, isCompat bool) (original, working []byte) {
 	original = TranslateRequestWithAPIKeyModelCompatibility(ctx, headers, cfg, from, to, model, originalPayload, stream, isCompat)
-	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasPluginHooks() {
+	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasRequestPluginHooks() {
 		return original, append([]byte(nil), original...)
 	}
 	return original, TranslateRequestWithAPIKeyModelCompatibility(ctx, headers, cfg, from, to, model, requestPayload, stream, isCompat)

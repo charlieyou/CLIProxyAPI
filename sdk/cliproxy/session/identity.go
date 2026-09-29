@@ -383,8 +383,9 @@ func hasExplicitSession(headers map[string][]string, payload []byte) bool {
 	if len(payload) == 0 {
 		return false
 	}
-	// Parsing without copying matters here: this runs on every request and the
-	// payload can be multiple megabytes.
+	// This runs on every request and the payload can be multiple megabytes;
+	// all lookups below target object members, so skip large arrays once.
+	payload = util.CompactGJSONObjectForKeyLookup(payload)
 	root := util.ParseGJSONBytesNoCopy(payload)
 	reqRoot := root
 	req := root.Get("request")

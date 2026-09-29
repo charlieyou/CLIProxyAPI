@@ -3747,3 +3747,39 @@ func (failingReadCloser) Read(p []byte) (int, error) {
 func (failingReadCloser) Close() error {
 	return nil
 }
+
+func TestHostHasRequestHooks(t *testing.T) {
+	var nilHost *Host
+	if nilHost.HasRequestHooks() {
+		t.Fatal("nil host reported request hooks")
+	}
+	if New().HasRequestHooks() {
+		t.Fatal("host without plugins reported request hooks")
+	}
+	observerOnly := newHostWithRecords(capabilityRecord{
+		id: "observer",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			WebSocketResponseObserver: testWebSocketObserverFunc(func(context.Context, pluginapi.WebSocketResponseEvent) error { return nil }),
+		}},
+	})
+	if observerOnly.HasRequestHooks() {
+		t.Fatal("plugin without request normalizer or translator reported request hooks")
+	}
+	normalizer := newHostWithRecords(capabilityRecord{
+		id: "normalizer",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestNormalizer: requestNormalizerFunc(func(context.Context, pluginapi.RequestTransformRequest) (pluginapi.PayloadResponse, error) {
+				return pluginapi.PayloadResponse{}, nil
+			}),
+		}},
+	})
+	if !normalizer.HasRequestHooks() {
+		t.Fatal("request normalizer plugin was not reported")
+	}
+	normalizer.mu.Lock()
+	normalizer.fused["normalizer"] = "test fused"
+	normalizer.mu.Unlock()
+	if normalizer.HasRequestHooks() {
+		t.Fatal("fused request normalizer must not count as an active request hook")
+	}
+}

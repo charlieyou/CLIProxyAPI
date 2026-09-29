@@ -9942,3 +9942,15 @@ func TestClaudeExecutor_ExecuteStream_OAuthRestoresOriginalToolNameCasing(t *tes
 		t.Fatalf("stream output missing restored Read tool_reference name: %s", out.String())
 	}
 }
+
+func TestClaudeHistoryHasAdvisorCallOrResultLargeHistory(t *testing.T) {
+	history := strings.Repeat(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"output"}]}]},`, 300)
+	plain := []byte(`{"messages":[` + history + `{"role":"user","content":"hi"}]}`)
+	if claudeHistoryHasAdvisorCallOrResult(plain) {
+		t.Fatal("history without advisor blocks reported advisor usage")
+	}
+	nested := []byte(`{"messages":[` + history + `{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"\u0061dvisor_redacted_result"}]}]}]}`)
+	if !claudeHistoryHasAdvisorCallOrResult(nested) {
+		t.Fatal("escaped nested advisor_redacted_result was not detected")
+	}
+}

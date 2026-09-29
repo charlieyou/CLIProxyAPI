@@ -699,6 +699,11 @@ func claudeCallerSystemReminder(text string) string {
 // advisor result to the conversation layout; any mid-conversation system splice
 // shifts message indices and causes upstream 400 errors.
 func claudeHistoryHasAdvisorCallOrResult(payload []byte) bool {
+	// Every match below requires a decoded string containing "advisor"; reject
+	// large histories without materializing every message and block.
+	if !helps.RawJSONMayContainLetterPhrase(payload, "advisor") {
+		return false
+	}
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.IsArray() {
 		return false

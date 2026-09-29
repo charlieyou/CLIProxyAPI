@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -424,6 +426,11 @@ func isClaudeTitleHelperRequest(body []byte) bool {
 			strings.Contains(t, "Return a short title") ||
 			strings.Contains(t, "Write the title in the predominant language")
 	}
+	// Exact fast rejection: this runs several times per request and otherwise
+	// materializes every message of multi-megabyte histories.
+	if !RawJSONMayContainLetterPhrase(body, "naming a coding session", "Return a short title", "Write the title in the predominant language") {
+		return false
+	}
 	system := gjson.GetBytes(body, "system")
 	if system.IsArray() {
 		for _, part := range system.Array() {
@@ -453,6 +460,31 @@ func isClaudeTitleHelperRequest(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// RawJSONMayContainLetterPhrase reports whether any decoded JSON string in raw
+// could contain one of phrases, which must consist only of ASCII letters and
+// spaces. Such characters appear in raw JSON either literally or as a \u00XX
+// escape, so when no phrase occurs literally and no such escape exists, no
+// decoded string can contain a phrase.
+func RawJSONMayContainLetterPhrase(raw []byte, phrases ...string) bool {
+	for _, phrase := range phrases {
+		if bytes.Contains(raw, []byte(phrase)) {
+			return true
+		}
+	}
+	for rest := raw; ; {
+		i := bytes.Index(rest, []byte(`\u00`))
+		if i < 0 || i+6 > len(rest) {
+			return false
+		}
+		if code, err := strconv.ParseUint(string(rest[i+4:i+6]), 16, 8); err == nil {
+			if code == ' ' || (code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z') {
+				return true
+			}
+		}
+		rest = rest[i+4:]
+	}
 }
 
 // IsClaudeProbeOrHelperRequest reports whether the request is a minimal

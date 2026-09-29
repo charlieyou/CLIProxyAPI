@@ -229,6 +229,22 @@ func (a *thinkingAdapter) Apply(body []byte, config thinking.ThinkingConfig, mod
 	return bytes.Clone(resp.Body), nil
 }
 
+// HasRequestHooks reports whether any active plugin can normalize or translate
+// requests. Without one, NormalizeRequest and TranslateRequest leave request
+// translation output unchanged, so callers may reuse a translation.
+func (h *Host) HasRequestHooks() bool {
+	if h == nil {
+		return false
+	}
+	for _, record := range h.activeRecords() {
+		caps := record.plugin.Capabilities
+		if (caps.RequestNormalizer != nil || caps.RequestTranslator != nil) && !h.isPluginFused(record.id) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Host) NormalizeRequest(ctx context.Context, from, to sdktranslator.Format, model string, body []byte, stream bool) []byte {
 	current := bytes.Clone(body)
 	for _, record := range h.activeRecords() {

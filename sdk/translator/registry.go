@@ -95,6 +95,28 @@ func (r *Registry) HasPluginHooks() bool {
 	return r.hooks != nil
 }
 
+// requestHookReporter is optionally implemented by PluginHooks that can report
+// whether any request normalizer or translator is currently active.
+type requestHookReporter interface {
+	HasRequestHooks() bool
+}
+
+// HasRequestPluginHooks reports whether installed hooks may change request
+// translation output. Hooks that do not report their request capabilities are
+// assumed to be active.
+func (r *Registry) HasRequestPluginHooks() bool {
+	r.mu.RLock()
+	hooks := r.hooks
+	r.mu.RUnlock()
+	if hooks == nil {
+		return false
+	}
+	if reporter, ok := hooks.(requestHookReporter); ok {
+		return reporter.HasRequestHooks()
+	}
+	return true
+}
+
 // TranslateRequest converts a payload between schemas, returning the original payload
 // if no translator is registered. When falling back to the original payload, the
 // "model" field is still updated to match the resolved model name so that
@@ -336,6 +358,12 @@ func SetPluginHooks(hooks PluginHooks) {
 // HasPluginHooks reports whether hooks are installed on the default registry.
 func HasPluginHooks() bool {
 	return defaultRegistry.HasPluginHooks()
+}
+
+// HasRequestPluginHooks reports whether hooks on the default registry may change
+// request translation output.
+func HasRequestPluginHooks() bool {
+	return defaultRegistry.HasRequestPluginHooks()
 }
 
 // TranslateRequest is a helper on the default registry.

@@ -60,6 +60,9 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 	var hasNestedReq bool
 	var parentCandidate string
 
+	// Every payload lookup below targets object members, so skip the large
+	// message/tool arrays once instead of on each of ~100 lookups.
+	payload = util.CompactGJSONObjectForKeyLookup(payload)
 	if len(payload) > 0 {
 		root = util.ParseGJSONBytesNoCopy(payload)
 		reqRoot = root

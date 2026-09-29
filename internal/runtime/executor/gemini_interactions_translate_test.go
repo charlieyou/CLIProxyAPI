@@ -76,7 +76,7 @@ func TestTranslateGeminiInteractionsRequestPairTranslatesSameSliceOnce(t *testin
 	if sdktranslator.HasRequestTransformer(from, to) {
 		t.Fatalf("request transformer %s -> %s is already registered", from, to)
 	}
-	if sdktranslator.HasPluginHooks() {
+	if sdktranslator.HasRequestPluginHooks() {
 		t.Fatal("plugin hooks are installed and disable translation reuse")
 	}
 

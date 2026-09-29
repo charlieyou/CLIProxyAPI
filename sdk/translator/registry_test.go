@@ -500,3 +500,33 @@ func TestUnregisterRestoresFormatPair(t *testing.T) {
 		t.Fatal("unregister removed a different format pair")
 	}
 }
+
+type reportingPluginHooks struct {
+	fakePluginHooks
+	requestHooks bool
+}
+
+func (h *reportingPluginHooks) HasRequestHooks() bool { return h.requestHooks }
+
+func TestHasRequestPluginHooks(t *testing.T) {
+	registry := NewRegistry()
+	if registry.HasRequestPluginHooks() {
+		t.Fatal("new registry unexpectedly reports request hooks")
+	}
+	registry.SetPluginHooks(&fakePluginHooks{})
+	if !registry.HasRequestPluginHooks() {
+		t.Fatal("hooks without capability reporting must be treated as request hooks")
+	}
+	reporting := &reportingPluginHooks{}
+	registry.SetPluginHooks(reporting)
+	if registry.HasRequestPluginHooks() {
+		t.Fatal("reporting hooks without request capabilities must not count as request hooks")
+	}
+	if !registry.HasPluginHooks() {
+		t.Fatal("HasPluginHooks must still report installed hooks")
+	}
+	reporting.requestHooks = true
+	if !registry.HasRequestPluginHooks() {
+		t.Fatal("reporting hooks with request capabilities must count as request hooks")
+	}
+}
