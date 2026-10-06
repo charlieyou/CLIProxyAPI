@@ -25,7 +25,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 ## Personal Fly.io deployment
 - App: `cyou-cliproxyapi`, organization: `personal`, primary region: `iad` (Ashburn, Virginia).
 - Public endpoint: `https://cyou-cliproxyapi.fly.dev`; OpenAI-compatible base URL: `https://cyou-cliproxyapi.fly.dev/v1`. Anthropic clients use the root URL, without `/v1`.
-- One always-on shared CPU Machine with 512 MB RAM. Fly terminates HTTPS and forwards to port 8317; proxy idle timeout is 600 seconds, not a total request-duration setting.
+- One always-on shared-cpu-2x Machine with 1 GB RAM and 512 MB swap. Fly terminates HTTPS and forwards to port 8317; proxy idle timeout is 600 seconds, not a total request-duration setting.
 - A 1 GB encrypted volume named `proxy_data` is mounted at `/data`. Runtime config is `/data/config.yaml`, with `auth-dir: /data/auths`. Credentials must persist on this volume, never in Git or a container image.
 - Runtime security settings: `ws-auth: true`, debug logging off, remote management disabled, and control panel disabled. The endpoint uses the existing proxy API key; do not print it in logs or documentation.
 - As of September 26, 2026, Fly holds four Claude accounts and two ChatGPT accounts. The local `~/.cli-proxy-api` directory was subsequently deleted; Fly now owns these credentials. Avoid concurrent refreshes of the same OAuth account on separate deployments.

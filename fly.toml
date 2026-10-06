@@ -1,5 +1,6 @@
 app = "cyou-cliproxyapi"
 primary_region = "iad"
+swap_size_mb = 512
 
 [build]
   dockerfile = "Dockerfile"
@@ -24,5 +25,5 @@ primary_region = "iad"
 
 [[vm]]
   cpu_kind = "shared"
-  cpus = 1
-  memory = "512mb"
+  cpus = 2
+  memory = "1024mb"
