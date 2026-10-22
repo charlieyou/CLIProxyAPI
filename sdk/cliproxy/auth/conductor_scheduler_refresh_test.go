@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 type schedulerProviderTestExecutor struct {
@@ -63,8 +64,14 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
+	hook := setupTestLoggerHook(t)
 
 	manager.refreshAuth(ctx, auth.ID)
+
+	entry := hook.LastEntry()
+	if entry == nil || entry.Level != log.ErrorLevel || !strings.Contains(entry.Message, auth.ID) || !strings.Contains(entry.Message, "invalid_grant") {
+		t.Fatalf("expected error log naming the auth and refresh error, got %+v", entry)
+	}
 
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok {
@@ -498,8 +505,14 @@ func TestManager_RefreshAuthTransientFailure_ExpiredTokenMarkedUnavailableWithRe
 	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
+	hook := setupTestLoggerHook(t)
 
 	manager.refreshAuth(ctx, auth.ID)
+
+	entry := hook.LastEntry()
+	if entry == nil || entry.Level != log.WarnLevel || !strings.Contains(entry.Message, auth.ID) || !strings.Contains(entry.Message, "503") {
+		t.Fatalf("expected warning log naming the auth and refresh error, got %+v", entry)
+	}
 
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok {

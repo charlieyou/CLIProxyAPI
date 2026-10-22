@@ -585,9 +585,11 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				if unauthorized {
 					current.NextRefreshAfter = time.Time{}
 					current.StatusMessage = "unauthorized"
+					log.Errorf("credential refresh rejected for %s (%s): %s; credential unavailable until re-login", current.Provider, current.ID, safeErrorDiagnosticForLog(err))
 				} else {
 					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 					current.StatusMessage = "token expired"
+					log.Warnf("credential refresh failed for %s (%s): %s; access token expired, retrying in %s", current.Provider, current.ID, safeErrorDiagnosticForLog(err), refreshFailureBackoff)
 				}
 			} else {
 				// Access token remains valid. Preserve current in-flight/cooldown status without overwrite.
