@@ -283,6 +283,88 @@ func TestManager_QuotaRefreshClearsCooldownAfterWindowRollover(t *testing.T) {
 	}
 }
 
+func TestManager_QuotaRefreshClearsCredentialScopedCooldownAfterWindowRollover(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	ctx := context.Background()
+	now := time.Now()
+	requestAllowed := true
+	provider := "test-credential-quota-rollover"
+	authID := "credential-quota-rollover-auth"
+	failedModel := "credential-quota-rollover-failed"
+	siblingModel := "credential-quota-rollover-sibling"
+	missingModel := "credential-quota-rollover-missing"
+	statelessModel := "credential-quota-rollover-stateless"
+
+	RegisterQuotaProvider(rolloverQuotaProvider{
+		provider: provider,
+		windows:  []QuotaWindow{{Name: "secondary", ResetAt: now.Add(7 * 24 * time.Hour), RequestAllowed: &requestAllowed}},
+	})
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: failedModel}, {ID: siblingModel}, {ID: missingModel}, {ID: statelessModel}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), &Auth{
+		ID:          authID,
+		Provider:    provider,
+		ModelStates: map[string]*ModelState{siblingModel: {Status: StatusActive}},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	// A 404 gives the missing model its own 12h cooldown, which must outlive the quota rollover.
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: provider,
+		Model:    missingModel,
+		Error:    &Error{HTTPStatus: 404, Message: "model not found"},
+	})
+	retryAfter := time.Hour
+	manager.MarkResult(ctx, Result{
+		AuthID:          authID,
+		Provider:        provider,
+		Model:           failedModel,
+		CredentialScope: true,
+		RetryAfter:      &retryAfter,
+		Error:           &Error{HTTPStatus: 429, Message: "usage_limit_reached"},
+	})
+
+	manager.mu.Lock()
+	live := manager.auths[authID]
+	recoverAt := live.Quota.NextRecoverAt
+	if live.Quota.Reason != "credential_quota" || recoverAt.IsZero() {
+		manager.mu.Unlock()
+		t.Fatalf("auth quota after 429 = %+v, want credential_quota cooldown", live.Quota)
+	}
+	live.QuotaWindows = QuotaWindowState{
+		Windows:       []QuotaWindow{{Name: "secondary", ResetAt: recoverAt, UsedPercent: 100}},
+		LastFetchedAt: now.Add(-time.Hour),
+	}
+	manager.mu.Unlock()
+	if count := reg.GetModelCount(statelessModel); count != 0 {
+		t.Fatalf("registry count for %s before refresh = %d, want 0", statelessModel, count)
+	}
+
+	manager.doQuotaRefresh(ctx, authID)
+
+	for _, model := range []string{failedModel, siblingModel, statelessModel} {
+		selected, errPick := manager.scheduler.pickSingle(ctx, provider, model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("scheduler pick for %s after quota refresh: %v", model, errPick)
+		}
+		if selected == nil || selected.ID != authID {
+			t.Fatalf("scheduler selected auth for %s = %#v, want %q", model, selected, authID)
+		}
+		if count := reg.GetModelCount(model); count != 1 {
+			t.Fatalf("registry count for %s after refresh = %d, want 1", model, count)
+		}
+	}
+	if _, errPick := manager.scheduler.pickSingle(ctx, provider, missingModel, cliproxyexecutor.Options{}, nil); errPick == nil {
+		t.Fatalf("scheduler picked %s, want its 404 cooldown kept", missingModel)
+	}
+}
+
 func TestReconcileQuotaWindowRolloversKeepsAmbiguousCooldowns(t *testing.T) {
 	t.Parallel()
 

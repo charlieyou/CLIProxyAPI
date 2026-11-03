@@ -498,11 +498,18 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	// Persist outside the lock: store.Save may perform I/O.
 	_ = m.persist(ctx, persistSnapshot)
 	if len(resumedModels) > 0 {
+		// Re-project every registered model: a credential-scoped cooldown also
+		// suspended models that have no per-model state to resume.
 		reg := registry.GetGlobalRegistry()
-		for _, model := range resumedModels {
-			reg.ClearModelQuotaExceeded(authID, model)
-			reg.ResumeClientModel(authID, model)
+		supportedModels, regEpoch := reg.GetModelsAndEpochForClient(authID)
+		projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+		for _, sm := range supportedModels {
+			if sm == nil || strings.TrimSpace(sm.ID) == "" {
+				continue
+			}
+			projections = append(projections, m.clientModelProjectionForAuth(persistSnapshot, sm.ID, now))
 		}
+		reg.ApplyClientModelProjections(authID, regEpoch, persistSnapshot.Generation, projections)
 		if m.scheduler != nil {
 			m.scheduler.upsertAuth(persistSnapshot)
 		}
@@ -543,8 +550,13 @@ func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows [
 
 	resumedModels := make([]string, 0)
 	for model, state := range auth.ModelStates {
-		if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.Quota.Reason != "quota" ||
+		// credential_quota marks sibling models that inherited a credential-scoped cooldown.
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded || (state.Quota.Reason != "quota" && state.Quota.Reason != "credential_quota") ||
 			state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) || state.Quota.NextRecoverAt.IsZero() {
+			continue
+		}
+		// A retry deadline beyond the quota window belongs to another failure.
+		if state.NextRetryAfter.After(state.Quota.NextRecoverAt) {
 			continue
 		}
 
@@ -569,7 +581,7 @@ func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows [
 		}
 
 		// Clear only the aggregate cooldown tied to this rolled-over model window.
-		if auth.Quota.Reason == "quota" && auth.Quota.NextRecoverAt.Equal(recoverAt) {
+		if (auth.Quota.Reason == "quota" || auth.Quota.Reason == "credential_quota") && auth.Quota.NextRecoverAt.Equal(recoverAt) {
 			applyCooldownFields(&auth.Quota, QuotaState{})
 		}
 		resetModelState(state, now)
