@@ -289,10 +289,8 @@ func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string
 	m.EnqueueQuotaRefresh(ids)
 }
 
-// quotaRefreshInterval returns the cadence for the periodic proactive quota
-// refresh. It is derived from StaleThreshold so refreshes land at roughly the
-// half-life of the routing-staleness window, keeping QuotaWindows "known" for
-// expiry-based selection. Returns 0 (disabled) when no usable threshold is set.
+// quotaRefreshInterval keeps routing snapshots fresh at half their configured
+// staleness threshold, without accelerating polling for blocked credentials.
 func (m *Manager) quotaRefreshInterval() time.Duration {
 	m.mu.RLock()
 	stale := m.quotaRefreshSettings.StaleThreshold
@@ -313,13 +311,15 @@ func (m *Manager) periodicQuotaRefresh(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
+		// Spread usage checks across instances without adding a network timeout.
+		jitter := time.Duration(rand.Int64N(max(int64(interval/10), 1)))
+		timer := time.NewTimer(interval + jitter)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			if !m.quotaRefreshEnabled("") {
 				continue
 			}
@@ -345,19 +345,45 @@ func (m *Manager) quotaRefreshWorker(ctx context.Context) {
 
 // doQuotaRefresh performs the actual quota fetch and updates state under lock.
 func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
-	m.mu.Lock()
-	delete(m.pendingRefreshes, authID)
-	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.pendingRefreshes, authID)
+		m.mu.Unlock()
+	}()
+	_ = m.refreshQuota(ctx, authID, false)
+}
+
+// refreshQuota serializes worker and manual fetches. afterReset bypasses cache
+// freshness only; provider limits and guarded recovery still apply.
+func (m *Manager) refreshQuota(ctx context.Context, authID string, afterReset bool) error {
+	m.quotaRefreshMu.Lock()
+	defer m.quotaRefreshMu.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	m.mu.RLock()
 	auth := m.auths[authID]
 	if auth == nil {
 		m.mu.RUnlock()
-		return
+		return &Error{HTTPStatus: http.StatusNotFound, Message: "auth not found"}
 	}
 	cfg := m.quotaRefreshSettings
+	if auth.Disabled || auth.Status == StatusDisabled || cfg.ReadOnlyMode {
+		m.mu.RUnlock()
+		return &Error{HTTPStatus: http.StatusForbidden, Message: "quota refresh is disabled for this account or read-only mode"}
+	}
+	if afterReset && (!cfg.Enabled || !slices.Contains(cfg.EnabledProviders, auth.Provider) || m.executors[auth.Provider] == nil) {
+		m.mu.RUnlock()
+		return &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "quota refresh and a provider executor must be enabled"}
+	}
+	if afterReset && auth.Provider != "claude" && auth.Provider != "codex" {
+		m.mu.RUnlock()
+		return &Error{HTTPStatus: http.StatusBadRequest, Message: "manual reset recovery supports Claude and Codex accounts"}
+	}
 	providerKey := auth.Provider
 	authClone := auth.Clone()
+	attempt := m.quotaRecoveryAttempts[authID]
 	originalToken, _ := authClone.Metadata["access_token"].(string)
 	m.mu.RUnlock()
 
@@ -367,14 +393,17 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 			"auth_id":       authID,
 			"cooling_until": authClone.QuotaWindows.NextFetchAfter.Format(time.RFC3339),
 		}).Debug("quota refresh: skip, cooling from prior 429")
-		return
+		return &RateLimitedError{RetryAfter: authClone.QuotaWindows.NextFetchAfter.Sub(now)}
+	}
+	if afterReset && attempt.epoch == authClone.RegistrationEpoch && attempt.nextProbeAfter.After(now) && hasRecoverableQuota(authClone, now) {
+		return &RateLimitedError{RetryAfter: attempt.nextProbeAfter.Sub(now)}
 	}
 	// Refetch once the cached windows reach half the routing-staleness window.
 	// Using StaleThreshold/2 (matching the periodic refresh cadence) keeps the
 	// snapshot inside StaleThreshold at all times, so FillFirstSelector always
 	// sees "known" data and routes by soonest-expiring rather than ID order.
 	freshWindow := cfg.StaleThreshold / 2
-	if freshWindow > 0 && len(authClone.QuotaWindows.Windows) > 0 &&
+	if !afterReset && freshWindow > 0 && len(authClone.QuotaWindows.Windows) > 0 &&
 		!authClone.QuotaWindows.LastFetchedAt.IsZero() && now.Sub(authClone.QuotaWindows.LastFetchedAt) < freshWindow {
 		log.WithFields(log.Fields{
 			"auth_id":         authID,
@@ -382,7 +411,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 			"last_fetched_at": authClone.QuotaWindows.LastFetchedAt.Format(time.RFC3339),
 			"fresh_window":    freshWindow.String(),
 		}).Debug("quota refresh: skip, cached windows still fresh")
-		return
+		return nil
 	}
 
 	// The sink writes the refreshed token directly onto the live auth under
@@ -396,7 +425,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		current := m.auths[id]
-		if current == nil || current.Metadata == nil {
+		if current == nil || current.Metadata == nil || current.RegistrationEpoch != authClone.RegistrationEpoch {
 			return
 		}
 		if token, ok := current.Metadata["access_token"].(string); ok && token == accessToken {
@@ -421,7 +450,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 			m.unknownProviderLogged[providerKey] = true
 		}
 		m.mu.Unlock()
-		return
+		return &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "quota provider unavailable"}
 	}
 
 	windows, err := provider.FetchWindows(ctx, authClone, "")
@@ -430,10 +459,10 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	// don't write a stale error back over potentially-good state from a new
 	// worker running against the same queue.
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
 
-	var persistSnapshot *Auth
+	var persistSnapshot, recoverySnapshot *Auth
 	var resumedModels []string
 	cooldownStateChanged := false
 
@@ -442,11 +471,11 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	auth = m.auths[authID]
 	if auth == nil {
 		m.mu.Unlock()
-		return
+		return &Error{HTTPStatus: http.StatusNotFound, Message: "auth removed during quota refresh"}
 	}
-	if auth.Provider != providerKey {
+	if auth.Provider != providerKey || auth.RegistrationEpoch != authClone.RegistrationEpoch {
 		m.mu.Unlock()
-		return
+		return &Error{HTTPStatus: http.StatusConflict, Message: "auth replaced during quota refresh"}
 	}
 
 	now = time.Now()
@@ -454,17 +483,12 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	if err != nil {
 		auth.QuotaWindows.LastFetchedAt = now
 		auth.QuotaWindows.LastFetchError = &Error{Message: err.Error()}
-		// If the upstream returned 429, record a shared cooldown so both the
-		// quota refresher and the usage-expiration sweeper back off until
-		// Retry-After has elapsed (with a 60s floor when the header is
-		// missing or zero).
+		// Usage-endpoint limits have their own conservative, shared backoff.
 		var rl *RateLimitedError
 		if errors.As(err, &rl) {
-			cooldown := time.Now().Add(maxDuration(rl.RetryAfter, 60*time.Second))
-			if cooldown.After(auth.QuotaWindows.NextFetchAfter) {
-				auth.QuotaWindows.NextFetchAfter = cooldown
-				persistSnapshot = auth.Clone()
-			}
+			applyUsageEndpointRateLimit(&auth.QuotaWindows, rl.RetryAfter, now)
+			persistSnapshot = auth.Clone()
+			err = &RateLimitedError{RetryAfter: auth.QuotaWindows.NextFetchAfter.Sub(now)}
 		}
 		// If the sink refreshed the access token before the fetch ultimately
 		// failed, persist so the new token survives a restart.
@@ -475,7 +499,7 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		if persistSnapshot != nil {
 			_ = m.persist(ctx, persistSnapshot)
 		}
-		return
+		return err
 	}
 
 	var cooldownRecordsBefore []CooldownStateRecord
@@ -487,7 +511,17 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 	auth.QuotaWindows.Windows = windows
 	auth.QuotaWindows.LastFetchedAt = now
 	auth.QuotaWindows.LastFetchError = nil
-	resumedModels = reconcileQuotaWindowRollovers(auth, previousWindows, windows, now)
+	if !auth.QuotaWindows.NextFetchAfter.After(now) {
+		auth.QuotaWindows.NextFetchAfter = time.Time{}
+		auth.QuotaWindows.RateLimitBackoffLevel = 0
+	}
+	// Usage fetched before a newer request failed must not undo that failure.
+	if !auth.Disabled && auth.Status != StatusDisabled && auth.RegistrationEpoch == authClone.RegistrationEpoch && auth.Generation == authClone.Generation {
+		if !afterReset {
+			resumedModels = reconcileQuotaWindowRollovers(auth, previousWindows, windows, now)
+		}
+		recoverySnapshot = auth.Clone()
+	}
 	persistSnapshot = auth.Clone()
 	if trackCooldownState && len(resumedModels) > 0 {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -541,6 +575,8 @@ func (m *Manager) doQuotaRefresh(ctx context.Context, authID string) {
 		"window_count":  len(windows),
 		"soonest_reset": soonestStr,
 	}).Debug("quota refresh success")
+	m.recoverQuotaWindows(ctx, recoverySnapshot, previousWindows, windows, afterReset)
+	return nil
 }
 
 func reconcileQuotaWindowRollovers(auth *Auth, previousWindows, currentWindows []QuotaWindow, now time.Time) []string {
@@ -640,24 +676,27 @@ func quotaWindowNamed(windows []QuotaWindow, name string) (QuotaWindow, bool) {
 	return QuotaWindow{}, false
 }
 
-// recordUsageEndpointRateLimit stores a per-auth cooldown after a 429 from
-// either the quota refresher or the usage-expiration-trigger sweeper.
-// Floor: at least 60s, to prevent tight re-loops on 429s with no Retry-After.
-func (m *Manager) recordUsageEndpointRateLimit(ctx context.Context, authID string, retryAfter time.Duration) {
-	const minFloor = 60 * time.Second
-	if retryAfter < minFloor {
-		retryAfter = minFloor
+// applyUsageEndpointRateLimit is shared by both usage-endpoint callers.
+// Retry after 30m, 1h, then 2h, plus jitter; never shorten Retry-After.
+func applyUsageEndpointRateLimit(state *QuotaWindowState, retryAfter time.Duration, now time.Time) {
+	level := min(max(state.RateLimitBackoffLevel, 0), 2)
+	delay := max(30*time.Minute*time.Duration(1<<level), retryAfter)
+	jitter := time.Duration(rand.Int64N(int64(min(delay, 2*time.Hour) / 10)))
+	cooldown := now.Add(delay).Add(jitter)
+	if cooldown.After(state.NextFetchAfter) {
+		state.NextFetchAfter = cooldown
 	}
-	cooldown := time.Now().Add(retryAfter)
+	state.RateLimitBackoffLevel = level + 1
+}
 
+// recordUsageEndpointRateLimit backs off the shared endpoint, not inference.
+func (m *Manager) recordUsageEndpointRateLimit(ctx context.Context, authID string, retryAfter time.Duration) {
 	var snapshot *Auth
 	m.mu.Lock()
 	a := m.auths[authID]
 	if a != nil {
-		if cooldown.After(a.QuotaWindows.NextFetchAfter) {
-			a.QuotaWindows.NextFetchAfter = cooldown
-			snapshot = a.Clone()
-		}
+		applyUsageEndpointRateLimit(&a.QuotaWindows, retryAfter, time.Now())
+		snapshot = a.Clone()
 	}
 	m.mu.Unlock()
 	if snapshot != nil {
@@ -665,12 +704,19 @@ func (m *Manager) recordUsageEndpointRateLimit(ctx context.Context, authID strin
 	}
 }
 
-// maxDuration returns the larger of a, b.
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
+func (m *Manager) recordUsageEndpointSuccess(ctx context.Context, authID string) {
+	var snapshot *Auth
+	m.mu.Lock()
+	if a := m.auths[authID]; a != nil && !a.QuotaWindows.NextFetchAfter.After(time.Now()) &&
+		(a.QuotaWindows.RateLimitBackoffLevel != 0 || !a.QuotaWindows.NextFetchAfter.IsZero()) {
+		a.QuotaWindows.RateLimitBackoffLevel = 0
+		a.QuotaWindows.NextFetchAfter = time.Time{}
+		snapshot = a.Clone()
 	}
-	return b
+	m.mu.Unlock()
+	if snapshot != nil {
+		_ = m.persist(ctx, snapshot)
+	}
 }
 
 // validateQuotaProviders logs registered providers and warns about configuration issues.
@@ -1031,6 +1077,7 @@ func (m *Manager) runUsageTrigger(ctx context.Context, auth *Auth, provider, acc
 			log.Debugf("usage expiration trigger: fetch usage failed auth_id=%s err=%v", authID, err)
 			return
 		}
+		m.recordUsageEndpointSuccess(ctx, authID)
 		if !NeedsCodexUsageTrigger(usage) {
 			return
 		}
@@ -1056,6 +1103,7 @@ func (m *Manager) runUsageTrigger(ctx context.Context, auth *Auth, provider, acc
 			log.Debugf("usage expiration trigger: verify fetch failed auth_id=%s window=%s model=%s err=%v", authID, window, model, err)
 			return
 		}
+		m.recordUsageEndpointSuccess(ctx, authID)
 		if NeedsCodexUsageTrigger(usageAfter) {
 			log.Debugf("usage expiration trigger: reset_at still invalid after prompt auth_id=%s window=%s model=%s", authID, window, model)
 			return
@@ -1075,6 +1123,7 @@ func (m *Manager) runUsageTrigger(ctx context.Context, auth *Auth, provider, acc
 			log.Debugf("usage expiration trigger: fetch usage failed auth_id=%s err=%v", authID, err)
 			return
 		}
+		m.recordUsageEndpointSuccess(ctx, authID)
 		if !NeedsUsageTrigger(usage) {
 			return
 		}
@@ -1100,6 +1149,7 @@ func (m *Manager) runUsageTrigger(ctx context.Context, auth *Auth, provider, acc
 			log.Debugf("usage expiration trigger: verify fetch failed auth_id=%s window=%s model=%s err=%v", authID, window, model, err)
 			return
 		}
+		m.recordUsageEndpointSuccess(ctx, authID)
 		if NeedsUsageTrigger(usageAfter) {
 			log.Debugf("usage expiration trigger: resets_at still null after prompt auth_id=%s window=%s model=%s", authID, window, model)
 			return

@@ -741,17 +741,24 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	m.markResult(ctx, result, nil)
+}
+
+// markResult returns the applied snapshot. expected guards background recovery
+// against newer request failures and account replacement.
+func (m *Manager) markResult(ctx context.Context, result Result, expected *Auth) *Auth {
 	if result.AuthID == "" {
-		return
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	probeModel, probeSucceeded := result.Model, result.Success
 	if m != nil {
 		if policy := m.ResultPolicy(); policy != nil {
 			result = policy.ApplyResultPolicy(ctx, result)
 			if result.AuthID == "" {
-				return
+				return nil
 			}
 		}
 	}
@@ -765,6 +772,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	now := time.Now()
 
 	m.mu.Lock()
+	if expected != nil && (ctx.Err() != nil || result.AuthID != expected.ID || result.Provider != expected.Provider ||
+		result.Model != probeModel || result.Success && !probeSucceeded || !registry.GetGlobalRegistry().ClientSupportsModel(expected.ID, probeModel) ||
+		!m.quotaRecoveryCurrentLocked(m.auths[result.AuthID], expected) ||
+		!recoverableQuotaModel(existingModelState(m.auths[result.AuthID], modelKey), now)) {
+		m.mu.Unlock()
+		return nil
+	}
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
 			if m != nil {
@@ -782,6 +796,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
+		if expected != nil {
+			m.recordQuotaRecoveryResultLocked(auth, result, now)
+		}
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
@@ -792,6 +809,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			quotaProvider = strings.TrimSpace(auth.Provider)
 		}
 
+		// A failed diagnostic request must not replace a quota block with an
+		// unrelated transport/5xx failure. Keep the evidence for a backed-off retry.
+		availabilityNeutral := expected != nil && !result.Success && (statusCode == 0 || statusCode >= 500)
 		if result.Success {
 			if auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 				// Retain active credential-scoped cooldown
@@ -808,7 +828,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
-		} else {
+		} else if !availabilityNeutral {
 			if modelKey != "" {
 				if !shouldSkipCredentialCooldown(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
@@ -995,7 +1015,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
-		if !result.CredentialScope && modelKey != "" {
+		if !(expected != nil && result.Success) && !result.CredentialScope && modelKey != "" {
 			targetModels = append(targetModels, modelKey)
 			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
 				targetModels = append(targetModels, routeKey)
@@ -1027,6 +1047,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
 	m.updateSessionAffinity(result)
+	return authSnapshot
 }
 
 func (m *Manager) updateSessionAffinity(result Result) {

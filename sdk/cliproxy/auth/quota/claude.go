@@ -66,72 +66,47 @@ func (p *ClaudeQuotaProvider) FetchWindows(ctx context.Context, a *auth.Auth, mo
 		return nil, fmt.Errorf("claude quota API returned %d", resp.StatusCode)
 	}
 
-	// Use pointer types for optional windows to detect presence vs zero-value
+	// Missing utilization is unknown, not a zero-percent usage reset.
 	type windowData struct {
-		ResetsAt    string  `json:"resets_at"`
-		Utilization float64 `json:"utilization"`
+		ResetsAt    string   `json:"resets_at"`
+		Utilization *float64 `json:"utilization"`
 	}
 	var result struct {
-		FiveHour *windowData `json:"five_hour"`
-		SevenDay *windowData `json:"seven_day"`
+		FiveHour       *windowData `json:"five_hour"`
+		SevenDay       *windowData `json:"seven_day"`
+		SevenDayOpus   *windowData `json:"seven_day_opus"`
+		SevenDaySonnet *windowData `json:"seven_day_sonnet"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("claude quota parse failed: %w", err)
 	}
 
-	// toUsedPercent converts utilization to 0-100 range.
-	// The Claude API returns utilization as a 0-1 fraction (e.g., 0.75 means 75% used).
-	// If the API ever changes to return 0-100 directly, this handles both cases.
-	toUsedPercent := func(util float64) float64 {
-		if util <= 0 {
-			return 0
-		}
-		if util <= 1.0 {
-			return util * 100.0
-		}
-		if util <= 100.0 {
-			return util // Already in 0-100 range
-		}
-		return 100.0
-	}
-
-	// Best-effort parse: extract windows that are present, skip missing ones
+	// The usage endpoint reports percentages, unlike fractional utilization in
+	// inference response headers. In particular, 1 means 1%, not 100%.
 	var windows []auth.QuotaWindow
-
-	if result.FiveHour != nil && strings.TrimSpace(result.FiveHour.ResetsAt) != "" {
-		resetAt, err := time.Parse(time.RFC3339Nano, result.FiveHour.ResetsAt)
+	for _, entry := range []struct {
+		name string
+		data *windowData
+	}{
+		{"five_hour", result.FiveHour},
+		{"seven_day", result.SevenDay},
+		{"seven_day_opus", result.SevenDayOpus},
+		{"seven_day_sonnet", result.SevenDaySonnet},
+	} {
+		window := entry.data
+		if window == nil || window.Utilization == nil || *window.Utilization < 0 || strings.TrimSpace(window.ResetsAt) == "" {
+			log.WithField("window", entry.name).Debug("claude quota response missing usable window, skipping")
+			continue
+		}
+		resetAt, err := time.Parse(time.RFC3339Nano, window.ResetsAt)
 		if err != nil {
 			return nil, fmt.Errorf("claude quota parse failed: %w", err)
 		}
 		windows = append(windows, auth.QuotaWindow{
-			Name:        "five_hour",
+			Name:        entry.name,
 			ResetAt:     resetAt,
-			UsedPercent: toUsedPercent(result.FiveHour.Utilization),
+			UsedPercent: *window.Utilization,
 		})
-	} else if result.FiveHour != nil {
-		log.WithFields(log.Fields{
-			"resets_at": result.FiveHour.ResetsAt,
-		}).Debug("claude quota response missing five_hour window, skipping")
-	} else {
-		log.Debug("claude quota response missing five_hour window, skipping")
-	}
-
-	if result.SevenDay != nil && strings.TrimSpace(result.SevenDay.ResetsAt) != "" {
-		resetAt, err := time.Parse(time.RFC3339Nano, result.SevenDay.ResetsAt)
-		if err != nil {
-			return nil, fmt.Errorf("claude quota parse failed: %w", err)
-		}
-		windows = append(windows, auth.QuotaWindow{
-			Name:        "seven_day",
-			ResetAt:     resetAt,
-			UsedPercent: toUsedPercent(result.SevenDay.Utilization),
-		})
-	} else if result.SevenDay != nil {
-		log.WithFields(log.Fields{
-			"resets_at": result.SevenDay.ResetsAt,
-		}).Debug("claude quota response missing seven_day window, skipping")
-	} else {
-		log.Debug("claude quota response missing seven_day window, skipping")
 	}
 
 	// Only return schema mismatch error when NO windows could be extracted

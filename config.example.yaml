@@ -269,7 +269,9 @@ routing:
   # for maximum parallel concurrency.
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
-  # Quota refresh: fetch usage windows on 429 to drive fill-first routing.
+  # Quota refresh: fetch usage windows on 429 and at half stale_threshold (with jitter).
+  # Blocked accounts use the same cache cadence. Usage API 429s back off 30m -> 1h -> 2h.
+  # After an upstream manual reset, POST /v0/management/quota/refresh with auth_index.
   # quota-refresh:
   #   enabled: false              # Enable quota refresh (default: false)
   #   read_only_mode: false       # If true, never modify auth state (default: false)

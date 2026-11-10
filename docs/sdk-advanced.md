@@ -136,3 +136,39 @@ The embedded server calls this automatically for built‑in providers; for custo
 - Toggle debug logs: Management API GET/PUT `/v0/management/debug`
 - Hot reload changes in `config.yaml` and `auths/` are picked up automatically by the watcher
 
+## Quota Recovery After an Upstream Usage Reset
+
+When `routing.quota-refresh` is enabled, quota-blocked Claude and Codex accounts
+use the same cached usage-refresh cadence as healthy accounts. With
+`stale_threshold: 1h`, automatic refresh runs roughly every 30 minutes, plus up
+to 10% jitter. Normal inference requests also continue to record quota response
+headers without additional usage requests.
+
+Usage-endpoint 429s have a separate shared backoff: 30 minutes, 1 hour, then
+2 hours, with jitter and any longer `Retry-After` honored. A successful usage
+fetch resets that backoff. This reduces polling pressure; it does not guarantee
+that the provider will accept the next usage request.
+
+After manually resetting usage on the provider's website, notify the proxy with
+the existing management authentication and the account's `auth_index` from
+`GET /v0/management/auth-files`:
+
+```http
+POST /v0/management/quota/refresh
+Content-Type: application/json
+
+{"auth_index":"ACCOUNT_AUTH_INDEX"}
+```
+
+This performs one usage fetch, bypassing cache freshness but not active usage or
+inference-probe cooldowns. Healthy usage permits a small inference probe pinned
+to each blocked account/model; only successful, current probes clear quota
+blocks. Disabled accounts, authentication failures, and unrelated model errors
+are not cleared. The response lists `recovered_models`; an empty list means no
+quota block was verified as recovered. A cooldown returns HTTP 429 with
+`Retry-After`. This action requires quota refresh and the account's provider to
+be enabled, and is unavailable in read-only mode.
+
+Unlike `/v0/management/reset-quota`, this endpoint does not unconditionally
+erase local errors, and it does not reset usage at the upstream provider. SDK
+embedders can call `Manager.RefreshQuotaAfterReset(ctx, authID)` directly.

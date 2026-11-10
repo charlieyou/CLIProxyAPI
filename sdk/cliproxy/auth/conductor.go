@@ -199,10 +199,14 @@ type Manager struct {
 	refreshLocks sync.Map
 	// Quota refresh work queue for async refresh requests (capacity: 100).
 	quotaRefreshQueue chan string
+	// Serializes quota work across auto-refresh worker restarts.
+	quotaRefreshMu sync.Mutex
 	// Tracks which providers have logged unknown provider warning (prevents log spam).
 	unknownProviderLogged map[string]bool
 	// Tracks auth IDs currently pending or in-flight for quota refresh.
 	pendingRefreshes map[string]bool
+	// Guards recovery probes and retains reset evidence across failed attempts.
+	quotaRecoveryAttempts map[string]quotaRecoveryAttempt
 	// quotaRefreshSettings stores the quota refresh configuration for 429 handler integration.
 	quotaRefreshSettings QuotaRefreshSettings
 
