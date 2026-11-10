@@ -364,6 +364,49 @@ func TestHostAuthSaveCallbackRejectsInvalidWeightBeforePersistence(t *testing.T)
 	}
 }
 
+func TestHostAuthSaveCallbackPreservesClaudePrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		prefix  string
+	}{
+		{name: "default", payload: `{"type":"claude","access_token":"fixture-only"}`, prefix: "anthropic"},
+		{name: "custom", payload: `{"type":"claude","prefix":"team"}`, prefix: "team"},
+		{name: "explicit empty", payload: `{"type":"claude","prefix":""}`},
+		{name: "other provider", payload: `{"type":"demo"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host := New()
+			host.runtimeConfig = &config.Config{AuthDir: t.TempDir()}
+			host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+			req, err := json.Marshal(pluginapi.HostAuthSaveRequest{Name: "account.json", JSON: json.RawMessage(tc.payload)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for attempt := range 2 {
+				if _, err := host.callFromPlugin(context.Background(), pluginabi.MethodHostAuthSave, req); err != nil {
+					t.Fatal(err)
+				}
+				auth, exists := host.currentAuthManager().GetByID("account.json")
+				if !exists || auth.Prefix != tc.prefix {
+					t.Errorf("attempt %d: runtime prefix not %q", attempt, tc.prefix)
+				}
+				raw, err := os.ReadFile(filepath.Join(host.runtimeConfig.AuthDir, "account.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var saved map[string]any
+				if err := json.Unmarshal(raw, &saved); err != nil {
+					t.Fatal(err)
+				}
+				if got, _ := saved["prefix"].(string); got != tc.prefix {
+					t.Errorf("attempt %d: saved prefix = %q, want %q", attempt, got, tc.prefix)
+				}
+			}
+		})
+	}
+}
+
 func TestHostAuthSaveCallbackWritesPhysicalFile(t *testing.T) {
 	authDir := t.TempDir()
 	host := New()

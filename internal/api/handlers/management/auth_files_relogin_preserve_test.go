@@ -58,8 +58,89 @@ func TestSaveTokenRecord_PostPersistHookReceivesCanonicalClaudeOAuth(t *testing.
 	if got := persistedAuth.AuthKind(); got != coreauth.AuthKindOAuth {
 		t.Fatalf("post-persist auth kind = %q, want %q", got, coreauth.AuthKindOAuth)
 	}
+	if persistedAuth.Prefix != "anthropic" || persistedAuth.Metadata["prefix"] != "anthropic" {
+		t.Fatalf("new Claude account prefix = %q (metadata %#v), want anthropic", persistedAuth.Prefix, persistedAuth.Metadata["prefix"])
+	}
 	if persistedAuth.Status != coreauth.StatusActive {
 		t.Fatalf("post-persist status = %q, want %q", persistedAuth.Status, coreauth.StatusActive)
+	}
+}
+
+func TestSaveTokenRecord_PreservesClaudeOmittedPrefix(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "same filename"
+		if legacy {
+			name = "legacy migration"
+		}
+		t.Run(name, func(t *testing.T) {
+			authDir := t.TempDir()
+			fileName := claude.CredentialFileName("user@example.com", "org-a", "account-a")
+			existingName := fileName
+			if legacy {
+				existingName = "claude-user@example.com.json"
+			}
+			metadata := map[string]any{"type": "claude", "email": "user@example.com", "organization_uuid": "org-a", "account_uuid": "account-a"}
+			raw, err := json.Marshal(metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(authDir, existingName), raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			record := &coreauth.Auth{
+				ID: fileName, FileName: fileName, Provider: "claude", Metadata: metadata,
+				Storage: &claude.ClaudeTokenStorage{Email: "user@example.com", OrganizationUUID: "org-a", AccountUUID: "account-a", AccessToken: "new-token"},
+			}
+			h := NewHandler(&config.Config{AuthDir: authDir}, "", nil)
+			var persistedAuth *coreauth.Auth
+			h.SetPostAuthPersistHook(func(_ context.Context, auth *coreauth.Auth) error {
+				persistedAuth = auth.Clone()
+				return nil
+			})
+			savedPath, err := h.saveTokenRecord(context.Background(), record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persistedAuth == nil {
+				t.Fatal("post-persist hook not called")
+			}
+			if record.Prefix != "" || persistedAuth.Prefix != "" {
+				t.Errorf("relogin acquired a prefix: record %q, persisted %q", record.Prefix, persistedAuth.Prefix)
+			}
+			raw, err = os.ReadFile(savedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved map[string]any
+			if err := json.Unmarshal(raw, &saved); err != nil {
+				t.Fatal(err)
+			}
+			if saved["prefix"] != "" || saved["access_token"] != "new-token" {
+				t.Errorf("saved prefix = %#v, token updated = %v", saved["prefix"], saved["access_token"] == "new-token")
+			}
+		})
+	}
+}
+
+func TestSaveTokenRecord_RejectsUnreadableClaudeMetadata(t *testing.T) {
+	for _, content := range []string{"", "{", "null", "{}"} {
+		t.Run("content="+content, func(t *testing.T) {
+			authDir := t.TempDir()
+			fileName := "claude-user@example.com.json"
+			path := filepath.Join(authDir, fileName)
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandler(&config.Config{AuthDir: authDir}, "", nil)
+			record := &coreauth.Auth{ID: fileName, FileName: fileName, Provider: "claude", Storage: &claude.ClaudeTokenStorage{Email: "user@example.com", AccessToken: "new-token"}}
+			if _, err := h.saveTokenRecord(context.Background(), record); err == nil {
+				t.Error("relogin accepted unreadable existing metadata")
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil || string(raw) != content {
+				t.Error("failed relogin changed existing credential")
+			}
+		})
 	}
 }
 

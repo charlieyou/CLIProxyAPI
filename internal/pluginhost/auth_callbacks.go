@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfile"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -296,11 +297,8 @@ func (h *Host) saveAuthFile(ctx context.Context, name string, data []byte) (stri
 	if errBuild != nil {
 		return "", errBuild
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		return "", fmt.Errorf("failed to write auth file: %w", errWrite)
-	}
-	if errUpsert := h.upsertAuthRecord(ctx, auth); errUpsert != nil {
-		return "", errUpsert
+	if errSave := authfile.Save(ctx, dst, data, auth, h.currentAuthManager()); errSave != nil {
+		return "", errSave
 	}
 	return dst, nil
 }
@@ -360,20 +358,6 @@ func (h *Host) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, 
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
-}
-
-func (h *Host) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {
-	manager := h.currentAuthManager()
-	if manager == nil || auth == nil {
-		return nil
-	}
-	if existing, ok := manager.GetByID(auth.ID); ok {
-		auth.CreatedAt = existing.CreatedAt
-		_, errUpdate := manager.Update(ctx, auth)
-		return errUpdate
-	}
-	_, errRegister := manager.Register(ctx, auth)
-	return errRegister
 }
 
 func isUnsafeAuthFileName(name string) bool {

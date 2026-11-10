@@ -19,6 +19,27 @@ func IsAuthTokenPayloadKey(key string) bool {
 	}
 }
 
+// ApplyDefaultAuthPrefix defaults new Claude accounts to the Anthropic route.
+// Explicit prefixes, including an empty prefix, are preserved.
+func ApplyDefaultAuthPrefix(target *Auth) {
+	if target == nil || !strings.EqualFold(strings.TrimSpace(target.Provider), "claude") {
+		return
+	}
+	if target.Metadata == nil {
+		target.Metadata = make(map[string]any)
+	}
+	if _, exists := target.Metadata["prefix"]; !exists {
+		prefix := strings.TrimSpace(target.Prefix)
+		if prefix == "" {
+			prefix = "anthropic"
+		}
+		target.Metadata["prefix"] = prefix
+	}
+	if prefix, ok := target.Metadata["prefix"].(string); ok {
+		target.Prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	}
+}
+
 // MergeExistingAuthMetadata merges user-configured metadata fields from existingMap
 // into target.Metadata and target.Storage if target does not already define them.
 func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
@@ -45,6 +66,12 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		}
 		if _, exists := target.Metadata[k]; !exists {
 			target.Metadata[k] = v
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(target.Provider), "claude") && strings.TrimSpace(target.Prefix) == "" {
+		if _, exists := target.Metadata["prefix"]; !exists {
+			// An existing account without a prefix must remain unprefixed on relogin.
+			target.Metadata["prefix"] = ""
 		}
 	}
 	if setter, ok := target.Storage.(interface{ SetMetadata(map[string]any) }); ok {

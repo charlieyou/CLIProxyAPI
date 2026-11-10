@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfile"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -901,9 +902,9 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	return store
 }
 
-func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
+func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) error {
 	if h == nil || record == nil {
-		return
+		return nil
 	}
 	var existingMap map[string]any
 
@@ -914,8 +915,10 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 		}
 		if targetFile != "" {
 			fullPath := filepath.Join(h.cfg.AuthDir, targetFile)
-			if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
-				_ = json.Unmarshal(raw, &existingMap)
+			var errRead error
+			existingMap, errRead = authfile.ReadMetadata(fullPath)
+			if errRead != nil && strings.EqualFold(strings.TrimSpace(record.Provider), "claude") {
+				return fmt.Errorf("preserve existing Claude settings: %w", errRead)
 			}
 		}
 	}
@@ -936,13 +939,16 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 	if len(existingMap) > 0 {
 		coreauth.MergeExistingAuthMetadata(record, existingMap)
 	}
+	return nil
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
-	h.mergeExistingAuthFileMetadata(record)
+	if errMerge := h.mergeExistingAuthFileMetadata(record); errMerge != nil {
+		return "", errMerge
+	}
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
@@ -959,6 +965,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
+	coreauth.ApplyDefaultAuthPrefix(record)
 	savedPath, errSave := store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if errSave != nil {
 		return savedPath, errSave

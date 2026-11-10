@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -24,11 +25,12 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 
 	files := []struct {
-		name    string
-		content string
+		name        string
+		content     string
+		wantContent string
 	}{
-		{name: "alpha.json", content: `{"type":"codex","email":"alpha@example.com"}`},
-		{name: "beta.json", content: `{"type":"claude","email":"beta@example.com"}`},
+		{name: "alpha.json", content: `{"type":"codex","email":"alpha@example.com"}`, wantContent: `{"type":"codex","email":"alpha@example.com"}`},
+		{name: "beta.json", content: `{"type":"claude","email":"beta@example.com"}`, wantContent: `{"type":"claude","email":"beta@example.com","prefix":"anthropic"}`},
 	}
 
 	var body bytes.Buffer
@@ -72,8 +74,18 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if string(data) != file.content {
-			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
+		var got, want map[string]any
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(file.wantContent), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("file %s = %#v, want %#v", file.name, got, want)
+		}
+		if file.name == "alpha.json" && string(data) != file.content {
+			t.Fatal("upload changed an untouched provider's JSON")
 		}
 	}
 
@@ -143,8 +155,13 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if err != nil {
 		t.Fatalf("expected valid auth file to be created: %v", err)
 	}
-	if string(betaData) != files[1].content {
-		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
+	var beta map[string]any
+	if err := json.Unmarshal(betaData, &beta); err != nil {
+		t.Fatal(err)
+	}
+	wantBeta := map[string]any{"type": "claude", "email": "beta@example.com", "prefix": "anthropic"}
+	if !reflect.DeepEqual(beta, wantBeta) {
+		t.Fatalf("beta auth file = %#v, want %#v", beta, wantBeta)
 	}
 }
 
