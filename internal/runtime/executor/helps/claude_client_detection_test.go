@@ -18,7 +18,7 @@ func claudeCodeDetectionPayload(userID string) []byte {
 
 func confirmedClaudeCodeHeaders() http.Header {
 	return http.Header{
-		"User-Agent":     {"claude-cli/2.1.280 (external, cli)"},
+		"User-Agent":     {"claude-cli/2.1.321 (external, cli)"},
 		"X-App":          {"cli"},
 		"Anthropic-Beta": {"claude-code-20250219,interleaved-thinking-2025-05-14"},
 	}
@@ -62,7 +62,24 @@ func measuredClaudeCodeMinimalHelperPayload() []byte {
 
 func measuredClaudeCodeStructuredHelperPayload() []byte {
 	encodedUserID, _ := json.Marshal(validClaudeCodeMetadataUserID)
-	return []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":` + string(encodedUserID) + `},"max_tokens":32000,"thinking":{"type":"disabled"},"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
+	return []byte(`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.321.fc6; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":` + string(encodedUserID) + `},"max_tokens":128000,"output_config":{"effort":"medium","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
+}
+
+// measuredClaudeCodeTitleHelperBetas is the beta header of the native 2.1.321
+// session-title helper.
+func measuredClaudeCodeTitleHelperBetas() string {
+	return claudeCodeHelperBetaProfile(true,
+		"per-turn-control-2026-07-01",
+		"mid-conversation-tool-changes-2026-07-01",
+		"inline-tools-2026-09-15",
+		"advisor-tool-2026-03-01",
+		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-clear-at-2026-08-21",
+		"claude-code-side-query-2026-09-29",
+		"effort-2025-11-24",
+		"structured-outputs-2025-12-15",
+		"cache-diagnosis-2026-04-07",
+	)
 }
 
 func TestDetectClaudeCodeRequestRequiresAllFourMessageSignals(t *testing.T) {
@@ -79,7 +96,7 @@ func TestDetectClaudeCodeRequestRequiresAllFourMessageSignals(t *testing.T) {
 
 func TestDetectClaudeCodeRequestAcceptsNewerPatchInMeasuredReleaseLine(t *testing.T) {
 	headers := confirmedClaudeCodeHeaders()
-	headers.Set("User-Agent", "claude-cli/2.1.281 (external, cli)")
+	headers.Set("User-Agent", "claude-cli/2.1.322 (external, cli)")
 	payload := claudeCodeDetectionPayload(validClaudeCodeMetadataUserID)
 
 	detection := DetectClaudeCodeRequest(headers, payload, false)
@@ -113,9 +130,9 @@ func TestDetectClaudeCodeRequestRejectsEachMissingMessageSignal(t *testing.T) {
 		headers http.Header
 		body    []byte
 	}{
-		{name: "x-app", headers: http.Header{"User-Agent": {"claude-cli/2.1.280 (external, cli)"}, "Anthropic-Beta": {"claude-code-20250219"}}, body: payload},
+		{name: "x-app", headers: http.Header{"User-Agent": {"claude-cli/2.1.321 (external, cli)"}, "Anthropic-Beta": {"claude-code-20250219"}}, body: payload},
 		{name: "user-agent", headers: http.Header{"User-Agent": {"curl/8.7.1"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, body: payload},
-		{name: "betas", headers: http.Header{"User-Agent": {"claude-cli/2.1.280 (external, cli)"}, "X-App": {"cli"}}, body: payload},
+		{name: "betas", headers: http.Header{"User-Agent": {"claude-cli/2.1.321 (external, cli)"}, "X-App": {"cli"}}, body: payload},
 		{name: "metadata", headers: confirmedClaudeCodeHeaders(), body: []byte(`{"messages":[]}`)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -136,16 +153,16 @@ func TestDetectClaudeCodeRequestClassifiesEntrypoints(t *testing.T) {
 		agentSDKVersion string
 		native          bool
 	}{
-		{name: "cli", userAgent: "claude-cli/2.1.280 (external, cli)", entrypoint: "cli", subclient: "claude-code-cli", native: true},
-		{name: "vscode-agent-sdk", userAgent: "claude-cli/2.1.280 (external, claude-vscode, agent-sdk/0.3.220)", entrypoint: "claude-vscode", subclient: "claude-code-vscode", agentSDKVersion: "0.3.220", native: true},
-		{name: "sdk-cli", userAgent: "claude-cli/2.1.280 (external, sdk-cli)", entrypoint: "sdk-cli", subclient: "claude-code-cli-sdk", native: true},
-		{name: "sdk-ts", userAgent: "claude-cli/2.1.280 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220"},
-		{name: "sdk-py", userAgent: "claude-cli/2.1.280 (external, sdk-py, agent-sdk/0.1.0)", entrypoint: "sdk-py", subclient: "claude-code-sdk-py", agentSDKVersion: "0.1.0"},
-		{name: "desktop", userAgent: "claude-cli/2.1.280 (external, claude-desktop)", entrypoint: "claude-desktop", subclient: "claude-desktop"},
-		{name: "desktop-third-party-inference", userAgent: "claude-cli/2.1.280 (external, claude-desktop-3p)", entrypoint: "claude-desktop-3p", subclient: "claude-desktop-3p"},
-		{name: "remote", userAgent: "claude-cli/2.1.280 (external, remote)", entrypoint: "remote", subclient: "claude-remote"},
-		{name: "github-action", userAgent: "claude-cli/2.1.280 (external, claude-code-github-action)", entrypoint: "claude-code-github-action", subclient: "claude-code-gh-action"},
-		{name: "unknown", userAgent: "claude-cli/2.1.280 (external, copied-client)", entrypoint: "copied-client"},
+		{name: "cli", userAgent: "claude-cli/2.1.321 (external, cli)", entrypoint: "cli", subclient: "claude-code-cli", native: true},
+		{name: "vscode-agent-sdk", userAgent: "claude-cli/2.1.321 (external, claude-vscode, agent-sdk/0.3.220)", entrypoint: "claude-vscode", subclient: "claude-code-vscode", agentSDKVersion: "0.3.220", native: true},
+		{name: "sdk-cli", userAgent: "claude-cli/2.1.321 (external, sdk-cli)", entrypoint: "sdk-cli", subclient: "claude-code-cli-sdk", native: true},
+		{name: "sdk-ts", userAgent: "claude-cli/2.1.321 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220"},
+		{name: "sdk-py", userAgent: "claude-cli/2.1.321 (external, sdk-py, agent-sdk/0.1.0)", entrypoint: "sdk-py", subclient: "claude-code-sdk-py", agentSDKVersion: "0.1.0"},
+		{name: "desktop", userAgent: "claude-cli/2.1.321 (external, claude-desktop)", entrypoint: "claude-desktop", subclient: "claude-desktop"},
+		{name: "desktop-third-party-inference", userAgent: "claude-cli/2.1.321 (external, claude-desktop-3p)", entrypoint: "claude-desktop-3p", subclient: "claude-desktop-3p"},
+		{name: "remote", userAgent: "claude-cli/2.1.321 (external, remote)", entrypoint: "remote", subclient: "claude-remote"},
+		{name: "github-action", userAgent: "claude-cli/2.1.321 (external, claude-code-github-action)", entrypoint: "claude-code-github-action", subclient: "claude-code-gh-action"},
+		{name: "unknown", userAgent: "claude-cli/2.1.321 (external, copied-client)", entrypoint: "copied-client"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			headers := confirmedClaudeCodeHeaders()
@@ -166,7 +183,7 @@ func TestDetectClaudeCodeRequestClassifiesEntrypoints(t *testing.T) {
 
 func TestDetectClaudeCodeCountTokensAllowsMissingMetadata(t *testing.T) {
 	headers := confirmedClaudeCodeHeaders()
-	headers.Set("User-Agent", "claude-cli/2.1.280 (external, claude-vscode, agent-sdk/0.3.220)")
+	headers.Set("User-Agent", "claude-cli/2.1.321 (external, claude-vscode, agent-sdk/0.3.220)")
 	detection := DetectClaudeCodeRequest(headers, []byte(`{"messages":[]}`), true)
 	if !detection.Confirmed {
 		t.Fatalf("detection = %#v, want confirmed", detection)
@@ -196,24 +213,14 @@ func TestDetectClaudeCodeRequestRecognizesMeasuredHaikuHelpers(t *testing.T) {
 			payload: measuredClaudeCodeMinimalHelperPayload(),
 		},
 		{
-			name:    "structured title helper with advisor",
-			beta:    claudeCodeHelperBetaProfile(true, "advisor-tool-2026-03-01", "structured-outputs-2025-12-15", "cache-diagnosis-2026-04-07"),
-			payload: measuredClaudeCodeStructuredHelperPayload(),
-		},
-		{
-			name:    "structured title helper with fallback credit",
-			beta:    claudeCodeHelperBetaProfile(true, "structured-outputs-2025-12-15", "fallback-credit-2026-06-01"),
+			name:    "structured title helper",
+			beta:    measuredClaudeCodeTitleHelperBetas(),
 			payload: measuredClaudeCodeStructuredHelperPayload(),
 		},
 		{
 			name:    "structured title helper with lowercase hex CCH",
-			beta:    claudeCodeHelperBetaProfile(true, "structured-outputs-2025-12-15"),
+			beta:    measuredClaudeCodeTitleHelperBetas(),
 			payload: []byte(strings.Replace(string(measuredClaudeCodeStructuredHelperPayload()), "cch=00000", "cch=7ee87", 1)),
-		},
-		{
-			name:    "structured title helper without redact thinking",
-			beta:    claudeCodeHelperBetaProfile(false, "structured-outputs-2025-12-15"),
-			payload: measuredClaudeCodeStructuredHelperPayload(),
 		},
 	}
 	for _, test := range tests {
@@ -235,15 +242,18 @@ func TestDetectClaudeCodeRequestRecognizesMeasuredHaikuHelpers(t *testing.T) {
 
 func TestDetectClaudeCodeRequestRejectsMalformedStructuredHaikuHelpers(t *testing.T) {
 	basePayload := string(measuredClaudeCodeStructuredHelperPayload())
-	beta := claudeCodeHelperBetaProfile(true, "structured-outputs-2025-12-15")
+	beta := measuredClaudeCodeTitleHelperBetas()
 	for _, test := range []struct {
 		name    string
 		payload string
 	}{
 		{name: "non-hex CCH", payload: strings.Replace(basePayload, "cch=00000", "cch=ghijk", 1)},
 		{name: "uppercase CCH", payload: strings.Replace(basePayload, "cch=00000", "cch=7EE87", 1)},
-		{name: "wrong token cap", payload: strings.Replace(basePayload, `"max_tokens":32000`, `"max_tokens":32001`, 1)},
+		{name: "wrong token cap", payload: strings.Replace(basePayload, `"max_tokens":128000`, `"max_tokens":32000`, 1)},
+		{name: "wrong model", payload: strings.Replace(basePayload, `"claude-haiku-5-5"`, `"claude-haiku-4-5-20251001"`, 1)},
 		{name: "open schema", payload: strings.Replace(basePayload, `"additionalProperties":false`, `"additionalProperties":true`, 1)},
+		{name: "no effort", payload: strings.Replace(basePayload, `"effort":"medium",`, "", 1)},
+		{name: "numeric effort", payload: strings.Replace(basePayload, `"effort":"medium"`, `"effort":2`, 1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			detection := DetectClaudeCodeRequest(measuredClaudeCodeHelperHeaders(beta), []byte(test.payload), false)
@@ -306,7 +316,7 @@ func TestDetectClaudeCodeRequestRejectsNearMissHaikuHelpers(t *testing.T) {
 		},
 		{
 			name:    "wrong helper model",
-			payload: strings.Replace(minimalPayload, claudeCodeHelperModel, "claude-sonnet-4-6", 1),
+			payload: strings.Replace(minimalPayload, claudeCodeProbeModel, "claude-sonnet-4-6", 1),
 		},
 		{
 			name:    "wrong helper token cap",
@@ -351,10 +361,10 @@ func TestDetectClaudeCodeRequestRejectsMalformedNativeSignals(t *testing.T) {
 		{name: "uppercase device", headers: confirmedClaudeCodeHeaders(), userID: `{"device_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","account_uuid":"","session_id":"11111111-2222-4333-8444-555555555555"}`},
 		{name: "invalid session", headers: confirmedClaudeCodeHeaders(), userID: `{"device_id":"0000000000000000000000000000000000000000000000000000000000000000","account_uuid":"","session_id":"session"}`},
 		{name: "malformed user agent", headers: http.Header{"User-Agent": {"claude-cli/not-a-version (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
-		{name: "older patch user agent", headers: http.Header{"User-Agent": {"claude-cli/2.1.257 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
+		{name: "older patch user agent", headers: http.Header{"User-Agent": {"claude-cli/2.1.320 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
 		{name: "unmeasured next-minor user agent", headers: http.Header{"User-Agent": {"claude-cli/2.2.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
 		{name: "implausible future user agent", headers: http.Header{"User-Agent": {"claude-cli/999.0.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
-		{name: "unrelated beta", headers: http.Header{"User-Agent": {"claude-cli/2.1.280 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"anything"}}, userID: validClaudeCodeMetadataUserID},
+		{name: "unrelated beta", headers: http.Header{"User-Agent": {"claude-cli/2.1.321 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"anything"}}, userID: validClaudeCodeMetadataUserID},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

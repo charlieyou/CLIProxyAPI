@@ -148,7 +148,10 @@ func computeFingerprint(messageText, version string) string {
 
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // Claude Code prepends to its system prompt. cch is present only on signed paths.
-func generateBillingHeader(cchSigning bool, version, messageText, entrypoint, workload string, isSubagent bool, prevReq, promptID string) string {
+// turnFields holds the per-turn fields Claude Code 2.1.321 appends after
+// cc_prompt_id (see helps.ClaudeTurnBillingFields); it is written only together
+// with cc_prompt_id.
+func generateBillingHeader(cchSigning bool, version, messageText, entrypoint, workload string, isSubagent bool, prevReq, promptID, turnFields string) string {
 	if entrypoint == "" {
 		entrypoint = "cli"
 	}
@@ -183,6 +186,7 @@ func generateBillingHeader(cchSigning bool, version, messageText, entrypoint, wo
 			b.WriteString(" cc_prompt_id=")
 			b.WriteString(promptID)
 			b.WriteByte(';')
+			b.WriteString(turnFields)
 		}
 	}
 	return b.String()
@@ -289,17 +293,14 @@ func claudeCCHFallbackBillingHeader(ctx context.Context, cfg *config.Config, pay
 		isSubagent,
 		prevReq,
 		promptID,
+		helps.ClaudeTurnBillingFields(payload),
 	)
 }
 
 const claudeCodeCLIIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
 
-const claudeCodeFableReportingOutcomes = `# Reporting outcomes
-
-Report what actually happened, not what you intended. When you say something is done, sent, saved, fixed, or verified, that claim must rest on a result you observed in this session — tool output, the file as it now reads, the page as it now loads — not on what the step should have produced. If you did not check, say you did not check. If any step failed, was skipped, or came back different from what you expected, say so in the first sentence of your report, before anything else, even when the rest of the work succeeded. Never quietly work around a failure in a way that makes it look resolved; a problem the user can see is recoverable, one your summary hides is not. When you stop before the task is complete, your first line says so plainly and names what is left. Do not describe partial work as done, and do not let a summary read as more certain than the evidence behind it.`
-
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.280", "cli", "")
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.321", "cli", "")
 }
 
 // checkSystemInstructionsWithSigningMode keeps the top-level system in Claude
@@ -312,7 +313,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, cch
 }
 
 // isClaudeFable51Model reports whether the model is specifically Fable 5.1 / Mythos 5.1,
-// matching native Claude Code 2.1.258 family/major/minor checks (AFo = {major:5, minor:1}).
+// matching native Claude Code family/major/minor checks (AFo = {major:5, minor:1}).
 func isClaudeFable51Model(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	for _, target := range []string{"fable-5-1", "fable-5.1", "mythos-5-1", "mythos-5.1"} {
@@ -339,15 +340,11 @@ func checkSystemInstructionsWithSigningModeAt(
 	system := gjson.GetBytes(payload, "system")
 	messageText := claudeBillingFingerprintMessageText(payload)
 
-	billingText := generateBillingHeader(cchSigning, version, messageText, entrypoint, workload, isSubagent, prevReq, promptID)
+	billingText := generateBillingHeader(cchSigning, version, messageText, entrypoint, workload, isSubagent, prevReq, promptID, helps.ClaudeTurnBillingFields(payload))
 	billingBlock := buildTextBlock(billingText, nil)
 	agentBlock := buildTextBlock(claudeCodeCLIIdentity, &claudeCodeCacheControl)
 
 	systemBlocks := []string{billingBlock, agentBlock}
-	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "model").String()))
-	if isClaudeFable51Model(model) && !helps.IsClaudeProbeOrHelperRequest(payload) {
-		systemBlocks = append(systemBlocks, buildTextBlock(claudeCodeFableReportingOutcomes, nil))
-	}
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 	if strictMode {
 		return injectClaudeCodeCurrentDate(payload, now)
@@ -900,24 +897,7 @@ func reconcileClaudeCodeSystemPlacementAfterPayload(payload []byte, state claude
 }
 
 type claudeCodeFableState struct {
-	injectedFallbacks bool
-	injectedDisplay   bool
-	injectedReporting bool
-}
-
-func hasFableReportingBlock(body []byte) bool {
-	system := gjson.GetBytes(body, "system")
-	if !system.IsArray() {
-		str := strings.ReplaceAll(system.String(), "\u200B", "")
-		return str == claudeCodeFableReportingOutcomes || strings.Contains(str, claudeCodeFableReportingOutcomes)
-	}
-	for _, blk := range system.Array() {
-		text := strings.ReplaceAll(blk.Get("text").String(), "\u200B", "")
-		if text == claudeCodeFableReportingOutcomes {
-			return true
-		}
-	}
-	return false
+	injectedDisplay bool
 }
 
 func captureClaudeCodeFableState(before, after []byte, cloaked bool) claudeCodeFableState {
@@ -925,128 +905,36 @@ func captureClaudeCodeFableState(before, after []byte, cloaked bool) claudeCodeF
 		return claudeCodeFableState{}
 	}
 	return claudeCodeFableState{
-		injectedFallbacks: !gjson.GetBytes(before, "fallbacks").Exists() && gjson.GetBytes(after, "fallbacks").Exists(),
-		injectedDisplay:   !gjson.GetBytes(before, "thinking.display").Exists() && gjson.GetBytes(after, "thinking.display").Exists(),
-		injectedReporting: !hasFableReportingBlock(before) && hasFableReportingBlock(after),
+		injectedDisplay: !gjson.GetBytes(before, "thinking.display").Exists() && gjson.GetBytes(after, "thinking.display").Exists(),
 	}
 }
 
-// reconcileClaudeCodeFableModelAfterPayload reconciles model-specific additions
-// (Opus fallback, thinking.display=updates, and # Reporting outcomes system block)
-// if payload rules rewrite the request model between Fable 5.1 and non-Fable models.
+// reconcileClaudeCodeFableModelAfterPayload reconciles the Fable 5.1
+// thinking.display=updates addition if payload rules rewrite the request model
+// between Fable 5.1 and other models.
 func reconcileClaudeCodeFableModelAfterPayload(
 	body []byte,
 	fableState claudeCodeFableState,
-	payloadTouchedFallbacks bool,
 	payloadTouchedDisplay bool,
 	cloaked bool,
 	isProbeOrHelper bool,
 ) []byte {
-	if !cloaked || len(body) == 0 {
-		return body
-	}
-
-	// Probes and helpers must never carry Fable additions (Opus fallback, display=updates, reporting block)
-	if isProbeOrHelper {
-		if fableState.injectedFallbacks && !payloadTouchedFallbacks {
-			body, _ = sjson.DeleteBytes(body, "fallbacks")
-		}
-		if fableState.injectedDisplay && !payloadTouchedDisplay {
-			body, _ = sjson.DeleteBytes(body, "thinking.display")
-		}
-		if fableState.injectedReporting {
-			system := gjson.GetBytes(body, "system")
-			if system.IsArray() {
-				blocks := make([]string, 0, len(system.Array()))
-				removed := false
-				for _, blk := range system.Array() {
-					if strings.ReplaceAll(blk.Get("text").String(), "\u200B", "") == claudeCodeFableReportingOutcomes {
-						removed = true
-						continue
-					}
-					blocks = append(blocks, blk.Raw)
-				}
-				if removed {
-					body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
-				}
-			} else if strings.ReplaceAll(system.String(), "\u200B", "") == claudeCodeFableReportingOutcomes {
-				body, _ = sjson.DeleteBytes(body, "system")
-			}
-		}
+	if !cloaked || len(body) == 0 || payloadTouchedDisplay {
 		return body
 	}
 	currentModel := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
-
-	if isClaudeFable51Model(currentModel) {
-		// Non-Fable rewritten to Fable 5.1 (or original Fable 5.1): attach Fable additions
-		// unless matching payload rules explicitly configured or filtered them.
-		if !gjson.GetBytes(body, "fallbacks").Exists() && !payloadTouchedFallbacks {
-			body, _ = sjson.SetRawBytes(body, "fallbacks", []byte(`[{"model":"claude-opus-5"}]`))
-		}
-		if gjson.GetBytes(body, "thinking").Exists() {
-			thinkingType := gjson.GetBytes(body, "thinking.type").String()
-			if thinkingType == "adaptive" && !gjson.GetBytes(body, "thinking.display").Exists() && !payloadTouchedDisplay {
-				body, _ = sjson.SetBytes(body, "thinking.display", "updates")
-			} else if thinkingType != "adaptive" && fableState.injectedDisplay && !payloadTouchedDisplay {
-				body, _ = sjson.DeleteBytes(body, "thinking.display")
-			}
-		} else if fableState.injectedDisplay && !payloadTouchedDisplay {
+	if !isProbeOrHelper && isClaudeFable51Model(currentModel) {
+		thinkingType := gjson.GetBytes(body, "thinking.type").String()
+		if thinkingType == "adaptive" && !gjson.GetBytes(body, "thinking.display").Exists() {
+			body, _ = sjson.SetBytes(body, "thinking.display", "updates")
+		} else if thinkingType != "adaptive" && fableState.injectedDisplay {
 			body, _ = sjson.DeleteBytes(body, "thinking.display")
-		}
-		if !hasFableReportingBlock(body) {
-			system := gjson.GetBytes(body, "system")
-			if system.IsArray() {
-				blocks := make([]string, 0, len(system.Array())+1)
-				for _, blk := range system.Array() {
-					blocks = append(blocks, blk.Raw)
-				}
-				blocks = append(blocks, buildTextBlock(claudeCodeFableReportingOutcomes, nil))
-				body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
-			} else if system.Type == gjson.String {
-				str := system.String()
-				blocks := []string{
-					buildTextBlock(str, nil),
-					buildTextBlock(claudeCodeFableReportingOutcomes, nil),
-				}
-				body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
-			} else if !system.Exists() {
-				blocks := []string{
-					buildTextBlock(claudeCodeFableReportingOutcomes, nil),
-				}
-				body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
-			}
 		}
 		return body
 	}
-
-	// Target model is Non-Fable 5.1:
-	// Only delete fallbacks if CPA automatically injected it and matching payload rules did NOT explicitly configure/modify it
-	if fableState.injectedFallbacks && !payloadTouchedFallbacks {
-		body, _ = sjson.DeleteBytes(body, "fallbacks")
-	}
-	if fableState.injectedDisplay && !payloadTouchedDisplay {
+	// Probes, helpers and other models never carry the Fable addition.
+	if fableState.injectedDisplay {
 		body, _ = sjson.DeleteBytes(body, "thinking.display")
-	}
-
-	// Remove Reporting outcomes if CPA automatically injected it
-	if fableState.injectedReporting {
-		system := gjson.GetBytes(body, "system")
-		if system.IsArray() {
-			blocks := make([]string, 0, len(system.Array()))
-			removed := false
-			for _, blk := range system.Array() {
-				if strings.ReplaceAll(blk.Get("text").String(), "\u200B", "") == claudeCodeFableReportingOutcomes {
-					removed = true
-					continue
-				}
-				blocks = append(blocks, blk.Raw)
-			}
-			if removed {
-				body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
-			}
-		} else if strings.ReplaceAll(system.String(), "\u200B", "") == claudeCodeFableReportingOutcomes {
-			body, _ = sjson.DeleteBytes(body, "system")
-		}
 	}
 	return body
 }
@@ -1423,13 +1311,11 @@ func applyCloakingInternal(
 		promptID,
 	)
 
-	// In native Claude Code 2.1.258, claude-fable-5-1 requests carry:
-	// "fallbacks": [{"model": "claude-opus-5"}]
+	// Native Claude Code sends thinking.display=updates with adaptive thinking.
+	// Claude Code 2.1.258 attached its server-side Opus fallback only to Fable
+	// 5.1; 2.1.321 main turns carry no fallbacks on any model.
 	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "model").String()))
 	if isClaudeFable51Model(model) && !isProbeOrHelper {
-		if !gjson.GetBytes(payload, "fallbacks").Exists() {
-			payload, _ = sjson.SetRawBytes(payload, "fallbacks", []byte(`[{"model":"claude-opus-5"}]`))
-		}
 		if gjson.GetBytes(payload, "thinking").Exists() {
 			thinkingType := gjson.GetBytes(payload, "thinking.type").String()
 			if thinkingType == "adaptive" && !gjson.GetBytes(payload, "thinking.display").Exists() {

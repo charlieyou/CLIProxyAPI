@@ -193,7 +193,7 @@ func TestClaudeExecutorContinuityAdvancesRequestIDAndPromptIDInBillingHeader(t *
 
 	// Verify Turn 1:
 	h1 := capturedBillingHeaders[0]
-	if !strings.Contains(h1, "cc_version=2.1.280.") || !strings.Contains(h1, "cc_entrypoint=cli;") || !strings.Contains(h1, "cch=") {
+	if !strings.Contains(h1, "cc_version=2.1.321.") || !strings.Contains(h1, "cc_entrypoint=cli;") || !strings.Contains(h1, "cch=") {
 		t.Fatalf("h1 invalid: %s", h1)
 	}
 	if strings.Contains(h1, "cc_prev_req=") {
@@ -227,10 +227,21 @@ func TestClaudeExecutorContinuityAdvancesRequestIDAndPromptIDInBillingHeader(t *
 		t.Fatalf("h2Tool promptID (%s) must match turn 2 promptID (%s)", prompt2Tool, prompt2)
 	}
 
+	// Claude Code 2.1.321 follows cc_prompt_id with the human prompt index,
+	// which a tool continuation keeps.
+	for name, check := range map[string]struct{ header, index string }{
+		"h1": {h1, "1"}, "h2": {h2, "2"}, "h2Tool": {h2Tool, "2"},
+	} {
+		want := "; cc_turn_origin=human; cc_prompt_index=" + check.index + "; cc_turn_index=" + check.index + ";"
+		if !strings.HasSuffix(check.header, want) || strings.Count(check.header, "cc_turn_origin=") != 1 {
+			t.Fatalf("%s must end with exactly one %q, got: %s", name, want, check.header)
+		}
+	}
+
 	// Verify Turn 3 (probe with max_tokens: 1):
 	hProbe := capturedBillingHeaders[3]
-	if strings.Contains(hProbe, "cc_prev_req=") || strings.Contains(hProbe, "cc_prompt_id=") {
-		t.Fatalf("probe must not contain cc_prev_req or cc_prompt_id: %s", hProbe)
+	if strings.Contains(hProbe, "cc_prev_req=") || strings.Contains(hProbe, "cc_prompt_id=") || strings.Contains(hProbe, "cc_turn_origin=") {
+		t.Fatalf("probe must not contain cc_prev_req, cc_prompt_id or turn fields: %s", hProbe)
 	}
 
 	// Verify Turn 4 (subagent):

@@ -128,9 +128,9 @@ func TestClaudeCodeTLSSessionResumptionCompletesHandshake(t *testing.T) {
 		t.Fatal("second handshake did not resume, so the session cache is not effective")
 	}
 
-	// The padding extension absorbs the pre_shared_key bytes, so a resumed
-	// ClientHello keeps the same BoringSSL padding boundary as a fresh one.
-	if firstLength != secondLength {
-		t.Fatalf("resumed ClientHello length = %d, want %d to match the fresh handshake", secondLength, firstLength)
+	// The hybrid key share keeps the ClientHello above BoringSSL's padding
+	// window, so the resumed hello simply grows by the pre_shared_key bytes.
+	if secondLength <= firstLength {
+		t.Fatalf("resumed ClientHello length = %d, want more than the fresh %d", secondLength, firstLength)
 	}
 }

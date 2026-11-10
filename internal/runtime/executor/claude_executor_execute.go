@@ -155,7 +155,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		requestPath,
 		opts.Headers,
 		"context_management",
-		"fallbacks",
 		"thinking.display",
 		"diagnostics",
 	)
@@ -194,7 +193,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = reconcileClaudeCodeFableModelAfterPayload(
 		body,
 		fableState,
-		touchedPayloadPaths["fallbacks"],
 		touchedPayloadPaths["thinking.display"],
 		cloaked,
 		isProbeOrHelper,

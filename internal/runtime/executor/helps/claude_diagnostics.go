@@ -112,6 +112,7 @@ type claudeDiagnosticsEntry struct {
 	promptID          string
 	minimumSequence   uint64
 	committedSequence uint64
+	committedAt       time.Time
 	lastAccess        uint64
 	expiresAt         time.Time
 }
@@ -235,9 +236,26 @@ func CommitClaudeContinuity(key string, sequence uint64, messageID, requestID st
 		}
 	}
 	entry.committedSequence = sequence
+	entry.committedAt = now
 	entry.lastAccess = claudeDiagnosticsState.nextAccess
 	entry.expiresAt = now.Add(claudeDiagnosticsTTL)
 	claudeDiagnosticsState.entries[key] = entry
+}
+
+// ClaudeContinuitySinceLastCommit returns how long ago the conversation's last
+// upstream response completed, or zero when none is recorded.
+func ClaudeContinuitySinceLastCommit(key string) time.Duration {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0
+	}
+	claudeDiagnosticsState.Lock()
+	entry, ok := claudeDiagnosticsState.entries[key]
+	claudeDiagnosticsState.Unlock()
+	if !ok || entry.committedAt.IsZero() {
+		return 0
+	}
+	return time.Since(entry.committedAt)
 }
 
 // CommitClaudeDiagnostics advances continuity only after a response completes.
@@ -328,6 +346,7 @@ func IsClaudeNewPromptTurn(body []byte) bool {
 var (
 	claudePrevReqBillingPattern  = regexp.MustCompile(`\s*cc_prev_req=[^;]+;`)
 	claudePromptIDBillingPattern = regexp.MustCompile(`\s*cc_prompt_id=[^;]+;`)
+	claudeTurnBillingPattern     = regexp.MustCompile(`\s*cc_(?:turn_origin|prompt_index|turn_index)=[^;]+;`)
 )
 
 func isClaudeProbeRequest(body []byte) bool {
@@ -487,6 +506,11 @@ func RawJSONMayContainLetterPhrase(raw []byte, phrases ...string) bool {
 	}
 }
 
+// IsClaudeProbeRequest reports whether body is a max_tokens=1 quota probe.
+func IsClaudeProbeRequest(body []byte) bool {
+	return isClaudeProbeRequest(body)
+}
+
 // IsClaudeProbeOrHelperRequest reports whether the request is a minimal
 // probe/preflight (max_tokens: 1) or an automated title generation helper,
 // which in native Claude Code do not emit cc_prompt_id or cc_prev_req.
@@ -579,7 +603,8 @@ func ClaudeSubagentRequests1h(headers http.Header, body []byte) bool {
 	return strings.Contains(betas, "extended-cache-ttl-2025-04-11")
 }
 
-// StripClaudeBillingTags removes cc_prev_req and cc_prompt_id from the billing header in body.
+// StripClaudeBillingTags removes cc_prev_req, cc_prompt_id and the per-turn
+// fields that follow cc_prompt_id from the billing header in body.
 func StripClaudeBillingTags(body []byte) []byte {
 	system := gjson.GetBytes(body, "system")
 	if !system.IsArray() || len(system.Array()) == 0 {
@@ -591,6 +616,7 @@ func StripClaudeBillingTags(body []byte) []byte {
 	}
 	cleaned := claudePrevReqBillingPattern.ReplaceAllString(billingText, "")
 	cleaned = claudePromptIDBillingPattern.ReplaceAllString(cleaned, "")
+	cleaned = claudeTurnBillingPattern.ReplaceAllString(cleaned, "")
 	if cleaned != billingText {
 		updated, err := sjson.SetBytes(body, "system.0.text", cleaned)
 		if err == nil {
@@ -600,7 +626,8 @@ func StripClaudeBillingTags(body []byte) []byte {
 	return body
 }
 
-// InjectClaudeBillingTags appends cc_prev_req and cc_prompt_id to the billing header in body if present.
+// InjectClaudeBillingTags appends cc_prev_req, cc_prompt_id and the per-turn
+// fields that follow cc_prompt_id to the billing header in body if present.
 func InjectClaudeBillingTags(body []byte, prevReq, promptID string) []byte {
 	system := gjson.GetBytes(body, "system")
 	if !system.IsArray() || len(system.Array()) == 0 {
@@ -612,6 +639,7 @@ func InjectClaudeBillingTags(body []byte, prevReq, promptID string) []byte {
 	}
 	cleaned := claudePrevReqBillingPattern.ReplaceAllString(billingText, "")
 	cleaned = claudePromptIDBillingPattern.ReplaceAllString(cleaned, "")
+	cleaned = claudeTurnBillingPattern.ReplaceAllString(cleaned, "")
 	cleaned = strings.TrimSpace(cleaned)
 	if !strings.HasSuffix(cleaned, ";") {
 		cleaned += ";"
@@ -620,7 +648,7 @@ func InjectClaudeBillingTags(body []byte, prevReq, promptID string) []byte {
 		cleaned += " cc_prev_req=" + prevReq + ";"
 	}
 	if promptID != "" {
-		cleaned += " cc_prompt_id=" + promptID + ";"
+		cleaned += " cc_prompt_id=" + promptID + ";" + ClaudeTurnBillingFields(body)
 	}
 	updated, err := sjson.SetBytes(body, "system.0.text", cleaned)
 	if err == nil {

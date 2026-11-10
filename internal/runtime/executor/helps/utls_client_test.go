@@ -213,26 +213,28 @@ type claudeCodeTLSFingerprintFixture struct {
 	KeyShareGroups      []uint16
 }
 
-func TestClaudeCodeTLSClientHelloSpecMatches220Capture(t *testing.T) {
+// The fixture is the /v1/messages ClientHello of native Claude Code 2.1.321,
+// captured 2026-11-09. Above 512 bytes BoringSSL sends no padding extension.
+func TestClaudeCodeTLSClientHelloSpecMatches321Capture(t *testing.T) {
 	t.Parallel()
 
 	fixture := claudeCodeTLSFingerprintFixture{
-		ClientHelloLength: 508,
-		JA3:               "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-21,29-23-24,0",
-		JA3MD5:            "d871d02cecbde59abbf8f4806134addf",
+		ClientHelloLength: 1499,
+		JA3:               "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,4588-29-23-24,0",
+		JA3MD5:            "1523504b38f0fae0d881d4b6554aac1b",
 		ALPN:              []string{"http/1.1"},
 		HTTPVersion:       "HTTP/1.1",
 		CipherSuites:      []uint16{4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49161, 49171, 49162, 49172, 156, 157, 47, 53},
-		ExtensionTypes:    []uint16{0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 21},
+		ExtensionTypes:    []uint16{0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43},
 		ExtensionLengths: [][2]int{
-			{0, 22}, {23, 0}, {65281, 1}, {10, 8}, {11, 2}, {35, 0}, {16, 11},
-			{5, 5}, {13, 20}, {18, 0}, {51, 38}, {45, 2}, {43, 5}, {21, 231},
+			{0, 22}, {23, 0}, {65281, 1}, {10, 10}, {11, 2}, {35, 0}, {16, 11},
+			{5, 5}, {13, 24}, {18, 0}, {51, 1258}, {45, 2}, {43, 5},
 		},
-		SupportedGroups:     []uint16{29, 23, 24},
+		SupportedGroups:     []uint16{4588, 29, 23, 24},
 		PointFormats:        []uint8{0},
-		SignatureAlgorithms: []uint16{1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513},
+		SignatureAlgorithms: []uint16{1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 2055, 1539, 513},
 		SupportedVersions:   []uint16{772, 771},
-		KeyShareGroups:      []uint16{29},
+		KeyShareGroups:      []uint16{4588, 29},
 	}
 
 	record := captureClaudeCodeClientHello(t)
@@ -316,11 +318,22 @@ func TestClaudeCodeTLSResumptionIsWireSafe(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeRequestHeaderOrderMatchesNative220Capture(t *testing.T) {
+func TestClaudeCodeRequestHeaderOrderMatchesNativeCapture(t *testing.T) {
 	t.Parallel()
 
-	if got, want := claudeCodeRequestHeaderOrder(http.MethodPost, "/v1/messages?beta=true"), claudeCodeMessagesHeaderOrder; !reflect.DeepEqual(got, want) {
-		t.Fatalf("Messages header order = %v, want %v", got, want)
+	// Header names of a native Claude Code 2.1.321 OAuth /v1/messages tool
+	// continuation, in wire order (captured 2026-11-09).
+	native321 := []string{
+		"Accept", "Authorization", "Content-Type", "User-Agent", "X-Claude-Code-Session-Id",
+		"X-Stainless-Arch", "X-Stainless-Lang", "X-Stainless-OS", "X-Stainless-Package-Version",
+		"X-Stainless-Retry-Count", "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Timeout",
+		"anthropic-beta", "anthropic-dangerous-direct-browser-access", "anthropic-dispatch-id",
+		"anthropic-usage-limit", "anthropic-version", "x-app", "x-claude-code-prev-tool-durations",
+		"x-claude-code-prompt-id", "x-claude-code-request-class", "x-claude-code-sandy-plover",
+		"x-client-request-id", "Connection", "Host", "Accept-Encoding", "Content-Length",
+	}
+	if got := claudeCodeRequestHeaderOrder(http.MethodPost, "/v1/messages?beta=true"); !reflect.DeepEqual(got, native321) {
+		t.Fatalf("Messages header order = %v, want %v", got, native321)
 	}
 	if got, want := claudeCodeRequestHeaderOrder(http.MethodPost, "/v1/messages/count_tokens?beta=true"), claudeCodeCountTokensHeaderOrder; !reflect.DeepEqual(got, want) {
 		t.Fatalf("count_tokens header order = %v, want %v", got, want)

@@ -21,7 +21,9 @@ import (
 const (
 	claudeNativeHelperSessionID = "11111111-2222-4333-8444-555555555555"
 	claudeNativeHelperUserID    = `{"device_id":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","account_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","session_id":"11111111-2222-4333-8444-555555555555"}`
-	claudeNativeHelperCoreBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	claudeNativeHelperCoreBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	// claudeNativeTitleHelperBetas is the measured 2.1.321 session-title helper profile.
+	claudeNativeTitleHelperBetas = claudeNativeHelperCoreBetas + ",per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,mid-conversation-system-clear-at-2026-08-21,claude-code-side-query-2026-09-29,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"
 )
 
 func claudeNativeHelperHeaders(betas, compression string) http.Header {
@@ -29,7 +31,7 @@ func claudeNativeHelperHeaders(betas, compression string) http.Header {
 		"Accept":            {"application/json"},
 		"Accept-Encoding":   {compression},
 		"Content-Type":      {"application/json"},
-		"User-Agent":        {"claude-cli/2.1.280 (external, cli)"},
+		"User-Agent":        {"claude-cli/2.1.321 (external, cli)"},
 		"X-App":             {"cli"},
 		"Anthropic-Beta":    {betas},
 		"Anthropic-Version": {"2023-06-01"},
@@ -38,8 +40,8 @@ func claudeNativeHelperHeaders(betas, compression string) http.Header {
 		"X-Client-Request-Id":                       {"66666666-7777-4888-8999-aaaaaaaaaaaa"},
 		"X-Stainless-Lang":                          {"js"},
 		"X-Stainless-Runtime":                       {"node"},
-		"X-Stainless-Package-Version":               {"0.112.1"},
-		"X-Stainless-Runtime-Version":               {"v26.3.0"},
+		"X-Stainless-Package-Version":               {"0.128.0"},
+		"X-Stainless-Runtime-Version":               {"v26.12.1"},
 		"X-Stainless-OS":                            {"MacOS"},
 		"X-Stainless-Arch":                          {"arm64"},
 		"X-Stainless-Retry-Count":                   {"0"},
@@ -161,12 +163,12 @@ func TestClaudeExecutorStructuredNativeHelperPreservesStreamProfile(t *testing.T
 	}))
 	defer server.Close()
 
-	betas := claudeNativeHelperCoreBetas + ",structured-outputs-2025-12-15"
-	payload := []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":"` + strings.ReplaceAll(claudeNativeHelperUserID, `"`, `\"`) + `"},"max_tokens":32000,"thinking":{"type":"disabled"},"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
+	betas := claudeNativeTitleHelperBetas
+	payload := []byte(`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.321.fc6; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":"` + strings.ReplaceAll(claudeNativeHelperUserID, `"`, `\"`) + `"},"max_tokens":128000,"output_config":{"effort":"medium","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
 	headers := claudeNativeHelperHeaders(betas, "gzip, deflate, br, zstd")
 	executor := NewClaudeExecutor(&config.Config{})
 	result, errStream := executor.ExecuteStream(context.Background(), claudeNativeHelperOAuthAuth(server.URL), cliproxyexecutor.Request{
-		Model:   "claude-haiku-4-5-20251001",
+		Model:   "claude-haiku-5-5",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FormatClaude,
@@ -185,10 +187,10 @@ func TestClaudeExecutorStructuredNativeHelperPreservesStreamProfile(t *testing.T
 	if got := gjson.GetBytes(upstreamBody, "system.#").Int(); got != 3 {
 		t.Fatalf("system block count = %d, want native 3: %s", got, upstreamBody)
 	}
-	if !bytes.HasPrefix(upstreamBody, []byte(`{"model":"claude-haiku-4-5-20251001","messages":`)) {
+	if !bytes.HasPrefix(upstreamBody, []byte(`{"model":"claude-haiku-5-5","messages":`)) {
 		t.Fatalf("structured helper top-level order changed: %s", upstreamBody)
 	}
-	for _, path := range []string{"context_management", "output_config.effort"} {
+	for _, path := range []string{"context_management", "thinking"} {
 		if got := gjson.GetBytes(upstreamBody, path); got.Exists() {
 			t.Fatalf("structured helper unexpectedly contains %s=%s: %s", path, got.Raw, upstreamBody)
 		}

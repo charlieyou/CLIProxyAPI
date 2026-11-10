@@ -157,10 +157,11 @@ func newClaudeCodeTLSConfig(host string, sessionCache tls.ClientSessionCache) *t
 	}
 }
 
-// claudeCodeTLSClientHelloSpec reproduces the deterministic Node/OpenSSL
-// ClientHello emitted by Claude Code 2.1.220 on macOS arm64. Keep this spec in
-// sync with a fresh native capture whenever the advertised Claude Code version
-// changes.
+// claudeCodeTLSClientHelloSpec reproduces the ClientHello Claude Code 2.1.321
+// emits for /v1/messages (measured 2026-11-09 on the native linux-x64 build; the
+// Messages client offers http/1.1, OCSP stapling and SCT, and the hybrid
+// X25519MLKEM768 key share). Keep this spec in sync with a fresh native capture
+// whenever the advertised Claude Code version changes.
 func claudeCodeTLSClientHelloSpec() *tls.ClientHelloSpec {
 	return &tls.ClientHelloSpec{
 		CipherSuites: []uint16{
@@ -187,7 +188,7 @@ func claudeCodeTLSClientHelloSpec() *tls.ClientHelloSpec {
 			&tls.SNIExtension{},
 			&tls.ExtendedMasterSecretExtension{},
 			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient},
-			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384}},
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384}},
 			&tls.SupportedPointsExtension{SupportedPoints: []byte{0}},
 			&tls.SessionTicketExtension{},
 			&tls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
@@ -201,10 +202,12 @@ func claudeCodeTLSClientHelloSpec() *tls.ClientHelloSpec {
 				tls.PKCS1WithSHA384,
 				tls.PSSWithSHA512,
 				tls.PKCS1WithSHA512,
+				tls.Ed25519,
+				tls.ECDSAWithP521AndSHA512,
 				tls.PKCS1WithSHA1,
 			}},
 			&tls.SCTExtension{},
-			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{{Group: tls.X25519}}},
+			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{{Group: tls.X25519MLKEM768}, {Group: tls.X25519}}},
 			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{tls.PskModeDHE}},
 			&tls.SupportedVersionsExtension{Versions: []uint16{tls.VersionTLS13, tls.VersionTLS12}},
 			&tls.UtlsPaddingExtension{GetPaddingLen: tls.BoringPaddingStyle},
@@ -242,8 +245,14 @@ var claudeCodeMessagesHeaderOrder = []string{
 	"X-Stainless-Timeout",
 	"anthropic-beta",
 	"anthropic-dangerous-direct-browser-access",
+	"anthropic-dispatch-id",
+	"anthropic-usage-limit",
 	"anthropic-version",
 	"x-app",
+	"x-claude-code-prev-tool-durations",
+	"x-claude-code-prompt-id",
+	"x-claude-code-request-class",
+	"x-claude-code-sandy-plover",
 	"x-client-request-id",
 	"Connection",
 	"Host",
