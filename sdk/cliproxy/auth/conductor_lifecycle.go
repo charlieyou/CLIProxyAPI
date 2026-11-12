@@ -220,6 +220,13 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
+		// File reloads omit runtime quota state. Preserve the cache and usage-API
+		// backoff together without replacing an explicitly supplied snapshot.
+		if auth.Provider == existing.Provider && len(auth.QuotaWindows.Windows) == 0 &&
+			auth.QuotaWindows.LastFetchedAt.IsZero() && auth.QuotaWindows.LastFetchError == nil &&
+			auth.QuotaWindows.NextFetchAfter.IsZero() && auth.QuotaWindows.RateLimitBackoffLevel == 0 {
+			auth.QuotaWindows = existing.QuotaWindows
+		}
 		credChanged := CredentialsChanged(existing, auth)
 		if credChanged {
 			if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
