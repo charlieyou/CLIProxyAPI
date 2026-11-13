@@ -70,6 +70,15 @@ func isOverageOrFableOnlyRejection(headers http.Header, status5h, status7d, stat
 		return true
 	}
 
+	// Some accounts omit the five-hour window entirely. An explicit Fable
+	// claim with an allowed shared week must not suspend unrelated models.
+	// Keep malformed or exhausted five-hour evidence conservative below.
+	if shared7dAllowed && status5h == "" &&
+		strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Utilization")) == "" &&
+		status7dOI == "rejected" && representativeClaim == "seven_day_overage_included" {
+		return true
+	}
+
 	// When Anthropic evaluates an overage-only or 7d_oi claim, it often omits
 	// the 5h status header while 5h utilization is 0.00 (or vice versa).
 	// Require an explicit, valid non-negative utilization below 1.0 before

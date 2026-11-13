@@ -225,8 +225,10 @@ func TestClaudeExecutor_AuthManager_FableOnlyRejectionDoesNotBlockOpus(t *testin
 			fableAttempts.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-			w.Header().Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+			// Live Fable-only rejections omit both five-hour headers.
+			w.Header().Set("Anthropic-Ratelimit-Unified-Representative-Claim", "seven_day_overage_included")
 			w.Header().Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+			w.Header().Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.5")
 			w.Header().Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "rejected")
 			w.Header().Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(reset, 10))
 			w.Header().Set("Retry-After", "120")

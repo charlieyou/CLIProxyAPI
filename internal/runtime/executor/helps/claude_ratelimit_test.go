@@ -376,7 +376,7 @@ func TestClaudeHeadersIndicateUnifiedRateLimitRejection_OverageRejection_Utiliza
 	}{
 		{name: "healthy zero utilization", utilization: "0.00", wantUnified: false},
 		{name: "healthy partial utilization", utilization: "0.50", wantUnified: false},
-		{name: "missing utilization", utilization: "", wantUnified: true},
+		{name: "Fable claim without a five-hour window", utilization: "", wantUnified: false},
 		{name: "invalid text", utilization: "invalid", wantUnified: true},
 		{name: "NaN", utilization: "NaN", wantUnified: true},
 		{name: "+Inf", utilization: "+Inf", wantUnified: true},
@@ -395,6 +395,25 @@ func TestClaudeHeadersIndicateUnifiedRateLimitRejection_OverageRejection_Utiliza
 			got := ClaudeHeadersIndicateUnifiedRateLimitRejection(h)
 			if got != tt.wantUnified {
 				t.Fatalf("ClaudeHeadersIndicateUnifiedRateLimitRejection() with 5h-utilization %q = %v, want %v", tt.utilization, got, tt.wantUnified)
+			}
+		})
+	}
+
+	// Missing five-hour evidence is safe only for the explicit Fable claim.
+	for _, override := range []struct{ header, value string }{
+		{"Anthropic-Ratelimit-Unified-Representative-Claim", ""},
+		{"Anthropic-Ratelimit-Unified-Representative-Claim", "five_hour"},
+		{"Anthropic-Ratelimit-Unified-7d_oi-Status", ""},
+		{"Anthropic-Ratelimit-Unified-7d-Status", ""},
+		{"Anthropic-Ratelimit-Unified-7d-Status", "rejected"},
+		{"Anthropic-Ratelimit-Unified-5h-Status", "rejected"},
+		{"Anthropic-Ratelimit-Unified-5h-Status", "unknown"},
+	} {
+		t.Run(override.header+"="+override.value, func(t *testing.T) {
+			h := baseHeaders()
+			h.Set(override.header, override.value)
+			if !ClaudeHeadersIndicateUnifiedRateLimitRejection(h) {
+				t.Fatal("expected shared or ambiguous rejection to remain credential-scoped")
 			}
 		})
 	}
