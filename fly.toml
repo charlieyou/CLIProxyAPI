@@ -5,6 +5,9 @@ swap_size_mb = 512
 [build]
   dockerfile = "Dockerfile"
 
+[env]
+  CLIPROXY_LATENCY_DIAGNOSTIC_DIR = "/data/latency-diagnostics"
+
 [processes]
   app = "/CLIProxyAPI/CLIProxyAPI --config /data/config.yaml"
 

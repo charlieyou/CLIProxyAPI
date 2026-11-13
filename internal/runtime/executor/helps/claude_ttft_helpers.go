@@ -6,6 +6,81 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// ClaudeStreamSummary records response shape without retaining text, thinking,
+// tool arguments, signatures, or arbitrary upstream strings.
+type ClaudeStreamSummary struct {
+	stopReason     string
+	textBytes      int
+	contentBlocks  int
+	toolUseBlocks  int
+	thinkingBlocks int
+	outputTokens   int64
+	hasUsage       bool
+}
+
+// Observe reads a single SSE line, before response translation.
+func (s *ClaudeStreamSummary) Observe(line []byte) {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if !gjson.ValidBytes(payload) {
+		return
+	}
+	root := gjson.ParseBytes(payload)
+	var tokens gjson.Result
+	switch root.Get("type").String() {
+	case "message_start":
+		tokens = root.Get("message.usage.output_tokens")
+	case "content_block_start":
+		s.contentBlocks++
+		block := root.Get("content_block")
+		switch block.Get("type").String() {
+		case "text":
+			s.textBytes += len(block.Get("text").String())
+		case "tool_use":
+			s.toolUseBlocks++
+		case "thinking", "redacted_thinking":
+			s.thinkingBlocks++
+		}
+	case "content_block_delta":
+		delta := root.Get("delta")
+		if delta.Get("type").String() == "text_delta" {
+			s.textBytes += len(delta.Get("text").String())
+		}
+	case "message_delta":
+		if reason := root.Get("delta.stop_reason"); reason.Type == gjson.String {
+			switch reason.String() {
+			case "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", "model_context_window_exceeded":
+				s.stopReason = reason.String()
+			default:
+				s.stopReason = "unknown"
+			}
+		}
+		tokens = root.Get("usage.output_tokens")
+	}
+	if tokens.Type == gjson.Number {
+		s.outputTokens = tokens.Int()
+		s.hasUsage = true
+	}
+}
+
+// Fields returns only allowlisted metadata for the latency diagnostic log.
+func (s *ClaudeStreamSummary) Fields() map[string]any {
+	fields := map[string]any{
+		"stop_reason":     s.stopReason,
+		"text_bytes":      s.textBytes,
+		"content_blocks":  s.contentBlocks,
+		"tool_use_blocks": s.toolUseBlocks,
+		"thinking_blocks": s.thinkingBlocks,
+	}
+	if s.hasUsage {
+		fields["output_tokens"] = s.outputTokens
+	}
+	return fields
+}
+
 // IsClaudeTokenEvent reports whether an Anthropic Messages SSE chunk carries
 // substantive output token content (such as text delta, thinking delta, or tool input delta).
 // It filters out message_start, ping, content_block_stop, and empty containers.

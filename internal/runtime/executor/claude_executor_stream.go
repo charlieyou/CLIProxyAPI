@@ -401,7 +401,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	go func() {
 		defer close(out)
 		termination := "complete"
-		defer func() { latencydiag.Event(ctx, "claude_upstream_termination", map[string]any{"outcome": termination}) }()
+		recordStreamSummary := latencydiag.FromContext(ctx) != nil
+		var streamSummary helps.ClaudeStreamSummary
+		defer func() {
+			if recordStreamSummary {
+				fields := streamSummary.Fields()
+				fields["outcome"] = termination
+				latencydiag.Event(ctx, "claude_upstream_termination", fields)
+			}
+		}()
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
@@ -495,6 +503,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				firstSSE.Do(func() { latencydiag.Event(ctx, "claude_first_sse_event", nil) })
 			}
 			observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
+			if recordStreamSummary {
+				streamSummary.Observe(line)
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveClaudeStream(line)
