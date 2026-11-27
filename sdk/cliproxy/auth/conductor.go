@@ -302,6 +302,16 @@ type Manager struct {
 	// quotaRefreshSettings drives usage-window refresh and quota-aware fill-first routing.
 	quotaRefreshSettings QuotaRefreshSettings
 
+	// Usage expiration trigger state.
+	usageTracker   *usageExpirationTracker
+	usageTriggerMu sync.RWMutex
+	usageConfig    internalconfig.UsageExpirationTriggerConfig
+	// lastUsageCheck tracks when each auth was last checked for usage expiration.
+	lastUsageCheck map[string]time.Time
+	// lastUsageSweepLog throttles sweep-level logging for usage trigger checks.
+	lastUsageSweepLog time.Time
+	// usageTriggerSem limits concurrent usage trigger goroutines (capacity: 5).
+	usageTriggerSem chan struct{}
 	// authMutationLocks coordinate credential mutations without blocking unrelated readers.
 	authMutationLocks      sync.Map
 	metadataPersistCancels sync.Map
@@ -338,6 +348,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		quotaRefreshQueue:     make(chan string, 100),
 		unknownProviderLogged: make(map[string]bool),
 		pendingRefreshes:      make(map[string]bool),
+		usageTracker:          newUsageExpirationTracker(),
+		lastUsageCheck:        make(map[string]time.Time),
+		usageTriggerSem:       make(chan struct{}, 5),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})

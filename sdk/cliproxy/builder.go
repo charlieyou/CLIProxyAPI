@@ -315,6 +315,7 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(b.cfg))
+	coreManager.SetUsageExpirationConfig(b.cfg.Routing.UsageExpirationTrigger.WithDefaults())
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)

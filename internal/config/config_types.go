@@ -620,6 +620,49 @@ type RoutingConfig struct {
 	// QuotaRefresh configures usage-window fetching that drives quota-aware
 	// fill-first routing. Ignored when Home is enabled.
 	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh,omitempty" json:"quota-refresh,omitempty"`
+
+	// UsageExpirationTrigger sends minimal prompts to start usage windows whose
+	// reset time is null. Ignored when Home is enabled.
+	UsageExpirationTrigger UsageExpirationTriggerConfig `yaml:"usage-expiration-trigger,omitempty" json:"usage-expiration-trigger,omitempty"`
+}
+
+// UsageExpirationTriggerConfig configures the usage expiration trigger feature.
+// When enabled, the system sends minimal prompts to refresh null resets_at timestamps.
+// Zero values fall back to DefaultUsageExpirationTriggerConfig.
+type UsageExpirationTriggerConfig struct {
+	Enabled           bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Model             string        `yaml:"model,omitempty" json:"model,omitempty"`
+	CodexModel        string        `yaml:"codex_model,omitempty" json:"codex_model,omitempty"`
+	MaxRetriesPerHour int           `yaml:"max_retries_per_hour,omitempty" json:"max_retries_per_hour,omitempty"`
+	CheckInterval     time.Duration `yaml:"check_interval,omitempty" json:"check_interval,omitempty"`
+}
+
+// DefaultUsageExpirationTriggerConfig returns a UsageExpirationTriggerConfig with default values.
+func DefaultUsageExpirationTriggerConfig() UsageExpirationTriggerConfig {
+	return UsageExpirationTriggerConfig{
+		Model:             "claude-haiku-4-5",
+		CodexModel:        "gpt-5.4",
+		MaxRetriesPerHour: 3,
+		CheckInterval:     30 * time.Minute,
+	}
+}
+
+// WithDefaults fills unset fields from DefaultUsageExpirationTriggerConfig.
+func (c UsageExpirationTriggerConfig) WithDefaults() UsageExpirationTriggerConfig {
+	defaults := DefaultUsageExpirationTriggerConfig()
+	if strings.TrimSpace(c.Model) == "" {
+		c.Model = defaults.Model
+	}
+	if strings.TrimSpace(c.CodexModel) == "" {
+		c.CodexModel = defaults.CodexModel
+	}
+	if c.MaxRetriesPerHour <= 0 {
+		c.MaxRetriesPerHour = defaults.MaxRetriesPerHour
+	}
+	if c.CheckInterval <= 0 {
+		c.CheckInterval = defaults.CheckInterval
+	}
+	return c
 }
 
 // QuotaRefreshConfig configures reactive usage-window fetching (on 429 and at startup).

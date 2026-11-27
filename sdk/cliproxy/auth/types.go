@@ -373,7 +373,7 @@ type QuotaWindowState struct {
 	// LastFetchError stores the last fetch failure for debugging.
 	LastFetchError *Error `json:"last_fetch_error,omitempty"`
 	// NextFetchAfter gates calls to the provider usage endpoint for this auth.
-	// Usage-endpoint 429s
+	// Shared by quota-refresh and usage-expiration-trigger. Usage-endpoint 429s
 	// apply exponential backoff and honor any longer Retry-After duration.
 	NextFetchAfter time.Time `json:"next_fetch_after,omitempty"`
 	// RateLimitBackoffLevel tracks consecutive usage-endpoint 429s separately
