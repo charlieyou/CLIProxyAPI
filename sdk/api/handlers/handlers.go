@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -691,6 +692,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 
 	if requestCtx != nil {
+		parentCtx = latencydiag.Propagate(parentCtx, requestCtx)
 		parentCtx = httptransport.InheritDecorator(parentCtx, requestCtx)
 		parentCtx = logging.InheritDeferredCapture(parentCtx, requestCtx)
 	}

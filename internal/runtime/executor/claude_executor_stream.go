@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -298,8 +300,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if errThread != nil {
 		return nil, errThread
 	}
+	httpReq = helps.WithLatencyDiagnosticTrace(httpReq)
 	fastRequest := isAnthropicUpstreamBase(baseURL) && claudeRequestIsFast(httpReq, bodyForUpstream)
 	authID, authLabel, authType, authValue := claudeAuthLogIdentity(auth)
+	latencydiag.Event(ctx, "claude_upstream_attempt", map[string]any{
+		"model": upstreamModel, "credential": latencydiag.Opaque(ctx, authID),
+	})
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
@@ -316,11 +322,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := doClaudeUpstreamRequest(httpClient, httpReq)
 	if err != nil {
+		latencydiag.Event(ctx, "claude_upstream_termination", map[string]any{"outcome": "transport_error"})
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, wrapClaudeFastRequestError(fastRequest, 0, err)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	latencydiag.Event(ctx, "claude_upstream_headers", map[string]any{
+		"status": httpResp.StatusCode, "upstream_request_id": latencydiag.SafeUpstreamRequestID(httpResp.Header),
+	})
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		latencydiag.Event(ctx, "claude_upstream_termination", map[string]any{"outcome": "http_error", "status": httpResp.StatusCode})
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
@@ -365,6 +376,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	out := make(chan cliproxyexecutor.StreamChunk, 1)
 	go func() {
 		defer close(out)
+		// termination stays empty when the downstream consumer stops reading.
+		termination := ""
+		recordStreamSummary := latencydiag.FromContext(ctx) != nil
+		var streamSummary helps.ClaudeStreamSummary
+		defer func() {
+			if !recordStreamSummary {
+				return
+			}
+			if termination == "" {
+				termination = "downstream_stopped"
+			}
+			fields := streamSummary.Fields()
+			fields["outcome"] = termination
+			latencydiag.Event(ctx, "claude_upstream_termination", fields)
+		}()
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
@@ -375,6 +401,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		emitCancellation := func(cause error) bool {
 			cancelErr := newClaudeOAuthCancellationError(ctx, fp.OAuthCancellation, cause)
 			if cancelErr != nil {
+				termination = "cancelled"
 				helps.RecordAPIResponseError(ctx, e.cfg, cancelErr)
 				streamUsage.PublishFailure(ctx, reporter, cancelErr)
 				select {
@@ -388,6 +415,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				c = ctx.Err()
 			}
 			if errors.Is(c, context.Canceled) {
+				termination = "cancelled"
 				helps.RecordAPIResponseError(ctx, e.cfg, c)
 				streamUsage.PublishFailure(ctx, reporter, c)
 				return true
@@ -395,12 +423,30 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return false
 		}
 		emitResponseError := func(errResponse error) {
+			termination = "stream_error"
 			errResponse = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errResponse)
 			helps.RecordAPIResponseError(ctx, e.cfg, errResponse)
 			streamUsage.PublishFailure(ctx, reporter, errResponse)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errResponse}:
 			case <-ctx.Done():
+			}
+		}
+
+		var firstSSE, firstOutput sync.Once
+		observeLatency := func(line []byte) {
+			if !recordStreamSummary {
+				return
+			}
+			latencydiag.ObserveUpstream(ctx)
+			if len(bytes.TrimSpace(line)) > 0 {
+				firstSSE.Do(func() { latencydiag.Event(ctx, "claude_first_sse_event", nil) })
+			}
+			streamSummary.Observe(line)
+		}
+		observeFirstOutput := func() {
+			if recordStreamSummary {
+				firstOutput.Do(func() { latencydiag.Event(ctx, "claude_first_translated_output", nil) })
 			}
 		}
 
@@ -424,6 +470,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				streamUsage.ObserveClaudeSSEEvent(event.Bytes())
 				cloned := bytes.Clone(event.Bytes())
 				event.Reset()
+				observeFirstOutput()
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
 					return true
@@ -458,6 +505,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		passthroughScan:
 			for scanner.Scan() {
 				line := scanner.Bytes()
+				observeLatency(line)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				reporter.ObserveResponseModel(line)
 				streamUsage.ObserveClaudeStream(line)
@@ -500,6 +548,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 			if !upstreamCompleted || upstreamStreamErr != nil {
+				termination = claudeStreamEndOutcome(upstreamStreamErr)
 				if emitCancellation(scanner.Err()) {
 					return
 				}
@@ -522,6 +571,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 			if upstreamCompleted {
+				termination = "complete"
 				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 				e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 			}
@@ -565,6 +615,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			for i := range chunks {
+				observeFirstOutput()
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 				case <-ctx.Done():
@@ -588,6 +639,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	translatedScan:
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			observeLatency(line)
 			eventBuf.Write(line)
 			eventBuf.WriteByte('\n')
 			if len(bytes.TrimSpace(line)) == 0 {
@@ -641,6 +693,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 		if !upstreamCompleted || upstreamStreamErr != nil {
+			termination = claudeStreamEndOutcome(upstreamStreamErr)
 			if emitCancellation(scanner.Err()) {
 				return
 			}
@@ -663,6 +716,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if upstreamCompleted {
+			termination = "complete"
 			commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 			e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 		}
@@ -672,6 +726,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		result = wrapClaudeThinkingReplayStream(ctx, result, replayScope)
 	}
 	return result, nil
+}
+
+// claudeStreamEndOutcome names how a stream without a clean message_stop
+// ended, for the latency diagnostic timeline.
+func claudeStreamEndOutcome(upstreamStreamErr error) string {
+	if upstreamStreamErr != nil {
+		return "stream_error"
+	}
+	return "incomplete_eof"
 }
 
 const claudeStreamEndedBeforeErrorDataMessage = "claude executor: upstream stream ended before error event data"

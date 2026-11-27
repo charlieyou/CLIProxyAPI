@@ -22,6 +22,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -462,6 +463,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errExec)})
 		exceeded, errWait := m.waitForContinuityBoundedCooldown(ctx, continuitySession, wait, maxWait)
 		if errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
@@ -574,6 +576,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errExec)})
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -777,6 +780,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
+		latencydiag.Event(ctx, "auth_retry", map[string]any{"round": attempt + 1, "delay_ms": wait.Milliseconds(), "status": statusCodeFromError(errStream)})
 		exceeded, errWait := m.waitForContinuityBoundedCooldown(ctx, continuitySession, wait, maxWait)
 		if errWait != nil {
 			return nil, errWait
