@@ -209,6 +209,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
+	var oauthToolNameCasing map[string]string
+	if isClaudeOAuthToken(apiKey) {
+		// body still holds the translated request, so these are the tool names
+		// the client declared before any MCP aliasing.
+		oauthToolNameCasing = util.UnambiguousToolNameMapFromClaudeRequest(body)
+	}
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx, opts.Metadata, req.Metadata)
@@ -433,7 +439,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
 					return true, false
 				}
-				line = e.restoreResponseModel(restoredLine, req.Model)
+				line = e.restoreResponseModel(helps.RestoreClaudeToolNameCasingFromStreamLine(restoredLine, oauthToolNameCasing), req.Model)
 				advisorState.ObserveSSELine(line)
 				event.Write(line)
 				event.WriteByte('\n')
@@ -539,7 +545,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
 				return true, false
 			}
-			line = e.restoreResponseModel(restoredLine, req.Model)
+			line = e.restoreResponseModel(helps.RestoreClaudeToolNameCasingFromStreamLine(restoredLine, oauthToolNameCasing), req.Model)
 			advisorState.ObserveSSELine(line)
 			helps.RecordClaudeWebSearchResultsContext(ctx, webSearchSessionKey, line, webSearchTTL, webSearchLimit)
 			chunks := sdktranslator.TranslateStream(

@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -212,6 +213,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
+	var oauthToolNameCasing map[string]string
+	if isClaudeOAuthToken(apiKey) {
+		// body still holds the translated request, so these are the tool names
+		// the client declared before any MCP aliasing.
+		oauthToolNameCasing = util.UnambiguousToolNameMapFromClaudeRequest(body)
+	}
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx, opts.Metadata, req.Metadata)
@@ -407,7 +414,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 				streamUsage.PublishFailure(ctx, reporter, errRestore)
 				return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errRestore)
 			}
-			lines[i] = restoredLine
+			lines[i] = helps.RestoreClaudeToolNameCasingFromStreamLine(restoredLine, oauthToolNameCasing)
 		}
 		if eventBuf.Len() > 0 {
 			observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
@@ -434,6 +441,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, errRestore)
 			return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errRestore)
 		}
+		data = helps.RestoreClaudeToolNameCasing(data, oauthToolNameCasing)
 		if refusalMsg, blocked := clienterror.ClaudePolicyRefusalMessage(data); blocked {
 			errRefusal := wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, statusErr{code: http.StatusBadRequest, msg: refusalMsg})
 			helps.RecordAPIResponseError(ctx, e.cfg, errRefusal)
