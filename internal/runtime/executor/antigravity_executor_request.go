@@ -14,6 +14,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -128,6 +129,13 @@ func (e *AntigravityExecutor) checkAntigravityRequestCooldown(ctx context.Contex
 		return homeKVUnavailableStatusErr(errCooldown)
 	}
 	if inCooldown && (countTokens || !antigravityShouldBypassShortCooldown(ctx, e.cfg)) {
+		if latencydiag.FromContext(ctx) != nil {
+			latencydiag.Event(ctx, "antigravity_short_cooldown_skip", map[string]any{
+				"model":        model,
+				"credential":   latencydiag.Opaque(ctx, antigravityAuthID(auth)),
+				"remaining_ms": remaining.Milliseconds(),
+			})
+		}
 		log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", antigravityAuthID(auth), model, remaining)
 		return statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &remaining}
 	}

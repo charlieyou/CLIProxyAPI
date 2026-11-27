@@ -53,6 +53,7 @@ type LogFormatter struct{}
 // logFieldOrder defines the display order for common log fields.
 var logFieldOrder = []string{
 	"provider", "model",
+	"auth", "status", "in_band", "use_credits", "rpc_status", "rpc_reason", "decision", "retry_after_ms",
 	"plugin_id", "plugin_name", "source_id",
 	"version", "active_version", "retired_version", "overwritten",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
@@ -62,6 +63,7 @@ var logFieldOrder = []string{
 }
 
 var quotedLogFields = map[string]struct{}{
+	"auth":             {},
 	"credential":       {},
 	"auth_id":          {},
 	"auth_index":       {},

@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -781,20 +783,149 @@ func antigravityInBandErrorStatusCode(errorResult ojson.Result) int {
 	return statusCode
 }
 
+func antigravityAuthLogName(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return filepath.Base(fileName)
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return filepath.Base(id)
+	}
+	return ""
+}
+
+// emitAntigravityUpstreamAttempt records one upstream inference attempt on the
+// latency diagnostic timeline.
+func emitAntigravityUpstreamAttempt(ctx context.Context, auth *cliproxyauth.Auth, upstreamModel string, stream, useCredits bool) {
+	if latencydiag.FromContext(ctx) == nil {
+		return
+	}
+	latencydiag.Event(ctx, "antigravity_upstream_attempt", map[string]any{
+		"model":       upstreamModel,
+		"credential":  latencydiag.Opaque(ctx, antigravityAuthID(auth)),
+		"stream":      stream,
+		"use_credits": useCredits,
+	})
+}
+
+// emitAntigravityUpstreamHeaders records the upstream response status on the
+// latency diagnostic timeline.
+func emitAntigravityUpstreamHeaders(ctx context.Context, resp *http.Response) {
+	if resp == nil || latencydiag.FromContext(ctx) == nil {
+		return
+	}
+	latencydiag.Event(ctx, "antigravity_upstream_headers", map[string]any{
+		"status":              resp.StatusCode,
+		"upstream_request_id": latencydiag.SafeUpstreamRequestID(resp.Header),
+	})
+}
+
+// emitAntigravityUpstreamTermination records how the upstream exchange ended.
+// A positive status is attached for HTTP and in-band errors.
+func emitAntigravityUpstreamTermination(ctx context.Context, outcome string, status int) {
+	if latencydiag.FromContext(ctx) == nil {
+		return
+	}
+	fields := map[string]any{"outcome": outcome}
+	if status > 0 {
+		fields["status"] = status
+	}
+	latencydiag.Event(ctx, "antigravity_upstream_termination", fields)
+}
+
+// antigravityTerminationOutcome reports "canceled" for caller cancellation and
+// fallback for any other failure.
+func antigravityTerminationOutcome(ctx context.Context, err error, fallback string) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
+		return "canceled"
+	}
+	return fallback
+}
+
+// emitAntigravityUpstreamErrorTelemetry records an allowlist-sanitized
+// antigravity_upstream_error latency diagnostic event and a structured WARN log
+// for an Antigravity upstream error. It returns the sanitized RPC reason.
+// body may be nil when the error body could not be read.
+func emitAntigravityUpstreamErrorTelemetry(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	upstreamModel string,
+	useCredits bool,
+	inBand bool,
+	statusCode int,
+	headers http.Header,
+	body []byte,
+) string {
+	is429 := statusCode == http.StatusTooManyRequests
+	var decision antigravity429Decision
+	var retryAfter *time.Duration
+	if is429 {
+		decision = decideAntigravity429WithHeaders(body, headers)
+		retryAfter = decision.retryAfter
+	} else if parsed, errParse := helps.ParseRetryDelayWithHeaders(headers, body, time.Now()); errParse == nil && parsed != nil {
+		retryAfter = parsed
+	}
+	rpcStatus := helps.SanitizeAntigravityRPCStatus(body)
+	rpcReason := helps.SanitizeAntigravityRPCReason(body, decision.reason, is429)
+
+	if latencydiag.FromContext(ctx) != nil {
+		diagFields := map[string]any{
+			"model":       upstreamModel,
+			"credential":  latencydiag.Opaque(ctx, antigravityAuthID(auth)),
+			"status":      statusCode,
+			"in_band":     inBand,
+			"use_credits": useCredits,
+			"rpc_status":  rpcStatus,
+			"rpc_reason":  rpcReason,
+		}
+		if is429 {
+			diagFields["decision"] = string(decision.kind)
+		}
+		if retryAfter != nil {
+			diagFields["retry_after_ms"] = retryAfter.Milliseconds()
+		}
+		latencydiag.Event(ctx, "antigravity_upstream_error", diagFields)
+	}
+
+	logFields := log.Fields{
+		"provider":    "antigravity",
+		"model":       upstreamModel,
+		"auth":        antigravityAuthLogName(auth),
+		"status":      statusCode,
+		"in_band":     inBand,
+		"use_credits": useCredits,
+		"rpc_status":  rpcStatus,
+		"rpc_reason":  rpcReason,
+	}
+	if is429 {
+		logFields["decision"] = string(decision.kind)
+	}
+	if retryAfter != nil {
+		logFields["retry_after_ms"] = retryAfter.Milliseconds()
+	}
+	helps.LogWithRequestID(ctx).WithFields(logFields).Warn("antigravity executor: upstream error")
+	return rpcReason
+}
+
 // applyAntigravityUpstreamError performs shared executor-side bookkeeping for
 // an Antigravity upstream error (either an HTTP non-2xx response or an HTTP 2xx
-// in-band JSON error frame): 429 cooldown/credits handling, invalid-signature
-// replay invalidation, 403 TOS/pool eviction, and 401 idle transport eviction.
+// in-band JSON error frame): structured upstream error telemetry, 429
+// cooldown/credits handling, invalid-signature replay invalidation, 403
+// TOS/pool eviction, and 401 idle transport eviction.
 func (e *AntigravityExecutor) applyAntigravityUpstreamError(
 	ctx context.Context,
 	auth *cliproxyauth.Auth,
 	upstreamModel string,
 	useCredits bool,
+	inBand bool,
 	replayScope antigravityReasoningReplayScope,
 	statusCode int,
 	headers http.Header,
 	body []byte,
 ) error {
+	emitAntigravityUpstreamErrorTelemetry(ctx, auth, upstreamModel, useCredits, inBand, statusCode, headers, body)
 	if statusCode == http.StatusTooManyRequests {
 		if err429 := e.applyAntigravity429State(ctx, auth, upstreamModel, useCredits, headers, body); err429 != nil {
 			return err429

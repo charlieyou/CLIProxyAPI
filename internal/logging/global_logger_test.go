@@ -301,3 +301,46 @@ func TestLogFormatterFormatsShortRequestID(t *testing.T) {
 		t.Fatalf("formatted line %q does not contain expected placeholder [--------]", lineEmpty)
 	}
 }
+
+func TestLogFormatterPrintsAntigravityUpstreamErrorFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 11, 27, 10, 15, 30, 0, time.Local)
+	entry.Level = log.WarnLevel
+	entry.Message = "antigravity executor: upstream error"
+	entry.Data["provider"] = "antigravity"
+	entry.Data["model"] = "gemini-3-flash"
+	entry.Data["auth"] = "ag 1\ninjected.json"
+	entry.Data["status"] = 429
+	entry.Data["in_band"] = false
+	entry.Data["use_credits"] = false
+	entry.Data["rpc_status"] = "RESOURCE_EXHAUSTED"
+	entry.Data["rpc_reason"] = "RATE_LIMIT_EXCEEDED"
+	entry.Data["decision"] = "short_cooldown_switch_auth"
+	entry.Data["retry_after_ms"] = int64(15000)
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"provider=antigravity",
+		"model=gemini-3-flash",
+		`auth="ag 1\ninjected.json"`,
+		"status=429",
+		"in_band=false",
+		"use_credits=false",
+		"rpc_status=RESOURCE_EXHAUSTED",
+		"rpc_reason=RATE_LIMIT_EXCEEDED",
+		"decision=short_cooldown_switch_auth",
+		"retry_after_ms=15000",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %s", line, want)
+		}
+	}
+	if strings.Count(line, "\n") != 1 {
+		t.Fatalf("formatted line contains an unescaped newline: %q", line)
+	}
+}
