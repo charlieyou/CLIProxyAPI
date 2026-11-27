@@ -430,7 +430,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		WebsocketAuth:                 false,
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
 		Antigravity: config.AntigravityConfig{
-			SensitiveWords: []string{"old-word"},
+			SensitiveWords:              []string{"old-word"},
+			ToolDescriptionReplacements: map[string]string{"OldTool": "NewTool"},
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled:         &oldPoolEnabled,
 				IdleConnTimeout: "30s",
@@ -462,7 +463,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		WebsocketAuth:                 true,
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true, AntigravityCredits: true},
 		Antigravity: config.AntigravityConfig{
-			SensitiveWords: []string{"new-word-1", "new-word-2"},
+			SensitiveWords:              []string{"new-word-1", "new-word-2"},
+			ToolDescriptionReplacements: map[string]string{"T1": "R1", "T2": "R2"},
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled:         &newPoolEnabled,
 				IdleConnTimeout: "10s",
@@ -518,6 +520,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "quota-exceeded.switch-preview-model: false -> true")
 	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
 	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
+	expectContains(t, details, "antigravity.tool-description-replacements: 1 -> 2")
 	expectContains(t, details, "antigravity.connection-pool.enabled: false -> true")
 	expectContains(t, details, `antigravity.connection-pool.idle-conn-timeout: "30s" -> "10s"`)
 	expectContains(t, details, "xai.inject-x-search: false -> true")

@@ -30,6 +30,85 @@ func TestParseConfigBytes_AntigravitySensitiveWords(t *testing.T) {
 	}
 }
 
+func TestParseConfigBytes_AntigravityToolDescriptionReplacements(t *testing.T) {
+	want := map[string]string{
+		"an Amp thread":      "a session thread",
+		"Amp attachment URL": "attachment URL",
+	}
+	for name, raw := range map[string]string{
+		"legacy": `antigravity:
+  tool-description-replacements:
+    "an Amp thread": "a session thread"
+    "Amp attachment URL": "attachment URL"
+`,
+		"v8": `config-version: 8
+oauth:
+  providers:
+    antigravity:
+      tool-description-replacements:
+        "an Amp thread": "a session thread"
+        "Amp attachment URL": "attachment URL"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "v8" {
+				if errValidate := ValidateV8Config([]byte(raw)); errValidate != nil {
+					t.Fatalf("ValidateV8Config() error = %v", errValidate)
+				}
+			}
+			cfg, errParse := ParseConfigBytes([]byte(raw))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if !reflect.DeepEqual(cfg.Antigravity.ToolDescriptionReplacements, want) {
+				t.Fatalf("Antigravity.ToolDescriptionReplacements = %#v, want %#v", cfg.Antigravity.ToolDescriptionReplacements, want)
+			}
+			cloned := cfg.CloneForRuntime()
+			cfg.Antigravity.ToolDescriptionReplacements["an Amp thread"] = "mutated"
+			if cloned.Antigravity.ToolDescriptionReplacements["an Amp thread"] != "a session thread" {
+				t.Fatalf("cloned ToolDescriptionReplacements mutated via original: %#v", cloned.Antigravity.ToolDescriptionReplacements)
+			}
+		})
+	}
+}
+
+func TestV8Migration_AntigravityToolDescriptionReplacements(t *testing.T) {
+	raw := []byte("antigravity:\n  tool-description-replacements:\n    \"an Amp thread\": \"a session thread\"\n")
+	migrated, changed, errNormalize := NormalizeConfigLayout(raw, true)
+	if errNormalize != nil || !changed {
+		t.Fatalf("NormalizeConfigLayout() changed=%v error=%v", changed, errNormalize)
+	}
+	if errValidate := ValidateV8Config(migrated); errValidate != nil {
+		t.Fatalf("migrated config invalid: %v\n%s", errValidate, migrated)
+	}
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(migrated, &doc); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	var out struct {
+		OAuth struct {
+			Providers struct {
+				Antigravity struct {
+					ToolDescriptionReplacements map[string]string `yaml:"tool-description-replacements"`
+				} `yaml:"antigravity"`
+			} `yaml:"providers"`
+		} `yaml:"oauth"`
+	}
+	if errDecode := doc.Decode(&out); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if got := out.OAuth.Providers.Antigravity.ToolDescriptionReplacements["an Amp thread"]; got != "a session thread" {
+		t.Fatalf("migrated oauth.providers.antigravity.tool-description-replacements = %#v\n%s", out.OAuth.Providers.Antigravity.ToolDescriptionReplacements, migrated)
+	}
+	cfg, errParse := ParseConfigBytes(migrated)
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes(migrated) error = %v", errParse)
+	}
+	if got := cfg.Antigravity.ToolDescriptionReplacements["an Amp thread"]; got != "a session thread" {
+		t.Fatalf("Antigravity.ToolDescriptionReplacements after migration = %#v", cfg.Antigravity.ToolDescriptionReplacements)
+	}
+}
+
 func TestParseConfigBytes_AntigravityConnectionPool(t *testing.T) {
 	cfg, errParse := ParseConfigBytes([]byte(`antigravity:
   connection-pool:

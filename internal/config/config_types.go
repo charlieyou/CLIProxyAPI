@@ -279,6 +279,12 @@ type AntigravityConfig struct {
 	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
 	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 
+	// ToolDescriptionReplacements applies deterministic plain-text substring
+	// replacements (longest key first, no zero-width characters) to Antigravity
+	// request.tools function declaration and schema description strings without
+	// mutating tool names, property keys, enums, defaults, or other schema fields.
+	ToolDescriptionReplacements map[string]string `yaml:"tool-description-replacements,omitempty" json:"tool-description-replacements,omitempty"`
+
 	// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
 

@@ -1332,6 +1332,8 @@ oauth:
       #     replacement: ""
       #   - pattern: '(?s)<system[-_](conventions|directive)>.*?</system[-_](conventions|directive)>\n?'
       #     replacement: ""
+      # tool-description-replacements: # optional: deterministic plain-ASCII replacements in tool and schema description strings only (preserves tool/property names)
+      #   "an Amp thread": "a session thread"
       # connection-pool:              # optional: upstream HTTP connection pool settings
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)

@@ -203,6 +203,7 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 	if antigravityRequestNeedsSchemaSanitizationDoc(doc) {
 		sanitizeAntigravityRequestSchemasForModelDoc(doc, useAntigravitySchema, isClaudeModel)
 	}
+	e.applyToolDescriptionReplacementsDoc(doc)
 	if isClaudeModel {
 		if !promptStructuredOutput && !antigravityToolChoiceModeIsNoneDoc(doc) {
 			canonicalizeAntigravityToolConfigForValidatedDoc(doc)

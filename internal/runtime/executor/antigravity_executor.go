@@ -118,6 +118,16 @@ func (e *AntigravityExecutor) obfuscateSensitiveWordsDoc(doc *ojson.Doc) bool {
 	return helps.ObfuscateSensitiveWordsInSystemInstructionDoc(doc, matcher)
 }
 
+// applyToolDescriptionReplacementsDoc scrubs request.tools description strings.
+// Callers run it after schema sanitization so bare MCP property maps and
+// inlined local $ref targets are covered too.
+func (e *AntigravityExecutor) applyToolDescriptionReplacementsDoc(doc *ojson.Doc) bool {
+	if e == nil || e.cfg == nil {
+		return false
+	}
+	return helps.ApplyAntigravityToolDescriptionReplacements(doc, e.cfg.Antigravity.ToolDescriptionReplacements)
+}
+
 // Each Antigravity credential gets its own HTTP/1.1 connection pool. Sessions routed
 // to the same auth reuse that pool, while different OAuth identities never share a
 // TCP/TLS connection, matching the native client's one-credential process model.

@@ -74,6 +74,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	_ = doc.Delete("request.sessionId")
 	_ = doc.Delete("request.stream")
 	sanitizeAntigravityRequestSchemasForModelIfNeededDoc(selection.ID, doc)
+	e.applyToolDescriptionReplacementsDoc(doc)
 
 	base := resolveAntigravityRequestBaseURL(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
