@@ -465,6 +465,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		Antigravity: config.AntigravityConfig{
 			SensitiveWords:              []string{"new-word-1", "new-word-2"},
 			ToolDescriptionReplacements: map[string]string{"T1": "R1", "T2": "R2"},
+			StopOnBare429:               true,
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled:         &newPoolEnabled,
 				IdleConnTimeout: "10s",
@@ -521,6 +522,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
 	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
 	expectContains(t, details, "antigravity.tool-description-replacements: 1 -> 2")
+	expectContains(t, details, "antigravity.stop-on-bare-429: false -> true")
 	expectContains(t, details, "antigravity.connection-pool.enabled: false -> true")
 	expectContains(t, details, `antigravity.connection-pool.idle-conn-timeout: "30s" -> "10s"`)
 	expectContains(t, details, "xai.inject-x-search: false -> true")

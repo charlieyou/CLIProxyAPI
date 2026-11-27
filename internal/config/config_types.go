@@ -294,6 +294,12 @@ type AntigravityConfig struct {
 	// is explicitly configured. Set to "0", "off", "false", "none", or
 	// "disabled" to explicitly disable the pause.
 	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
+
+	// StopOnBare429 stops retrying and rotating credentials on a bare 429 (no
+	// ErrorInfo reason, RetryInfo, or Retry-After) and returns it to the client
+	// without cooling the credential. Defaults to false (upstream cooldown and
+	// rotation) when omitted.
+	StopOnBare429 bool `yaml:"stop-on-bare-429,omitempty" json:"stop-on-bare-429,omitempty"`
 }
 
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.

@@ -925,7 +925,7 @@ func (e *AntigravityExecutor) applyAntigravityUpstreamError(
 	headers http.Header,
 	body []byte,
 ) error {
-	emitAntigravityUpstreamErrorTelemetry(ctx, auth, upstreamModel, useCredits, inBand, statusCode, headers, body)
+	rpcReason := emitAntigravityUpstreamErrorTelemetry(ctx, auth, upstreamModel, useCredits, inBand, statusCode, headers, body)
 	if statusCode == http.StatusTooManyRequests {
 		if err429 := e.applyAntigravity429State(ctx, auth, upstreamModel, useCredits, headers, body); err429 != nil {
 			return err429
@@ -945,8 +945,22 @@ func (e *AntigravityExecutor) applyAntigravityUpstreamError(
 	case http.StatusUnauthorized:
 		closeAntigravityAuthIdleTransports(auth)
 	}
-	return newAntigravityStatusErrWithHeaders(statusCode, headers, body)
+	errStatus := newAntigravityStatusErrWithHeaders(statusCode, headers, body)
+	if statusCode == http.StatusTooManyRequests && rpcReason == "bare" && errStatus.retryAfter == nil && antigravityStopOnBare429(cfg) &&
+		decideAntigravity429WithHeaders(helps.UnwrapGoogleRPCErrorBody(body), headers).kind == antigravity429DecisionSoftRetry {
+		// A 429 without ErrorInfo reason, RetryInfo, or Retry-After carries no
+		// quota signal: mark it request-scoped so the conductor returns it
+		// without cooling this credential or rotating to (and cooling) others.
+		errStatus.requestScoped = true
+	}
+	return errStatus
 }
+
+// antigravityStopOnBare429 reports whether antigravity.stop-on-bare-429 is enabled.
+func antigravityStopOnBare429(cfg *config.Config) bool {
+	return cfg != nil && cfg.Antigravity.StopOnBare429
+}
+
 func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {
 	if e == nil || isAntigravityAuthDisabled(auth) || !antigravityCreditsRetryEnabled(e.cfg) || antigravityCoolingDisabled(auth, e.cfg) {
 		return

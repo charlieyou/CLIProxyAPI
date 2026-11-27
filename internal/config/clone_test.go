@@ -548,3 +548,44 @@ api-keys:
 		t.Fatalf("ClaudeKey[0].Cloak.SensitivePatternsReplace = %#v", cfg.ClaudeKey)
 	}
 }
+
+func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
+	for name, tc := range map[string]struct {
+		raw  string
+		want bool
+	}{
+		"omitted": {raw: "antigravity:\n  sensitive-words: [\"API\"]\n", want: false},
+		"legacy":  {raw: "antigravity:\n  stop-on-bare-429: true\n", want: true},
+		"v8":      {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: true\n", want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "v8" {
+				if errValidate := ValidateV8Config([]byte(tc.raw)); errValidate != nil {
+					t.Fatalf("ValidateV8Config() error = %v", errValidate)
+				}
+			}
+			cfg, errParse := ParseConfigBytes([]byte(tc.raw))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if cfg.Antigravity.StopOnBare429 != tc.want {
+				t.Fatalf("Antigravity.StopOnBare429 = %v, want %v", cfg.Antigravity.StopOnBare429, tc.want)
+			}
+			if cloned := cfg.CloneForRuntime(); cloned.Antigravity.StopOnBare429 != tc.want {
+				t.Fatalf("cloned Antigravity.StopOnBare429 = %v, want %v", cloned.Antigravity.StopOnBare429, tc.want)
+			}
+		})
+	}
+
+	migrated, changed, errNormalize := NormalizeConfigLayout([]byte("antigravity:\n  stop-on-bare-429: true\n"), true)
+	if errNormalize != nil || !changed {
+		t.Fatalf("NormalizeConfigLayout() changed=%v error=%v", changed, errNormalize)
+	}
+	cfg, errParse := ParseConfigBytes(migrated)
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes(migrated) error = %v", errParse)
+	}
+	if !cfg.Antigravity.StopOnBare429 {
+		t.Fatalf("Antigravity.StopOnBare429 after migration = false, want true\n%s", migrated)
+	}
+}
