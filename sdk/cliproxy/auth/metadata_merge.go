@@ -21,6 +21,40 @@ func IsAuthTokenPayloadKey(key string) bool {
 	}
 }
 
+// defaultAuthPrefixes are the model prefixes new accounts of a provider get,
+// matching the provider namespace Amp sends models under through a wildcard
+// model mapping, such as "anthropic/claude-opus-5-5" or "google/gemini-4-neon".
+var defaultAuthPrefixes = map[string]string{
+	"claude":      "anthropic",
+	"antigravity": "google",
+}
+
+// ApplyDefaultAuthPrefix defaults new Claude accounts to the Anthropic route
+// and new Antigravity accounts to the Google route. Explicit prefixes,
+// including an empty prefix, are preserved.
+func ApplyDefaultAuthPrefix(target *Auth) {
+	if target == nil {
+		return
+	}
+	defaultPrefix, ok := defaultAuthPrefixes[strings.ToLower(strings.TrimSpace(target.Provider))]
+	if !ok {
+		return
+	}
+	if target.Metadata == nil {
+		target.Metadata = make(map[string]any)
+	}
+	if _, exists := target.Metadata["prefix"]; !exists {
+		prefix := strings.TrimSpace(target.Prefix)
+		if prefix == "" {
+			prefix = defaultPrefix
+		}
+		target.Metadata["prefix"] = prefix
+	}
+	if prefix, ok := target.Metadata["prefix"].(string); ok {
+		target.Prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	}
+}
+
 // MergeExistingAuthMetadata merges user-configured metadata fields from existingMap
 // into target.Metadata and target.Storage if target does not already define them.
 func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
@@ -55,6 +89,12 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		}
 		if _, exists := target.Metadata[k]; !exists {
 			target.Metadata[k] = v
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(target.Provider), "claude") && strings.TrimSpace(target.Prefix) == "" {
+		if _, exists := target.Metadata["prefix"]; !exists {
+			// An existing account without a prefix must remain unprefixed on relogin.
+			target.Metadata["prefix"] = ""
 		}
 	}
 	if setter, ok := target.Storage.(interface{ SetMetadata(map[string]any) }); ok {

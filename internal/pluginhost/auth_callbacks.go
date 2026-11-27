@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfile"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -375,6 +376,13 @@ func (h *Host) saveAuthFile(ctx context.Context, name string, data []byte) (stri
 	auths, errBuild := h.buildAuthsFromFileData(ctx, dst, data)
 	if errBuild != nil {
 		return "", errBuild
+	}
+	if len(auths) == 1 {
+		var errPrefix error
+		data, errPrefix = authfile.ApplyUploadPrefix(dst, data, auths[0], h.currentAuthManager())
+		if errPrefix != nil {
+			return "", errPrefix
+		}
 	}
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return "", fmt.Errorf("failed to write auth file: %w", errWrite)

@@ -18,6 +18,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfile"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
@@ -965,9 +966,9 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	return store
 }
 
-func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
+func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) error {
 	if h == nil || record == nil {
-		return
+		return nil
 	}
 	var existingMap map[string]any
 
@@ -986,8 +987,10 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 			}
 		}
 		if fullPath != "" {
-			if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
-				_ = json.Unmarshal(raw, &existingMap)
+			var errRead error
+			existingMap, errRead = authfile.ReadMetadata(fullPath)
+			if errRead != nil && strings.EqualFold(strings.TrimSpace(record.Provider), "claude") {
+				return fmt.Errorf("preserve existing Claude settings: %w", errRead)
 			}
 		}
 	}
@@ -1008,6 +1011,7 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 	if len(existingMap) > 0 {
 		coreauth.MergeExistingAuthMetadata(record, existingMap)
 	}
+	return nil
 }
 
 type targetedOAuthSaveContextKey struct{}
@@ -1031,7 +1035,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
-	h.mergeExistingAuthFileMetadata(record)
+	if errMerge := h.mergeExistingAuthFileMetadata(record); errMerge != nil {
+		return "", errMerge
+	}
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
@@ -1086,6 +1092,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
+	coreauth.ApplyDefaultAuthPrefix(record)
 	savedPath, errSave := store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if errSave != nil {
 		return savedPath, errSave

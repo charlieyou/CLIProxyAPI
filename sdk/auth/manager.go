@@ -3,13 +3,12 @@ package auth
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/MoeForge/moego/json"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfile"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
@@ -76,10 +75,6 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s returned nil record", provider)
 	}
 
-	if m.store == nil {
-		return record, "", nil
-	}
-
 	if cfg != nil {
 		if dirSetter, ok := m.store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(cfg.AuthDir)
@@ -91,14 +86,19 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 			}
 			if targetFile != "" {
 				fullPath := filepath.Join(cfg.AuthDir, targetFile)
-				if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
-					var existingMap map[string]any
-					if errUnmarshal := json.Unmarshal(raw, &existingMap); errUnmarshal == nil && len(existingMap) > 0 {
-						coreauth.MergeExistingAuthMetadata(record, existingMap)
-					}
+				existingMap, errRead := authfile.ReadMetadata(fullPath)
+				if errRead != nil && strings.EqualFold(strings.TrimSpace(record.Provider), "claude") {
+					return record, "", fmt.Errorf("cliproxy auth: preserve existing Claude settings: %w", errRead)
+				}
+				if errRead == nil {
+					coreauth.MergeExistingAuthMetadata(record, existingMap)
 				}
 			}
 		}
+	}
+	if m.store == nil {
+		coreauth.ApplyDefaultAuthPrefix(record)
+		return record, "", nil
 	}
 	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, m.store, record)
 	if errLegacy != nil {
@@ -140,6 +140,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		adoptLegacyXAIFileName(record, legacyXAICredential)
 	}
 	applyLoginProxyToRecord(record, loginProxyURL)
+	coreauth.ApplyDefaultAuthPrefix(record)
 
 	savedPath, err := m.store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if err != nil {
