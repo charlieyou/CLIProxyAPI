@@ -2039,6 +2039,7 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 				} else {
 					current.StatusMessage = "unauthorized (refresh token invalid)"
 				}
+				log.Errorf("credential refresh rejected for %s (%s): %s; credential unavailable until re-login", current.Provider, current.ID, safeErrorDiagnosticForLog(err))
 				shouldUnschedule = true
 			} else if !hasValidAccessToken || accessTokenRejected {
 				current.Unavailable = true
@@ -2055,16 +2056,20 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 					} else {
 						current.StatusMessage = "unauthorized (refresh token invalid)"
 					}
+					log.Errorf("credential refresh rejected for %s (%s): %s; credential unavailable until re-login", current.Provider, current.ID, safeErrorDiagnosticForLog(err))
 					shouldUnschedule = true
 				} else if invalidGrant {
 					current.RefreshFailures++
-					current.NextRefreshAfter = now.Add(invalidGrantBackoffDuration(current.RefreshFailures))
+					backoff := invalidGrantBackoffDuration(current.RefreshFailures)
+					current.NextRefreshAfter = now.Add(backoff)
 					current.StatusMessage = "invalid grant (retrying)"
+					log.Warnf("credential refresh failed for %s (%s): %s; access token expired, retrying in %s", current.Provider, current.ID, safeErrorDiagnosticForLog(err), backoff)
 					shouldReschedule = true
 				} else {
 					current.RefreshFailures = 0
 					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 					current.StatusMessage = "token expired"
+					log.Warnf("credential refresh failed for %s (%s): %s; access token expired, retrying in %s", current.Provider, current.ID, safeErrorDiagnosticForLog(err), refreshFailureBackoff)
 					shouldReschedule = true
 				}
 			} else if terminalRefresh {
