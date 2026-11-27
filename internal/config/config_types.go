@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"gopkg.in/yaml.v3"
@@ -615,6 +616,37 @@ type RoutingConfig struct {
 	//     keep the binding and return the error (or retry the same credential) instead.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// QuotaRefresh configures usage-window fetching that drives quota-aware
+	// fill-first routing. Ignored when Home is enabled.
+	QuotaRefresh QuotaRefreshConfig `yaml:"quota-refresh,omitempty" json:"quota-refresh,omitempty"`
+}
+
+// QuotaRefreshConfig configures reactive usage-window fetching (on 429 and at startup).
+type QuotaRefreshConfig struct {
+	Enabled          bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	ReadOnlyMode     bool          `yaml:"read_only_mode,omitempty" json:"read_only_mode,omitempty"`
+	StaleThreshold   time.Duration `yaml:"stale_threshold,omitempty" json:"stale_threshold,omitempty"`
+	EnabledProviders []string      `yaml:"enabled_providers,omitempty" json:"enabled_providers,omitempty"`
+}
+
+// DefaultQuotaRefreshConfig returns a QuotaRefreshConfig with default values.
+func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
+	return QuotaRefreshConfig{
+		StaleThreshold:   time.Hour,
+		EnabledProviders: []string{},
+	}
+}
+
+// Validate checks that enabled_providers contains only providers with a usage endpoint.
+func (c *QuotaRefreshConfig) Validate() error {
+	validKeys := []string{constant.Claude, constant.Codex}
+	for _, p := range c.EnabledProviders {
+		if !slices.Contains(validKeys, p) {
+			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: %s)", p, strings.Join(validKeys, ", "))
+		}
+	}
+	return nil
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

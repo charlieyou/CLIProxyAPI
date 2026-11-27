@@ -106,6 +106,9 @@ func validateStartupConfig(data []byte, optional bool) (*startupConfig, error) {
 	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
+	if errValidate := cfg.Routing.QuotaRefresh.Validate(); errValidate != nil {
+		return nil, fmt.Errorf("config validation failed: %w", errValidate)
+	}
 	if cfg.Discovery.ServiceType == "" {
 		cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
 	}

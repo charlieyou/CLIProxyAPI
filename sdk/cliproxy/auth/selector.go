@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,10 +90,29 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 	return availabilityModel
 }
 
+// QuotaRefreshSettings holds the quota refresh configuration values needed by the
+// manager and selector. It mirrors internal/config.QuotaRefreshConfig.
+type QuotaRefreshSettings struct {
+	Enabled          bool
+	ReadOnlyMode     bool
+	StaleThreshold   time.Duration
+	EnabledProviders []string
+}
+
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+// When quota-aware routing is enabled, credentials whose usage window resets
+// soonest are drained first.
+type FillFirstSelector struct {
+	quotaSettings QuotaRefreshSettings
+}
+
+// NewFillFirstSelector creates a FillFirstSelector. Pass empty settings to keep
+// the default deterministic ordering.
+func NewFillFirstSelector(quotaSettings QuotaRefreshSettings) *FillFirstSelector {
+	return &FillFirstSelector{quotaSettings: quotaSettings}
+}
 
 type blockReason int
 
@@ -1231,6 +1251,8 @@ func saturatingAddInt64(value, delta int64) int64 {
 }
 
 // Pick selects the first available auth for the provider in a deterministic manner.
+// When quota-aware routing is enabled, the manager supplies quota snapshots via
+// WithQuotaSnapshots and candidates are ranked by their usage windows.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -1239,7 +1261,214 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	return available[0], nil
+
+	qs := s.quotaSettings
+	if !qs.Enabled || qs.ReadOnlyMode || len(available) < 2 {
+		return available[0], nil
+	}
+	snapshots := quotaSnapshotsFromContext(ctx)
+	if snapshots == nil {
+		return available[0], nil
+	}
+	return rankAuthsByQuota(available, snapshots, qs, now)[0], nil
+}
+
+// rankAuthsByQuota orders candidates for quota-aware fill-first selection.
+// Tier 0: enabled + known + has expiration (drain expiring quotas first)
+// Tier 1: enabled + known + no expiration (no urgency)
+// Tier 2: enabled + unknown (no quota data yet)
+// Tier 3: provider not enabled for quota refresh
+func rankAuthsByQuota(available []*Auth, snapshots map[string]QuotaWindowState, qs QuotaRefreshSettings, now time.Time) []*Auth {
+	type authSortData struct {
+		metrics quotaMetrics
+		tier    int
+	}
+	sortData := make(map[string]authSortData, len(available))
+	for _, auth := range available {
+		data := authSortData{tier: 3}
+		if slices.Contains(qs.EnabledProviders, auth.Provider) {
+			metrics, known := quotaMetricsFromSnapshot(snapshots[auth.ID], now, qs.StaleThreshold)
+			data.metrics = metrics
+			switch {
+			case !known:
+				data.tier = 2
+			case metrics.hasExpiration:
+				data.tier = 0
+			default:
+				data.tier = 1
+			}
+		}
+		sortData[auth.ID] = data
+	}
+
+	for _, auth := range available {
+		data := sortData[auth.ID]
+		soonestStr := ""
+		if soonest, ok := soonestResetAt(snapshots[auth.ID], now); ok {
+			soonestStr = soonest.Format(time.RFC3339)
+		}
+		log.Debugf("quota selection candidate auth_id=%s provider=%s tier=%d known=%t has_expiration=%t used_percent=%.2f soonest_reset=%s",
+			auth.ID, auth.Provider, data.tier, data.tier < 2, data.metrics.hasExpiration, data.metrics.usedPercent, soonestStr)
+	}
+
+	var earliestTimeToReset time.Duration
+	for _, data := range sortData {
+		if data.tier != 0 {
+			continue
+		}
+		if earliestTimeToReset == 0 || data.metrics.timeToReset < earliestTimeToReset {
+			earliestTimeToReset = data.metrics.timeToReset
+		}
+	}
+
+	ranked := append([]*Auth(nil), available...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		di := sortData[ranked[i].ID]
+		dj := sortData[ranked[j].ID]
+		if di.tier != dj.tier {
+			return di.tier < dj.tier
+		}
+		switch di.tier {
+		case 0:
+			if cmp := compareQuotaMetrics(di.metrics, dj.metrics, earliestTimeToReset); cmp != 0 {
+				return cmp < 0
+			}
+		case 1:
+			if di.metrics.usedPercent != dj.metrics.usedPercent {
+				return di.metrics.usedPercent < dj.metrics.usedPercent
+			}
+		}
+		return ranked[i].ID < ranked[j].ID
+	})
+	return ranked
+}
+
+// quotaMetrics holds the extracted quota window metrics for an auth.
+type quotaMetrics struct {
+	timeToReset   time.Duration
+	usedPercent   float64
+	hasExpiration bool
+}
+
+// preferredQuotaWindowName returns the long window that should drive routing:
+// seven_day for Claude and secondary for Codex, avoiding short-window bias.
+func preferredQuotaWindowName(windows []QuotaWindow) string {
+	preferred := ""
+	for _, w := range windows {
+		switch w.Name {
+		case "seven_day", "five_hour":
+			preferred = "seven_day"
+		case "primary", "secondary":
+			if preferred == "" {
+				preferred = "secondary"
+			}
+		}
+	}
+	return preferred
+}
+
+// preferredQuotaWindow returns the preferred window when it has a future reset.
+func preferredQuotaWindow(windows []QuotaWindow, now time.Time) (QuotaWindow, bool) {
+	preferred := preferredQuotaWindowName(windows)
+	if preferred == "" {
+		return QuotaWindow{}, false
+	}
+	for _, w := range windows {
+		if w.Name != preferred {
+			continue
+		}
+		if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+			return QuotaWindow{}, false
+		}
+		return w, true
+	}
+	return QuotaWindow{}, false
+}
+
+// quotaMetricsFromSnapshot extracts routing metrics from an immutable QuotaWindowState snapshot.
+// Returns the metrics for the preferred (or soonest-expiring) window and whether the data is known (not stale).
+func quotaMetricsFromSnapshot(snap QuotaWindowState, now time.Time, staleThreshold time.Duration) (metrics quotaMetrics, known bool) {
+	unknown := quotaMetrics{timeToReset: math.MaxInt64, usedPercent: 100}
+	if snap.LastFetchedAt.IsZero() || now.Sub(snap.LastFetchedAt) > staleThreshold || len(snap.Windows) == 0 {
+		return unknown, false
+	}
+	if w, ok := preferredQuotaWindow(snap.Windows, now); ok {
+		return quotaMetrics{timeToReset: w.ResetAt.Sub(now), usedPercent: w.UsedPercent, hasExpiration: true}, true
+	}
+
+	var bestTimeToReset time.Duration = -1
+	var bestUsedPercent float64 = -1
+	for _, w := range snap.Windows {
+		if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+			continue
+		}
+		timeToReset := w.ResetAt.Sub(now)
+		if bestTimeToReset < 0 || timeToReset < bestTimeToReset {
+			bestTimeToReset = timeToReset
+			bestUsedPercent = w.UsedPercent
+		} else if timeToReset == bestTimeToReset && w.UsedPercent < bestUsedPercent {
+			bestUsedPercent = w.UsedPercent
+		}
+	}
+	if bestTimeToReset >= 0 {
+		return quotaMetrics{timeToReset: bestTimeToReset, usedPercent: bestUsedPercent, hasExpiration: true}, true
+	}
+
+	var lowestUsedPercent float64 = -1
+	for _, w := range snap.Windows {
+		if lowestUsedPercent < 0 || w.UsedPercent < lowestUsedPercent {
+			lowestUsedPercent = w.UsedPercent
+		}
+	}
+	return quotaMetrics{timeToReset: math.MaxInt64, usedPercent: lowestUsedPercent}, true
+}
+
+// compareQuotaMetrics compares two quota metrics using 5-minute cohorts anchored
+// to the earliest tier-0 reset. Cohorts remain stable while the eligible credentials
+// and their reset timestamps are unchanged; an exact 5-minute offset starts a new cohort.
+// Returns -1 if a is better, +1 if b is better, 0 if equal.
+func compareQuotaMetrics(a, b quotaMetrics, earliestTimeToReset time.Duration) int {
+	if a.hasExpiration && !b.hasExpiration {
+		return -1
+	}
+	if !a.hasExpiration && b.hasExpiration {
+		return 1
+	}
+	if a.hasExpiration && b.hasExpiration {
+		const bucketSize = 5 * time.Minute
+		bucketA := (a.timeToReset - earliestTimeToReset) / bucketSize
+		bucketB := (b.timeToReset - earliestTimeToReset) / bucketSize
+		if bucketA < bucketB {
+			return -1
+		}
+		if bucketA > bucketB {
+			return 1
+		}
+	}
+	if a.usedPercent < b.usedPercent {
+		return -1
+	}
+	if a.usedPercent > b.usedPercent {
+		return 1
+	}
+	return 0
+}
+
+// soonestResetAt returns the reset time used for routing diagnostics.
+func soonestResetAt(snap QuotaWindowState, now time.Time) (time.Time, bool) {
+	if w, ok := preferredQuotaWindow(snap.Windows, now); ok {
+		return w.ResetAt, true
+	}
+	var earliest time.Time
+	for _, w := range snap.Windows {
+		if w.ResetAt.IsZero() || !w.ResetAt.After(now) {
+			continue
+		}
+		if earliest.IsZero() || w.ResetAt.Before(earliest) {
+			earliest = w.ResetAt
+		}
+	}
+	return earliest, !earliest.IsZero()
 }
 
 // IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.

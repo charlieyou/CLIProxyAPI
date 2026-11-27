@@ -232,6 +232,16 @@ routing:
   #     keep the binding and return the error (or retry the same credential) instead.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+  # Quota refresh: fetch usage windows on 429 to drive quota-aware fill-first routing
+  # (credentials whose usage window resets soonest are used first). Ignored in Home mode.
+  # Usage windows are also refetched at half stale_threshold (with jitter); blocked accounts
+  # use the same cache cadence. Usage API 429s back off 30m -> 1h -> 2h.
+  # After an upstream manual reset, POST /v8/management/routing/quota/refresh with auth_index.
+  # quota-refresh:
+  #   enabled: false              # Enable quota refresh (default: false)
+  #   read_only_mode: false       # If true, never modify auth state (default: false)
+  #   stale_threshold: 1h         # Treat cached windows older than this as unknown
+  #   enabled_providers: []       # Providers to enable (claude, codex)
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

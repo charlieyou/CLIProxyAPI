@@ -606,6 +606,13 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
+		// File reloads omit runtime quota state. Preserve the cache and usage-API
+		// backoff together without replacing an explicitly supplied snapshot.
+		if auth.Provider == existing.Provider && len(auth.QuotaWindows.Windows) == 0 &&
+			auth.QuotaWindows.LastFetchedAt.IsZero() && auth.QuotaWindows.LastFetchError == nil &&
+			auth.QuotaWindows.NextFetchAfter.IsZero() && auth.QuotaWindows.RateLimitBackoffLevel == 0 {
+			auth.QuotaWindows = existing.QuotaWindows
+		}
 		if isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now)) {
 			if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
 				auth.Status = existing.Status
@@ -1092,6 +1099,7 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
+	delete(m.quotaRecoveryAttempts, id)
 	m.notifyAuthChangeLocked(id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)

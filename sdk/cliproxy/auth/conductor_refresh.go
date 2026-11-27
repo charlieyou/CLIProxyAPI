@@ -69,6 +69,18 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	m.refreshLoop = loop
 	m.mu.Unlock()
 
+	// Start the quota refresh worker so reactive usage fetches (on 429) are processed.
+	if m.quotaRefreshQueue != nil {
+		go m.quotaRefreshWorker(ctx)
+		if m.quotaRefreshEnabled("") {
+			go m.enqueueInitialQuotaRefresh(ctx)
+			// Keep quota-window snapshots fresh between 429s so expiry-based
+			// routing stays active instead of decaying to default ordering once
+			// the startup data passes StaleThreshold.
+			go m.periodicQuotaRefresh(ctx)
+		}
+	}
+
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
 }

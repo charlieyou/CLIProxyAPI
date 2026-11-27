@@ -3992,6 +3992,8 @@ func (m *Manager) recordVerifyFailure(execCtx context.Context, auth *Auth, provi
 		CredentialVersion: credVersion,
 		RegistrationEpoch: regEpoch,
 		ExecutionSeq:      executionSeq,
+		// Set only for background quota recovery, never operator verification.
+		quotaRecoveryProbe: isQuotaRecoveryProbe(execCtx),
 	}
 	m.ApplyRequestScopedErrorResult(execCtx, auth, err, &result)
 	m.MarkResult(execCtx, result)

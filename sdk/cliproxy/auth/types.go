@@ -113,6 +113,8 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// QuotaWindows caches usage windows fetched from the provider usage endpoint.
+	QuotaWindows QuotaWindowState `json:"quota_windows,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -349,6 +351,55 @@ type RecentRequestBucket struct {
 	Failed  int64  `json:"failed"`
 }
 
+// QuotaWindow represents a single usage window with its reset time.
+type QuotaWindow struct {
+	// Name identifies the window (e.g., "primary", "secondary", "five_hour", "seven_day").
+	Name string `json:"name"`
+	// ResetAt is when this window resets.
+	ResetAt time.Time `json:"reset_at"`
+	// UsedPercent is the current usage percentage (0-100).
+	UsedPercent float64 `json:"used_percent,omitempty"`
+	// RequestAllowed reports whether the provider says this credential can accept requests.
+	// Nil means the provider did not supply an authoritative availability signal.
+	RequestAllowed *bool `json:"request_allowed,omitempty"`
+}
+
+// QuotaWindowState tracks usage windows fetched from the provider usage endpoint.
+type QuotaWindowState struct {
+	// Windows contains all known quota windows for this credential.
+	Windows []QuotaWindow `json:"windows,omitempty"`
+	// LastFetchedAt is when quota info was last fetched.
+	LastFetchedAt time.Time `json:"last_fetched_at,omitempty"`
+	// LastFetchError stores the last fetch failure for debugging.
+	LastFetchError *Error `json:"last_fetch_error,omitempty"`
+	// NextFetchAfter gates calls to the provider usage endpoint for this auth.
+	// Usage-endpoint 429s
+	// apply exponential backoff and honor any longer Retry-After duration.
+	NextFetchAfter time.Time `json:"next_fetch_after,omitempty"`
+	// RateLimitBackoffLevel tracks consecutive usage-endpoint 429s separately
+	// from inference cooldowns. Successful usage fetches reset it.
+	RateLimitBackoffLevel int `json:"rate_limit_backoff_level,omitempty"`
+}
+
+// Clone returns a deep copy of the window state.
+func (s QuotaWindowState) Clone() QuotaWindowState {
+	out := s
+	if len(s.Windows) > 0 {
+		out.Windows = make([]QuotaWindow, len(s.Windows))
+		copy(out.Windows, s.Windows)
+		for i := range out.Windows {
+			if allowed := s.Windows[i].RequestAllowed; allowed != nil {
+				value := *allowed
+				out.Windows[i].RequestAllowed = &value
+			}
+		}
+	}
+	if s.LastFetchError != nil {
+		out.LastFetchError = s.LastFetchError.Clone()
+	}
+	return out
+}
+
 // QuotaState contains limiter tracking data for a credential.
 type QuotaState struct {
 	// Exceeded indicates the credential recently hit a quota error.
@@ -524,6 +575,7 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth := *a
 	copyAuth.Quota = a.Quota.Clone()
+	copyAuth.QuotaWindows = a.QuotaWindows.Clone()
 	if a.LastError != nil {
 		copyAuth.LastError = a.LastError.Clone()
 	}

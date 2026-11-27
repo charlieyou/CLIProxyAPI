@@ -1829,6 +1829,9 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
+		} else if isNeutralQuotaRecoveryProbeFailure(result) {
+			// A failed recovery probe's transport or server error proves nothing
+			// about the quota; keep the block's evidence for a backed-off retry.
 		} else {
 			if modelKey != "" {
 				if auth.Disabled || auth.Status == StatusDisabled {
@@ -2488,6 +2491,14 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 	}
 	if authSnapshot != nil && len(projections) > 0 {
 		reg.ApplyClientModelProjections(result.AuthID, regEpoch, authSnapshot.Generation, projections)
+	}
+	// A 429 is the cue to refresh usage windows for quota-aware routing.
+	if authSnapshot != nil && !result.Success && statusCodeFromResult(result.Error) == http.StatusTooManyRequests {
+		quotaProvider := strings.TrimSpace(result.Provider)
+		if quotaProvider == "" {
+			quotaProvider = strings.TrimSpace(authSnapshot.Provider)
+		}
+		m.enqueueQuotaRefreshIfEligible(result.AuthID, quotaProvider)
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -3980,6 +3991,20 @@ func isInvalidGrantError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isNeutralQuotaRecoveryProbeFailure reports whether a background quota
+// recovery probe failed with a transport or server error. Invalid grants and
+// operator force-cooldown rules are still recorded.
+func isNeutralQuotaRecoveryProbeFailure(result Result) bool {
+	if !result.quotaRecoveryProbe {
+		return false
+	}
+	if result.Error != nil && (result.Error.Code == ErrorCodeForceCooldown || isInvalidGrantResultError(result.Error)) {
+		return false
+	}
+	code := statusCodeFromResult(result.Error)
+	return code == 0 || code >= http.StatusInternalServerError
 }
 
 func isInvalidGrantResultError(err *Error) bool {

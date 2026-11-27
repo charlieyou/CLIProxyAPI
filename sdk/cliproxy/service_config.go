@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
@@ -61,6 +62,41 @@ type routingRuntimeState struct {
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
 	sessionAffinityRebindOn  string
+	// Quota refresh settings in comparable form; providers are comma-joined.
+	quotaRefreshEnabled   bool
+	quotaRefreshReadOnly  bool
+	quotaStaleThreshold   time.Duration
+	quotaEnabledProviders string
+}
+
+// quotaSettingsFromConfig maps routing.quota-refresh to manager/selector settings,
+// defaulting StaleThreshold when unset.
+func quotaSettingsFromConfig(cfg *config.Config) coreauth.QuotaRefreshSettings {
+	if cfg == nil {
+		return coreauth.QuotaRefreshSettings{}
+	}
+	qr := cfg.Routing.QuotaRefresh
+	if qr.StaleThreshold <= 0 {
+		qr.StaleThreshold = internalconfig.DefaultQuotaRefreshConfig().StaleThreshold
+	}
+	return coreauth.QuotaRefreshSettings{
+		Enabled:          qr.Enabled,
+		ReadOnlyMode:     qr.ReadOnlyMode,
+		StaleThreshold:   qr.StaleThreshold,
+		EnabledProviders: append([]string(nil), qr.EnabledProviders...),
+	}
+}
+
+func (state routingRuntimeState) quotaSettings() coreauth.QuotaRefreshSettings {
+	settings := coreauth.QuotaRefreshSettings{
+		Enabled:        state.quotaRefreshEnabled,
+		ReadOnlyMode:   state.quotaRefreshReadOnly,
+		StaleThreshold: state.quotaStaleThreshold,
+	}
+	if state.quotaEnabledProviders != "" {
+		settings.EnabledProviders = strings.Split(state.quotaEnabledProviders, ",")
+	}
+	return settings
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -80,6 +116,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
 	}
+	quotaSettings := quotaSettingsFromConfig(cfg)
+	state.quotaRefreshEnabled = quotaSettings.Enabled
+	state.quotaRefreshReadOnly = quotaSettings.ReadOnlyMode
+	state.quotaStaleThreshold = quotaSettings.StaleThreshold
+	state.quotaEnabledProviders = strings.Join(quotaSettings.EnabledProviders, ",")
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
@@ -117,7 +158,7 @@ func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth
 			selector = &coreauth.WeightedRoundRobinSelector{}
 		}
 	case "fill-first":
-		selector = &coreauth.FillFirstSelector{}
+		selector = coreauth.NewFillFirstSelector(state.quotaSettings())
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
@@ -289,6 +330,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	if !s.coreManager.ApplyConfigWithCooldownStateStore(ctx, commit.cfg, store) {
 		return false
 	}
+	s.coreManager.SetQuotaRefreshSettings(quotaSettingsFromConfig(commit.cfg))
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
 	return true
 }

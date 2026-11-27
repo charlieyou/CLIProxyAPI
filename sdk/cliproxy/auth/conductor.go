@@ -125,6 +125,8 @@ type Result struct {
 	// cooldown. Zero means unknown (direct MarkResult callers) and is exempt
 	// from the ordering guard.
 	ExecutionSeq uint64
+	// quotaRecoveryProbe marks the failure of a background quota recovery probe.
+	quotaRecoveryProbe bool
 }
 
 // Selector chooses an auth candidate for execution.
@@ -287,6 +289,19 @@ type Manager struct {
 	homePrepareFlights map[string]*homeAuthPrepareFlight
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
 	persistLocks sync.Map
+	// quotaRefreshQueue holds auth IDs awaiting a usage-window refresh (capacity: 100).
+	quotaRefreshQueue chan string
+	// unknownProviderLogged suppresses repeated unknown quota provider warnings.
+	unknownProviderLogged map[string]bool
+	// pendingRefreshes tracks auth IDs currently queued or in-flight for quota refresh.
+	pendingRefreshes map[string]bool
+	// quotaRefreshMu serializes quota work across auto-refresh worker restarts.
+	quotaRefreshMu sync.Mutex
+	// quotaRecoveryAttempts guards recovery probes and retains reset evidence across failed attempts.
+	quotaRecoveryAttempts map[string]quotaRecoveryAttempt
+	// quotaRefreshSettings drives usage-window refresh and quota-aware fill-first routing.
+	quotaRefreshSettings QuotaRefreshSettings
+
 	// authMutationLocks coordinate credential mutations without blocking unrelated readers.
 	authMutationLocks      sync.Map
 	metadataPersistCancels sync.Map
@@ -320,6 +335,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homePrepareFlights:    make(map[string]*homeAuthPrepareFlight),
 		providerOffsets:       make(map[string]int),
 		modelPoolOffsets:      make(map[string]map[string]int),
+		quotaRefreshQueue:     make(chan string, 100),
+		unknownProviderLogged: make(map[string]bool),
+		pendingRefreshes:      make(map[string]bool),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})

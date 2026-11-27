@@ -2328,6 +2328,12 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
+	// Quota-aware fill-first ranks candidates by usage-window snapshots that
+	// only the legacy path supplies, so the scheduler fast path is bypassed.
+	// Read-only mode keeps the default ordering, which the scheduler matches.
+	if m.quotaRefreshEnabled("") {
+		return false
+	}
 	return isBuiltInSelector(m.Selector())
 }
 
@@ -2537,6 +2543,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		accountingAuths = fullAvailable
 	}
 	affinitySnapshots := cloneAuthSlice(affinityCandidates)
+	// Snapshot quota windows under the lock so Pick never re-acquires it.
+	quotaSnapshots := m.quotaSnapshotsForSelectorLocked(selectorAuths)
 	m.mu.RUnlock()
 
 	selected, handled, excluded, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
@@ -2572,11 +2580,15 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				accountingAuths = nil
 			}
 			affinitySnapshots = cloneAuthSlice(affinityCandidates)
+			quotaSnapshots = m.quotaSnapshotsForSelectorLocked(selectorAuths)
 			m.mu.RUnlock()
 		}
 		transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinitySnapshots, model, opts, now)
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+		if quotaSnapshots != nil {
+			selectorCtx = WithQuotaSnapshots(selectorCtx, quotaSnapshots)
+		}
 		if accountingAuths != nil {
 			selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
 		}
@@ -3036,6 +3048,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		accountingAuths = fullAvailable
 	}
 	affinitySnapshots := cloneAuthSlice(affinityCandidates)
+	// Snapshot quota windows under the lock so Pick never re-acquires it.
+	quotaSnapshots := m.quotaSnapshotsForSelectorLocked(selectorAuths)
 	m.mu.RUnlock()
 
 	selected, handled, excluded, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
@@ -3071,11 +3085,15 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 				accountingAuths = nil
 			}
 			affinitySnapshots = cloneAuthSlice(affinityCandidates)
+			quotaSnapshots = m.quotaSnapshotsForSelectorLocked(selectorAuths)
 			m.mu.RUnlock()
 		}
 		transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinitySnapshots, model, opts, now)
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+		if quotaSnapshots != nil {
+			selectorCtx = WithQuotaSnapshots(selectorCtx, quotaSnapshots)
+		}
 		if accountingAuths != nil {
 			selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
 		}
