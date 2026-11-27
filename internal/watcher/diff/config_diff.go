@@ -126,6 +126,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !equalSensitivePatternRules(oldCfg.Antigravity.SensitivePatternsReplace, newCfg.Antigravity.SensitivePatternsReplace) {
 		changes = append(changes, fmt.Sprintf("antigravity.sensitive-patterns-replace: %d -> %d", len(oldCfg.Antigravity.SensitivePatternsReplace), len(newCfg.Antigravity.SensitivePatternsReplace)))
 	}
+	if !reflect.DeepEqual(oldCfg.Antigravity.SystemPromptReplacements, newCfg.Antigravity.SystemPromptReplacements) {
+		changes = append(changes, fmt.Sprintf("antigravity.system-prompt-replacements: %d -> %d", len(oldCfg.Antigravity.SystemPromptReplacements), len(newCfg.Antigravity.SystemPromptReplacements)))
+	}
 	if !equalStringMap(oldCfg.Antigravity.ToolDescriptionReplacements, newCfg.Antigravity.ToolDescriptionReplacements) {
 		changes = append(changes, fmt.Sprintf("antigravity.tool-description-replacements: %d -> %d", len(oldCfg.Antigravity.ToolDescriptionReplacements), len(newCfg.Antigravity.ToolDescriptionReplacements)))
 	}

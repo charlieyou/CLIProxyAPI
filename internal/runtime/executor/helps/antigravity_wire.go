@@ -2566,6 +2566,48 @@ func buildAntigravityStringReplacer(replacements map[string]string) *strings.Rep
 	return strings.NewReplacer(pairs...)
 }
 
+// ApplyAntigravitySystemPromptReplacements applies deterministic plain-text
+// substring replacements (longest key first, no zero-width characters) to
+// request.systemInstruction (and snake_case request.system_instruction).
+func ApplyAntigravitySystemPromptReplacements(payload []byte, replacements map[string]string) []byte {
+	if len(payload) == 0 || len(replacements) == 0 {
+		return payload
+	}
+	replacer := buildAntigravityStringReplacer(replacements)
+	if replacer == nil {
+		return payload
+	}
+
+	for _, path := range []string{"request.systemInstruction", "request.system_instruction"} {
+		inst := ojson.GetBytes(payload, path)
+		if !inst.Exists() {
+			continue
+		}
+		if inst.Type == ojson.String {
+			orig := inst.String()
+			if updated := replacer.Replace(orig); updated != orig {
+				payload = setAntigravityJSONStringNoEscape(payload, path, updated)
+			}
+			continue
+		}
+		parts := inst.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		parts.ForEach(func(idx, part ojson.Result) bool {
+			if part.Get("text").Type != ojson.String {
+				return true
+			}
+			orig := part.Get("text").String()
+			if updated := replacer.Replace(orig); updated != orig {
+				payload = setAntigravityJSONStringNoEscape(payload, path+".parts."+idx.String()+".text", updated)
+			}
+			return true
+		})
+	}
+	return payload
+}
+
 // ApplyAntigravityToolDescriptionReplacements applies deterministic plain-text
 // substring replacements (longest key first, no zero-width characters) to
 // request.tools function declaration descriptions and nested JSON Schema

@@ -256,6 +256,22 @@ func TestAntigravityRootFingerprintStableForMultimodalTurn1(t *testing.T) {
 	}
 }
 
+func TestApplyAntigravitySystemPromptReplacements(t *testing.T) {
+	payload := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"<role>You are Amp Code running on Amp.</role>"}]}}}`)
+	out := ApplyAntigravitySystemPromptReplacements(payload, map[string]string{
+		"Amp":      "the assistant",
+		"Amp Code": "coding agent",
+	})
+	got := ojson.GetBytes(out, "request.systemInstruction.parts.0.text").String()
+	want := "<role>You are coding agent running on the assistant.</role>"
+	if got != want {
+		t.Fatalf("replaced text = %q, want %q", got, want)
+	}
+	if strings.Contains(string(out), `\u003c`) {
+		t.Fatalf("replacement HTML-escaped angle brackets: %s", string(out))
+	}
+}
+
 func TestApplyAntigravityToolDescriptionReplacements(t *testing.T) {
 	payload := []byte(`{
 		"request": {

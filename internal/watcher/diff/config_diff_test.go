@@ -433,6 +433,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
 		Antigravity: config.AntigravityConfig{
 			SensitiveWords:              []string{"old-word"},
+			SystemPromptReplacements:    map[string]string{"Old": "New"},
 			ToolDescriptionReplacements: map[string]string{"OldTool": "NewTool"},
 			StopOnBare429:               &oldStopOnBare429,
 			MaxConcurrentRequests:       1,
@@ -469,6 +470,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true, AntigravityCredits: true},
 		Antigravity: config.AntigravityConfig{
 			SensitiveWords:              []string{"new-word-1", "new-word-2"},
+			SystemPromptReplacements:    map[string]string{"A": "B", "C": "D"},
 			ToolDescriptionReplacements: map[string]string{"T1": "R1", "T2": "R2"},
 			StopOnBare429:               &newStopOnBare429,
 			MaxConcurrentRequests:       4,
@@ -528,6 +530,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "quota-exceeded.switch-preview-model: false -> true")
 	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
 	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
+	expectContains(t, details, "antigravity.system-prompt-replacements: 1 -> 2")
 	expectContains(t, details, "antigravity.tool-description-replacements: 1 -> 2")
 	expectContains(t, details, "antigravity.stop-on-bare-429: false -> true")
 	expectContains(t, details, "antigravity.max-concurrent-requests: 1 -> 4")

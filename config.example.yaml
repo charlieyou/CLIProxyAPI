@@ -1325,6 +1325,9 @@ oauth:
       # sensitive-words:              # optional: words to obfuscate with zero-width characters (U+200B) in system instructions
       #   - "API"
       #   - "proxy"
+      # system-prompt-replacements:   # optional: deterministic plain-ASCII replacements in system instructions (preferred over zero-width sensitive-words)
+      #   "Sourcegraph": "the platform"
+      #   "ampcode.com": "example.com"
       # tool-description-replacements: # optional: deterministic plain-ASCII replacements in tool and schema description strings only (preserves tool/property names)
       #   "an Amp thread": "a session thread"
       # stop-on-bare-429: true        # optional: stop retrying/rotating on bare/signal-less 429 responses without cooling the credential (default: true when omitted)

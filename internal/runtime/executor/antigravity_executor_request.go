@@ -320,6 +320,9 @@ func (e *AntigravityExecutor) buildPreparedRequest(ctx context.Context, auth *cl
 	payload = helps.NormalizeAntigravityFunctionResponseOutputs(payload)
 	_, llmTurnCount := helps.CountAntigravityAgentSteps(payload)
 	payload = geminiToAntigravityWithScope(credScope, strings.TrimSpace(explicitSessionID), modelName, payload, projectID, derivedSessionID)
+	if e.cfg != nil && len(e.cfg.Antigravity.SystemPromptReplacements) > 0 {
+		payload = helps.ApplyAntigravitySystemPromptReplacements(payload, e.cfg.Antigravity.SystemPromptReplacements)
+	}
 	payload = e.obfuscateSensitiveWords(payload)
 
 	isImageModel := strings.Contains(strings.ToLower(modelName), "image") || strings.EqualFold(strings.TrimSpace(ojson.GetBytes(payload, "requestType").String()), "image_gen")

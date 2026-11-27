@@ -1206,6 +1206,185 @@ func TestAntigravityBuildRequest_RemovesSnakeCaseSessionID(t *testing.T) {
 	}
 }
 
+func TestAntigravityBuildRequest_PromptToolParityAndFrozenTurn1Wrap(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	now := time.Date(2026, 11, 22, 18, 0, 0, 0, time.UTC)
+	helps.SetAntigravityWireNowFuncForTest(func() time.Time { return now })
+
+	cfg := &config.Config{
+		Antigravity: config.AntigravityConfig{
+			SystemPromptReplacements: map[string]string{
+				"Amp": "the coding assistant",
+			},
+			SensitiveWords: []string{"secretword"},
+		},
+	}
+	executor := NewAntigravityExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "parity-auth", Metadata: map[string]any{"project_id": "aicode-consumers"}}
+
+	turn1Payload := []byte(`{
+		"request": {
+			"system_instruction": {
+				"parts": [
+					{"text": "You are Amp."},
+					{"text": "Be concise with <tags> and secretword."}
+				]
+			},
+			"contents": [
+				{"role": "user", "parts": [{"text": "hello world"}]}
+			],
+			"tools": [{
+				"functionDeclarations": [{
+					"name": "read_file",
+					"parameters_json_schema": {
+						"type": "object",
+						"additionalProperties": false,
+						"$defs": {
+							"Filter": {
+								"type": "object",
+								"properties": {
+									"glob": {"type": "string"}
+								}
+							}
+						},
+						"properties": {
+							"path": {"type": "string", "minLength": 1},
+							"mode": {"type": "string", "enum": ["text", "raw"]},
+							"filter": {"$ref": "#/$defs/Filter"}
+						},
+						"required": ["path"]
+					},
+					"responseJsonSchema": {
+						"type": "object",
+						"properties": {"ok": {"type": "boolean"}}
+					}
+				}]
+			}]
+		}
+	}`)
+
+	req1, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-high", turn1Payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("turn 1 buildRequest error: %v", err)
+	}
+	raw1, errRead := io.ReadAll(req1.Body)
+	if errRead != nil {
+		t.Fatalf("read turn 1 body: %v", errRead)
+	}
+
+	// #1 & #2: Gemini models emit native draft 2020-12 JSON Schema under parametersJsonSchema
+	// (lowercase types, $defs/$ref, additionalProperties & standard constraints preserved as
+	// numbers, zero watermark hints, and responseJsonSchema stays lowercase).
+	if ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parameters_json_schema").Exists() {
+		t.Fatalf("parameters_json_schema should be canonicalized to parametersJsonSchema: %s", string(raw1))
+	}
+	if ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parameters").Exists() {
+		t.Fatalf("Gemini models should use parametersJsonSchema rather than legacy parameters: %s", string(raw1))
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.type").String(); got != "object" {
+		t.Fatalf("schema root type = %q, want object; body=%s", got, string(raw1))
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.additionalProperties").Raw; got != "false" {
+		t.Fatalf("additionalProperties = %s, want false", got)
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.path.type").String(); got != "string" {
+		t.Fatalf("path type = %q, want string", got)
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.path.minLength").Raw; got != "1" {
+		t.Fatalf("path minLength = %s, want numeric 1", got)
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.filter.$ref").String(); got != "#/$defs/Filter" {
+		t.Fatalf("local $ref Filter should be preserved verbatim in parametersJsonSchema: %s", ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.filter").Raw)
+	}
+	if !ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.$defs.Filter").IsObject() {
+		t.Fatalf("$defs.Filter should be preserved in parametersJsonSchema: %s", ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema").Raw)
+	}
+	if got := ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.responseJsonSchema.type").String(); got != "object" {
+		t.Fatalf("responseJsonSchema.type = %q, want lowercase object", got)
+	}
+	if len(ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.mode.enum").Array()) != 2 {
+		t.Fatalf("string enum missing: %s", ojson.GetBytes(raw1, "request.tools.0.functionDeclarations.0.parametersJsonSchema.properties.mode").Raw)
+	}
+	if strings.Contains(string(raw1), "No extra properties allowed") || strings.Contains(string(raw1), "minLength:") {
+		t.Fatalf("proxy watermark hint leaked into schema: %s", string(raw1))
+	}
+
+	// #3 & #4: system_instruction canonicalized, collapsed to single part, replacements + sensitive-words applied without HTML escaping.
+	if ojson.GetBytes(raw1, "request.system_instruction").Exists() {
+		t.Fatalf("snake_case request.system_instruction should be canonicalized: %s", string(raw1))
+	}
+	sysParts := ojson.GetBytes(raw1, "request.systemInstruction.parts").Array()
+	if len(sysParts) != 1 || !strings.HasPrefix(sysParts[0].Get("text").String(), "You are the coding assistant.\n\nBe concise with <tags> and ") || strings.Contains(sysParts[0].Get("text").String(), "secretword") {
+		t.Fatalf("systemInstruction.parts = %s", ojson.GetBytes(raw1, "request.systemInstruction.parts").Raw)
+	}
+	if strings.Contains(string(raw1), `\u003ctags\u003e`) {
+		t.Fatalf("systemInstruction angle brackets were HTML-escaped: %s", string(raw1))
+	}
+
+	// #5: Turn-1 <USER_REQUEST> wrap with frozen timestamp and literal angle brackets.
+	wrappedTurn1 := ojson.GetBytes(raw1, "request.contents.0.parts.0.text").String()
+	wantWrapped := "<USER_REQUEST>\nhello world\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-22T18:00:00Z.\n</ADDITIONAL_METADATA>"
+	if wrappedTurn1 != wantWrapped {
+		t.Fatalf("turn 1 user text = %q, want %q", wrappedTurn1, wantWrapped)
+	}
+	if strings.Contains(string(raw1), `\u003cUSER_REQUEST\u003e`) {
+		t.Fatalf("HTML-escaped <USER_REQUEST> found in wire body: %s", string(raw1))
+	}
+
+	// Advance clock by 5 minutes: Turn 2 must keep the exact frozen Turn-1 timestamp and rewrite non-decimal tool call IDs.
+	now = now.Add(5 * time.Minute)
+	turn2Payload := []byte(`{
+		"request": {
+			"system_instruction": {
+				"parts": [
+					{"text": "You are Amp."},
+					{"text": "Be concise with <tags> and secretword."}
+				]
+			},
+			"contents": [
+				{"role": "user", "parts": [{"text": "hello world"}]},
+				{"role": "model", "parts": [{"functionCall": {"id": "toolu_01test", "name": "read_file", "args": {"path": "a.go"}}}]},
+				{"role": "user", "parts": [{"functionResponse": {"id": "toolu_01test", "name": "read_file", "response": {"output": "ok"}}}]}
+			]
+		}
+	}`)
+	req2, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-high", turn2Payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("turn 2 buildRequest error: %v", err)
+	}
+	raw2, errRead := io.ReadAll(req2.Body)
+	if errRead != nil {
+		t.Fatalf("read turn 2 body: %v", errRead)
+	}
+	if got := ojson.GetBytes(raw2, "request.contents.0.parts.0.text").String(); got != wantWrapped {
+		t.Fatalf("turn 2 drifted Turn-1 timestamp (breaks prompt cache):\ngot:  %q\nwant: %q", got, wantWrapped)
+	}
+	// #6: Non-decimal tool call ID rewritten deterministically to call_<digits> on both call and response.
+	fcID := ojson.GetBytes(raw2, "request.contents.1.parts.0.functionCall.id").String()
+	frID := ojson.GetBytes(raw2, "request.contents.2.parts.0.functionResponse.id").String()
+	if !strings.HasPrefix(fcID, "call_") || fcID == "toolu_01test" || fcID != frID {
+		t.Fatalf("tool call IDs not normalized cleanly: fc=%q fr=%q", fcID, frID)
+	}
+	for _, ch := range fcID[len("call_"):] {
+		if ch < '0' || ch > '9' {
+			t.Fatalf("normalized tool call ID %q is not decimal", fcID)
+		}
+	}
+
+	// Non-agent requests (web_search, image_gen) must not wrap user text in <USER_REQUEST>.
+	wsPayload := []byte(`{"requestType":"web_search","request":{"contents":[{"role":"user","parts":[{"text":"weather in nyc"}]}]}}`)
+	reqWS, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-high", wsPayload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("web_search buildRequest error: %v", err)
+	}
+	rawWS, _ := io.ReadAll(reqWS.Body)
+	if got := ojson.GetBytes(rawWS, "request.contents.0.parts.0.text").String(); got != "weather in nyc" {
+		t.Fatalf("web_search user text should not be wrapped, got %q", got)
+	}
+}
+
 func TestAntigravityBuildRequest_NoHTMLEscapeInToolResultsAndStripsExtraNonAgyFields(t *testing.T) {
 	helps.ResetAntigravityWireStateForTest()
 	t.Cleanup(helps.ResetAntigravityWireStateForTest)

@@ -279,6 +279,11 @@ type AntigravityConfig struct {
 	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
 	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 
+	// SystemPromptReplacements applies deterministic plain-text substring
+	// replacements (longest key first, no zero-width characters) to Antigravity
+	// systemInstruction text before sending upstream.
+	SystemPromptReplacements map[string]string `yaml:"system-prompt-replacements,omitempty" json:"system-prompt-replacements,omitempty"`
+
 	// ToolDescriptionReplacements applies deterministic plain-text substring
 	// replacements (longest key first, no zero-width characters) to Antigravity
 	// request.tools function declaration and schema description strings without
