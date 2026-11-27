@@ -596,6 +596,15 @@ func authMatchesTokenPartition(auth *Auth, token string) bool {
 	return authAccessToken(auth) == token || authOuterAccessToken(auth) == token
 }
 
+// refreshesOnRequest reports whether an expired access token can only be renewed by a request,
+// because the provider has no background refresh lead (Antigravity refreshes while preparing the
+// request). Selection must keep such credentials eligible, or nothing would ever refresh them.
+// Other providers without a refresh lead keep upstream's expired-token block.
+func refreshesOnRequest(auth *Auth) bool {
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") &&
+		authRefreshToken(auth) != "" && ProviderRefreshLead(auth.Provider, auth.Runtime) == nil
+}
+
 func authRefreshToken(auth *Auth) string {
 	if token := authMetadataString(auth, "refresh_token"); token != "" {
 		return token

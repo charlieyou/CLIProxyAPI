@@ -543,3 +543,79 @@ func testStringValue(value any) string {
 		return ""
 	}
 }
+
+// expiredTokenRefreshExecutor refreshes expired access tokens only while preparing a request,
+// like the Antigravity executor, which has no background refresh lead.
+type expiredTokenRefreshExecutor struct {
+	requestPrepareExecutor
+}
+
+func (e *expiredTokenRefreshExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
+	return !auth.HasValidAccessToken(time.Now())
+}
+
+func (e *expiredTokenRefreshExecutor) PrepareRequestAuth(_ context.Context, auth *Auth) (*Auth, error) {
+	e.prepareCalls.Add(1)
+	updated := auth.Clone()
+	updated.Metadata["access_token"] = "refreshed-token"
+	updated.Metadata["expired"] = time.Now().Add(time.Hour).Format(time.RFC3339)
+	return updated, nil
+}
+
+func TestManagerExecute_ExpiredTokenWithoutRefreshLeadRefreshesOnRequest(t *testing.T) {
+	const model = "gemini-4-neon"
+	setRefreshLeadFactory(t, "antigravity", nil)
+	executor := &expiredTokenRefreshExecutor{}
+	manager := NewManager(&requestPrepareStore{}, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "auth-expired-lazy-refresh",
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"access_token":  "expired-token",
+			"refresh_token": "refresh-token",
+			"expired":       time.Now().Add(-time.Hour).Format(time.RFC3339),
+			"project_id":    "prepared-project",
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "antigravity", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	if _, errExecute := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute with expired lazily refreshed token: %v", errExecute)
+	}
+	if got := executor.prepareCalls.Load(); got != 1 {
+		t.Fatalf("prepare calls = %d, want 1", got)
+	}
+	if got := testStringValue(executor.lastObservedAuth().Metadata["access_token"]); got != "refreshed-token" {
+		t.Fatalf("executor received access_token = %q, want refreshed-token", got)
+	}
+
+	expired, _ := manager.GetByID(auth.ID)
+	expired = expired.Clone()
+	expired.Metadata["access_token"] = "expired-token"
+	expired.Metadata["expired"] = time.Now().Add(-time.Hour).Format(time.RFC3339)
+	if isCredentialBlocked(expired, 1, time.Now()) {
+		t.Fatal("scheduler should keep an expired lazily refreshed token selectable")
+	}
+
+	// With a background refresh lead, the refresh loop owns renewal, so an expired token stays unselectable.
+	setRefreshLeadFactory(t, "antigravity", func() *time.Duration { lead := 30 * time.Minute; return &lead })
+	if blocked, _, _ := isAuthBlockedForModel(auth, model, time.Now()); !blocked {
+		t.Fatal("expired access token should stay blocked when the provider refreshes in the background")
+	}
+	if !isCredentialBlocked(auth, 1, time.Now()) {
+		t.Fatal("scheduler should keep an expired token blocked when the provider refreshes in the background")
+	}
+
+	// Other providers without a refresh lead keep upstream's expired-token block.
+	devin := auth.Clone()
+	devin.Provider = "devin"
+	if blocked, _, _ := isAuthBlockedForModel(devin, model, time.Now()); !blocked {
+		t.Fatal("expired devin access token should stay blocked")
+	}
+}

@@ -1494,7 +1494,7 @@ func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model stri
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
-	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
+	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) && !refreshesOnRequest(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
 	if authForce := effectiveAuthForceUntil(auth); authForce.After(now) && auth.NextRetryAfter.After(now) {
