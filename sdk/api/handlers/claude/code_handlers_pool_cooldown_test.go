@@ -165,7 +165,7 @@ func TestClaudeLastCredential429AppendsPoolResetTime(t *testing.T) {
 				t.Fatalf("error.type = %q, want rate_limit_error", gotType)
 			}
 			wantDelay := (time.Duration(seconds) * time.Second).String()
-			wantMessage := "This request would exceed your account's monthly spend limit. Please try again later. (reset after " + wantDelay + ")"
+			wantMessage := claudeCapacityErrorMessage + " (reset after " + wantDelay + ")"
 			if gotMsg := ojson.GetBytesNoCopy(rec.Body.Bytes(), "error.message").String(); gotMsg != wantMessage {
 				t.Fatalf("error.message = %q, want %q", gotMsg, wantMessage)
 			}

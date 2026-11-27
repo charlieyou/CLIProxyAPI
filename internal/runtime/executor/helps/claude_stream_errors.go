@@ -163,7 +163,8 @@ func ClaudeStreamErrorStatus(payload []byte) (int, string) {
 		strings.Contains(lowerMessage, "payment") || strings.Contains(lowerMessage, "billing") ||
 		strings.Contains(lowerMessage, "credit"):
 		return http.StatusForbidden, message
-	case strings.Contains(lowerType, "overloaded") || strings.Contains(lowerCode, "overloaded"):
+	case strings.Contains(lowerType, "overloaded") || strings.Contains(lowerCode, "overloaded") ||
+		lowerType == "api_error" || lowerCode == "api_error":
 		return http.StatusServiceUnavailable, message
 	default:
 		return http.StatusBadGateway, message

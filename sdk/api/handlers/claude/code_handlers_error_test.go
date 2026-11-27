@@ -131,8 +131,11 @@ func TestClaudeErrorExtractsClaudeStyleUpstreamJSON(t *testing.T) {
 	if got.Error.Type != "rate_limit_error" {
 		t.Fatalf("error.type = %q, want rate_limit_error", got.Error.Type)
 	}
-	if got.Error.Message != "This request would exceed your account's rate limit. Please try again later." {
+	if got.Error.Message != claudeCapacityErrorMessage {
 		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+	if strings.Contains(strings.ToLower(got.Error.Message), "account") || strings.Contains(strings.ToLower(got.Error.Message), "rate limit") {
+		t.Fatalf("error.message leaked upstream limit details: %q", got.Error.Message)
 	}
 }
 

@@ -99,6 +99,7 @@ func TestClaudeStreamErrorStatus(t *testing.T) {
 		{`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`, http.StatusUnauthorized},
 		{`{"type":"error","error":{"type":"permission_error","message":"not allowed"}}`, http.StatusForbidden},
 		{`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`, http.StatusServiceUnavailable},
+		{`{"type":"error","error":{"type":"api_error","message":"temporary upstream capacity failure"}}`, http.StatusServiceUnavailable},
 		{`{"type":"error","error":{"type":"mystery_error","message":"boom"}}`, http.StatusBadGateway},
 	} {
 		got, message := ClaudeStreamErrorStatus([]byte(tc.payload))

@@ -263,3 +263,13 @@ func TestClaudeStreamErrorFromPayloadIncludesErrorType(t *testing.T) {
 		t.Fatalf("Error() = %q, want upstream message", streamErr.Error())
 	}
 }
+
+func TestClaudeStreamErrorFromPayloadClassifiesAPIErrorAsUnavailable(t *testing.T) {
+	streamErr := claudeStreamErrorFromPayload([]byte(`{"type":"error","error":{"type":"api_error","message":"temporary upstream capacity failure"}}`))
+	if got := streamErr.StatusCode(); got != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(streamErr.Error(), "api_error") {
+		t.Fatalf("Error() = %q, want api_error", streamErr.Error())
+	}
+}

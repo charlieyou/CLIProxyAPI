@@ -129,6 +129,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
+		if isClaudeCancellationErrorMessage(errMsg) {
+			cliCancel(errMsg.Error)
+			return
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -184,6 +188,10 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
+		if isClaudeCancellationErrorMessage(errMsg) {
+			cliCancel(errMsg.Error)
+			return
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -289,6 +297,10 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				errChan = nil
 				continue
 			}
+			if isClaudeCancellationErrorMessage(errMsg) {
+				cliCancel(errMsg.Error)
+				return
+			}
 			if committed {
 				stopKeepAlive()
 				stopWaitKeepAlive()
@@ -311,6 +323,10 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				stopKeepAlive()
 				stopWaitKeepAlive()
 				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
+					if isClaudeCancellationErrorMessage(errMsg) {
+						cliCancel(errMsg.Error)
+						return
+					}
 					if committed {
 						pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 						pendingErrors <- errMsg
@@ -348,6 +364,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			if len(chunk) > 0 {
 				_, _ = c.Writer.Write(chunk)
 				flusher.Flush()
+				streamState.wrotePayload = true
 			}
 
 			// Continue streaming the rest
@@ -366,6 +383,9 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 }
 
 type claudeSSEStreamState struct {
+	// wrotePayload reports that upstream data, not only keep-alive comments,
+	// has reached the client.
+	wrotePayload        bool
 	sawErrorEvent       bool
 	sawMessageStop      bool
 	sawBareMessageJSON  bool
@@ -514,10 +534,11 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 				state.loggedTerminalError = true
 			}
 			_, _ = c.Writer.Write(chunk)
+			state.wrotePayload = true
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			state.FlushPendingLine()
-			if errMsg == nil {
+			if errMsg == nil || isClaudeCancellationErrorMessage(errMsg) {
 				return
 			}
 			if !state.loggedTerminalError {
@@ -529,6 +550,12 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 				return
 			}
 			state.ensureSSEEventBoundary(c.Writer)
+			// Hide transient capacity failures once upstream data has reached the
+			// client, unless a known cooldown deadline gives it something
+			// actionable to show. Before any data, the error is the only reply.
+			if state.wrotePayload && isClaudeCapacityErrorMessage(errMsg) && claudeModelCooldownResetHint(errMsg, claudeErrorRetryAfter(errMsg)) == "" {
+				return
+			}
 
 			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
@@ -568,40 +595,39 @@ type claudeErrorResponse struct {
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
-	var retryAfter string
-	if msg != nil && msg.Error != nil {
-		retryAfter = coreauth.SafeResponseHeaders(msg.Error).Get("Retry-After")
+	return h.toClaudeErrorWithRetryAfter(msg, claudeErrorRetryAfter(msg))
+}
+
+func claudeErrorRetryAfter(msg *interfaces.ErrorMessage) string {
+	if msg == nil || msg.Error == nil {
+		return ""
 	}
-	return h.toClaudeErrorWithRetryAfter(msg, retryAfter)
+	return coreauth.SafeResponseHeaders(msg.Error).Get("Retry-After")
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeErrorWithRetryAfter(msg *interfaces.ErrorMessage, retryAfter string) claudeErrorResponse {
-	status := http.StatusInternalServerError
-	errText := http.StatusText(status)
-	if msg != nil {
-		if msg.StatusCode > 0 {
-			status = msg.StatusCode
-			errText = http.StatusText(status)
+	status := claudeDownstreamStatus(msg)
+	errText := http.StatusText(claudeRawStatus(msg))
+	if msg != nil && msg.Error != nil {
+		if v := strings.TrimSpace(claudeErrorText(msg.Error)); v != "" {
+			errText = v
 		}
-		if msg.Error != nil {
-			if v := strings.TrimSpace(claudeErrorText(msg.Error)); v != "" {
-				errText = v
-			}
+	}
+	if isClaudeCancellationErrorMessage(msg) {
+		return claudeErrorResponse{
+			Type: "error",
+			Error: claudeErrorDetail{
+				Type:    claudeErrorTypeFromStatus(status),
+				Message: "Request was canceled.",
+			},
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
-	if status == http.StatusTooManyRequests && msg != nil && msg.Error != nil {
-		var cooldown interface{ IsModelCooldown() bool }
-		if errors.As(msg.Error, &cooldown) && cooldown != nil && cooldown.IsModelCooldown() {
-			if seconds, errParse := strconv.ParseInt(retryAfter, 10, 64); errParse == nil && seconds > 0 {
-				delay := retryAfter + "s"
-				if seconds <= (1<<63-1)/int64(time.Second) {
-					delay = (time.Duration(seconds) * time.Second).String()
-				}
-				message += " (reset after " + delay + ")"
-			}
-		}
+	if isClaudeCapacityError(status, errText) {
+		errType = claudeErrorTypeFromStatus(status)
+		message = claudeCapacityErrorMessage
 	}
+	message += claudeModelCooldownResetHint(msg, retryAfter)
 	response := claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
@@ -616,10 +642,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeErrorWithRetryAfter(msg *interfaces.Error
 }
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status := claudeRawStatus(msg)
 	if msg != nil && msg.DirectResponse {
 		for key, values := range handlers.FilterUpstreamHeaders(msg.Headers) {
 			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
@@ -672,6 +695,10 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		}
 	}
 
+	if claudeRemapsCapacityStatus(msg) && c.Writer.Header().Get("Retry-After") == "" {
+		c.Writer.Header().Set("Retry-After", "60")
+	}
+
 	body, err := json.Marshal(h.toClaudeErrorWithRetryAfter(msg, retryAfter))
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
@@ -680,7 +707,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if !c.Writer.Written() {
 		c.Writer.Header().Set("Content-Type", "application/json")
 	}
-	c.Status(status)
+	c.Status(claudeDownstreamStatus(msg))
 	_, _ = c.Writer.Write(body)
 }
 
@@ -696,6 +723,84 @@ func claudeErrorText(err error) string {
 		return string(responseBody.ResponseBody())
 	}
 	return err.Error()
+}
+
+const claudeCapacityErrorMessage = "Claude upstream capacity is temporarily unavailable. Please retry later."
+
+func claudeRawStatus(msg *interfaces.ErrorMessage) int {
+	if msg != nil && msg.StatusCode > 0 {
+		return msg.StatusCode
+	}
+	return http.StatusInternalServerError
+}
+
+// claudeDownstreamStatus reports overloaded and unavailable capacity errors as
+// 429 so Claude clients back off and retry instead of giving up.
+func claudeDownstreamStatus(msg *interfaces.ErrorMessage) int {
+	if claudeRemapsCapacityStatus(msg) {
+		return http.StatusTooManyRequests
+	}
+	return claudeRawStatus(msg)
+}
+
+func claudeRemapsCapacityStatus(msg *interfaces.ErrorMessage) bool {
+	if msg == nil || isClaudeCancellationErrorMessage(msg) {
+		return false
+	}
+	status := claudeRawStatus(msg)
+	return (status == http.StatusServiceUnavailable || status == 529) && isClaudeCapacityErrorMessage(msg)
+}
+
+// claudeModelCooldownResetHint keeps the reset time of a model cooldown 429 in
+// the client-facing message, including when the upstream detail is hidden.
+func claudeModelCooldownResetHint(msg *interfaces.ErrorMessage, retryAfter string) string {
+	if claudeRawStatus(msg) != http.StatusTooManyRequests || msg.Error == nil {
+		return ""
+	}
+	var cooldown interface{ IsModelCooldown() bool }
+	if !errors.As(msg.Error, &cooldown) || cooldown == nil || !cooldown.IsModelCooldown() {
+		return ""
+	}
+	seconds, errParse := strconv.ParseInt(retryAfter, 10, 64)
+	if errParse != nil || seconds <= 0 {
+		return ""
+	}
+	delay := retryAfter + "s"
+	if seconds <= (1<<63-1)/int64(time.Second) {
+		delay = (time.Duration(seconds) * time.Second).String()
+	}
+	return " (reset after " + delay + ")"
+}
+
+func isClaudeCancellationErrorMessage(msg *interfaces.ErrorMessage) bool {
+	return msg != nil && errors.Is(msg.Error, context.Canceled)
+}
+
+func isClaudeCapacityErrorMessage(msg *interfaces.ErrorMessage) bool {
+	if msg == nil {
+		return false
+	}
+	status := msg.StatusCode
+	if status <= 0 && msg.Error != nil {
+		if se, ok := msg.Error.(interface{ StatusCode() int }); ok && se != nil {
+			status = se.StatusCode()
+		}
+	}
+	errText := ""
+	if msg.Error != nil {
+		errText = claudeErrorText(msg.Error)
+	}
+	return isClaudeCapacityError(status, errText)
+}
+
+// isClaudeCapacityError reports rate, usage and capacity failures whose
+// upstream details must not reach the client.
+func isClaudeCapacityError(status int, errText string) bool {
+	lower := strings.ToLower(errText)
+	if strings.Contains(lower, "session limit") || strings.Contains(lower, "usage limit") {
+		return true
+	}
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == 529
 }
 
 func claudeErrorDetailFromText(status int, errText string) (string, string) {
