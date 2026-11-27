@@ -557,11 +557,12 @@ func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
 		wantNil bool
 		want    bool
 	}{
-		"omitted":      {raw: "antigravity:\n  sensitive-words: [\"API\"]\n", wantNil: true, want: true},
-		"legacy":       {raw: "antigravity:\n  stop-on-bare-429: true\n", want: true},
-		"legacy-false": {raw: "antigravity:\n  stop-on-bare-429: false\n", want: false},
-		"v8":           {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: true\n", want: true},
-		"v8-false":     {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: false\n", want: false},
+		"omitted":        {raw: "antigravity:\n  sensitive-words: [\"API\"]\n", wantNil: true, want: true},
+		"legacy":         {raw: "antigravity:\n  stop-on-bare-429: true\n", want: true},
+		"legacy-false":   {raw: "antigravity:\n  stop-on-bare-429: false\n", want: false},
+		"v8":             {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: true\n", want: true},
+		"v8-false":       {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: false\n", want: false},
+		"v8-agy-options": {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      system-prompt-replacements: {a: b}\n      move-system-instruction-to-user: true\n", wantNil: true, want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if strings.HasPrefix(name, "v8") {

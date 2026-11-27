@@ -132,6 +132,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !equalStringMap(oldCfg.Antigravity.ToolDescriptionReplacements, newCfg.Antigravity.ToolDescriptionReplacements) {
 		changes = append(changes, fmt.Sprintf("antigravity.tool-description-replacements: %d -> %d", len(oldCfg.Antigravity.ToolDescriptionReplacements), len(newCfg.Antigravity.ToolDescriptionReplacements)))
 	}
+	if oldCfg.Antigravity.MoveSystemInstructionToUser != newCfg.Antigravity.MoveSystemInstructionToUser {
+		changes = append(changes, fmt.Sprintf("antigravity.move-system-instruction-to-user: %t -> %t", oldCfg.Antigravity.MoveSystemInstructionToUser, newCfg.Antigravity.MoveSystemInstructionToUser))
+	}
+	if oldCfg.Antigravity.SystemInstructionBaseline != newCfg.Antigravity.SystemInstructionBaseline {
+		changes = append(changes, fmt.Sprintf("antigravity.system-instruction-baseline: len %d -> %d", len(oldCfg.Antigravity.SystemInstructionBaseline), len(newCfg.Antigravity.SystemInstructionBaseline)))
+	}
 	oldStopOnBare429 := "<nil>"
 	if oldCfg.Antigravity.StopOnBare429 != nil {
 		oldStopOnBare429 = fmt.Sprintf("%t", *oldCfg.Antigravity.StopOnBare429)

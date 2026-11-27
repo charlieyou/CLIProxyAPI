@@ -1386,3 +1386,65 @@ func TestFormatAntigravityControlPlaneJSONAndDetrandCLParity(t *testing.T) {
 		t.Fatalf("onboardUser wire = %s, want %s", string(onboardOut), wantOnboard)
 	}
 }
+
+func TestRelocateAntigravitySystemInstructionToUser(t *testing.T) {
+	in := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"Caller system prompt"}]},"contents":[{"role":"user","parts":[{"text":"<USER_REQUEST>\nhello\n</USER_REQUEST>"}]}]}}`)
+	out := RelocateAntigravitySystemInstructionToUser(in, "")
+	if got := ojson.GetBytes(out, "request.systemInstruction.parts.0.text").String(); got != DefaultAntigravitySystemInstructionBaseline {
+		t.Fatalf("baseline systemInstruction = %q, want %q", got, DefaultAntigravitySystemInstructionBaseline)
+	}
+	if got := ojson.GetBytes(out, "request.contents.0.parts.0.text").String(); got != "<system-instructions>\nCaller system prompt\n</system-instructions>" {
+		t.Fatalf("relocated part 0 = %q", got)
+	}
+	if got := ojson.GetBytes(out, "request.contents.0.parts.1.text").String(); got != "<USER_REQUEST>\nhello\n</USER_REQUEST>" {
+		t.Fatalf("original user part 1 = %q", got)
+	}
+	// Idempotent when invoked again.
+	again := RelocateAntigravitySystemInstructionToUser(out, "")
+	if got := len(ojson.GetBytes(again, "request.contents.0.parts").Array()); got != 2 {
+		t.Fatalf("expected idempotent 2 parts, got %d: %s", got, again)
+	}
+
+	// Custom baseline & skips leading functionResponse turn if present.
+	customIn := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"Custom caller"}]},"contents":[{"role":"user","parts":[{"functionResponse":{"name":"t","response":{"output":"ok"}}}]},{"role":"user","parts":[{"text":"real prompt"}]}]}}`)
+	customOut := RelocateAntigravitySystemInstructionToUser(customIn, "Short custom baseline.")
+	if got := ojson.GetBytes(customOut, "request.systemInstruction.parts.0.text").String(); got != "Short custom baseline." {
+		t.Fatalf("custom baseline = %q", got)
+	}
+	if got := len(ojson.GetBytes(customOut, "request.contents.0.parts").Array()); got != 1 {
+		t.Fatalf("expected functionResponse turn untouched, got %s", customOut)
+	}
+	if got := ojson.GetBytes(customOut, "request.contents.1.parts.0.text").String(); got != "<system-instructions>\nCustom caller\n</system-instructions>" {
+		t.Fatalf("relocated into contents.1 = %q", got)
+	}
+	if got := ojson.GetBytes(customOut, "request.contents.1.parts.1.text").String(); got != "real prompt" {
+		t.Fatalf("original contents.1.parts.1 = %q", got)
+	}
+
+	// Distinct <system-instructions> block already in user turn must NOT drop caller systemInstruction.
+	existingTagIn := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"Always reply in JSON."}]},"contents":[{"role":"user","parts":[{"text":"<system-instructions>\nrepo rule\n</system-instructions>"},{"text":"Fix main.go"}]}]}}`)
+	existingTagOut := RelocateAntigravitySystemInstructionToUser(existingTagIn, "")
+	if got := ojson.GetBytes(existingTagOut, "request.contents.0.parts.0.text").String(); got != "<system-instructions>\nAlways reply in JSON.\n</system-instructions>" {
+		t.Fatalf("distinct tag relocated part 0 = %q", got)
+	}
+	if got := ojson.GetBytes(existingTagOut, "request.contents.0.parts.1.text").String(); got != "<system-instructions>\nrepo rule\n</system-instructions>" {
+		t.Fatalf("distinct tag preserved existing part 1 = %q", got)
+	}
+
+	// String-valued systemInstruction must be relocated rather than overwritten.
+	strSysIn := []byte(`{"request":{"systemInstruction":"Plain string system prompt","contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`)
+	strSysOut := RelocateAntigravitySystemInstructionToUser(strSysIn, "")
+	if got := ojson.GetBytes(strSysOut, "request.systemInstruction.parts.0.text").String(); got != DefaultAntigravitySystemInstructionBaseline {
+		t.Fatalf("string systemInstruction baseline = %q", got)
+	}
+	if got := ojson.GetBytes(strSysOut, "request.contents.0.parts.0.text").String(); got != "<system-instructions>\nPlain string system prompt\n</system-instructions>" {
+		t.Fatalf("string systemInstruction relocated = %q", got)
+	}
+
+	// Non-text parts (e.g. inlineData) in systemInstruction must leave payload unchanged instead of dropping media.
+	mediaSysIn := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"Look at image"},{"inlineData":{"mimeType":"image/png","data":"AA=="}}]},"contents":[{"role":"user","parts":[{"text":"describe"}]}]}}`)
+	mediaSysOut := RelocateAntigravitySystemInstructionToUser(mediaSysIn, "")
+	if string(mediaSysOut) != string(mediaSysIn) {
+		t.Fatalf("non-text systemInstruction was modified: %s", mediaSysOut)
+	}
+}

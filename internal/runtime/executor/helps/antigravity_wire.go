@@ -2566,6 +2566,145 @@ func buildAntigravityStringReplacer(replacements map[string]string) *strings.Rep
 	return strings.NewReplacer(pairs...)
 }
 
+// DefaultAntigravitySystemInstructionBaseline is the short, non-conflicting
+// Antigravity identity preamble sent in request.systemInstruction when
+// antigravity.move-system-instruction-to-user is enabled.
+const DefaultAntigravitySystemInstructionBaseline = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding."
+
+// RelocateAntigravitySystemInstructionToUser moves caller systemInstruction text
+// into the first non-functionResponse user turn in request.contents (wrapped in
+// <system-instructions>...</system-instructions> as a leading text part) and
+// replaces request.systemInstruction with a clean baseline prompt.
+//
+// It is idempotent and leaves payload unchanged if request.contents has no
+// non-functionResponse user turn to receive the relocated instructions.
+func RelocateAntigravitySystemInstructionToUser(payload []byte, baseline string) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	baseText := strings.TrimSpace(baseline)
+	if baseText == "" {
+		baseText = DefaultAntigravitySystemInstructionBaseline
+	}
+
+	var callerParts []string
+	hasNonTextPart := false
+	for _, path := range []string{"request.systemInstruction", "request.system_instruction"} {
+		sys := ojson.GetBytes(payload, path)
+		if !sys.Exists() {
+			continue
+		}
+		if sys.Type == ojson.String {
+			if txt := strings.TrimSpace(sys.String()); txt != "" {
+				callerParts = append(callerParts, txt)
+			}
+			break
+		}
+		if !sys.IsObject() {
+			continue
+		}
+		parts := sys.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		parts.ForEach(func(_, part ojson.Result) bool {
+			if !part.IsObject() || part.Get("text").Type != ojson.String {
+				hasNonTextPart = true
+				return false
+			}
+			if txt := strings.TrimSpace(part.Get("text").String()); txt != "" {
+				callerParts = append(callerParts, txt)
+			}
+			return true
+		})
+		if hasNonTextPart {
+			return payload
+		}
+		if len(callerParts) > 0 {
+			break
+		}
+	}
+	callerText := strings.Join(callerParts, "\n\n")
+
+	setBaseline := func(doc []byte) []byte {
+		baseObj, errMarshal := marshalAntigravityJSONNoEscape(map[string]any{
+			"role":  "user",
+			"parts": []map[string]string{{"text": baseText}},
+		})
+		if errMarshal != nil {
+			return doc
+		}
+		updated, errSet := ojson.SetRawBytes(doc, "request.systemInstruction", baseObj)
+		if errSet != nil {
+			return doc
+		}
+		updated, _ = ojson.DeleteBytes(updated, "request.system_instruction")
+		return updated
+	}
+
+	if callerText == "" || callerText == baseText {
+		return setBaseline(payload)
+	}
+
+	wrappedText := "<system-instructions>\n" + callerText + "\n</system-instructions>"
+	contents := ojson.GetBytes(payload, "request.contents")
+	if !contents.IsArray() {
+		return payload
+	}
+	targetIdx := -1
+	var existingParts []json.RawMessage
+	alreadyRelocated := false
+	contents.ForEach(func(ci, content ojson.Result) bool {
+		if !strings.EqualFold(content.Get("role").String(), "user") {
+			return true
+		}
+		if antigravityContentHasFunctionResponse(content) {
+			return true
+		}
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			return true
+		}
+		targetIdx = int(ci.Int())
+		parts.ForEach(func(pi, part ojson.Result) bool {
+			if pi.Int() == 0 && part.Get("text").Type == ojson.String && strings.TrimSpace(part.Get("text").String()) == wrappedText {
+				alreadyRelocated = true
+			}
+			existingParts = append(existingParts, json.RawMessage(part.Raw))
+			return true
+		})
+		return false
+	})
+	if targetIdx < 0 {
+		return payload
+	}
+
+	out := setBaseline(payload)
+	if alreadyRelocated {
+		return out
+	}
+
+	relocatedPart, errPart := marshalAntigravityJSONNoEscape(map[string]string{
+		"text": wrappedText,
+	})
+	if errPart != nil {
+		return payload
+	}
+	newParts := make([]json.RawMessage, 0, len(existingParts)+1)
+	newParts = append(newParts, json.RawMessage(relocatedPart))
+	newParts = append(newParts, existingParts...)
+	newPartsJSON, errParts := marshalAntigravityJSONNoEscape(newParts)
+	if errParts != nil {
+		return payload
+	}
+	partsPath := fmt.Sprintf("request.contents.%d.parts", targetIdx)
+	updated, errSet := ojson.SetRawBytes(out, partsPath, newPartsJSON)
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
 // ApplyAntigravitySystemPromptReplacements applies deterministic plain-text
 // substring replacements (longest key first, no zero-width characters) to
 // request.systemInstruction (and snake_case request.system_instruction).

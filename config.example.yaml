@@ -1330,6 +1330,8 @@ oauth:
       #   "ampcode.com": "example.com"
       # tool-description-replacements: # optional: deterministic plain-ASCII replacements in tool and schema description strings only (preserves tool/property names)
       #   "an Amp thread": "a session thread"
+      # move-system-instruction-to-user: false # optional: move caller request.systemInstruction into the first user message and set a clean agy baseline in request.systemInstruction
+      # system-instruction-baseline: ""        # optional: custom baseline systemInstruction text used when move-system-instruction-to-user is true (empty uses the default short agy preamble)
       # stop-on-bare-429: true        # optional: stop retrying/rotating on bare/signal-less 429 responses without cooling the credential (default: true when omitted)
       # max-concurrent-requests: 0    # optional: per-credential maximum concurrent in-flight Antigravity requests (<= 0 disables the cap)
       # max-rpm: 0                    # optional: per-credential sliding-window maximum Antigravity requests per minute (<= 0 disables the cap)

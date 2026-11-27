@@ -328,6 +328,9 @@ func (e *AntigravityExecutor) buildPreparedRequest(ctx context.Context, auth *cl
 	isImageModel := strings.Contains(strings.ToLower(modelName), "image") || strings.EqualFold(strings.TrimSpace(ojson.GetBytes(payload, "requestType").String()), "image_gen")
 	isWebSearch := strings.EqualFold(strings.TrimSpace(ojson.GetBytes(payload, "requestType").String()), "web_search")
 
+	if e.cfg != nil && e.cfg.Antigravity.MoveSystemInstructionToUser && !isImageModel && !isWebSearch {
+		payload = helps.RelocateAntigravitySystemInstructionToUser(payload, e.cfg.Antigravity.SystemInstructionBaseline)
+	}
 	if !strings.Contains(strings.ToLower(modelName), "claude") {
 		payload = helps.NormalizeAntigravityToolCallIDs(payload)
 	}

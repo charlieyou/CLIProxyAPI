@@ -1893,3 +1893,87 @@ func TestAntigravityBuildPreparedRequest_NormalizesFunctionResponseResultToOutpu
 		}
 	}
 }
+
+func TestAntigravityBuildRequest_MoveSystemInstructionToUser(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	executor := &AntigravityExecutor{
+		cfg: &config.Config{
+			Antigravity: config.AntigravityConfig{
+				SystemPromptReplacements:    map[string]string{"Amp": "the assistant"},
+				MoveSystemInstructionToUser: true,
+			},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "ag-move-sys-test",
+		Provider: "antigravity",
+		Metadata: map[string]any{"project_id": "proj-move-sys"},
+	}
+
+	turn1Payload := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"You are Amp, a coding agent."}]},"contents":[{"role":"user","parts":[{"text":"Fix the bug"}]}]}}`)
+	prepared1, err1 := executor.buildPreparedRequest(context.Background(), auth, "tok-1", "gemini-4-neon-high", turn1Payload, true, "", antigravityBaseURLDaily, "", "")
+	if err1 != nil {
+		t.Fatalf("turn 1 buildPreparedRequest() error = %v", err1)
+	}
+
+	turn2Payload := []byte(`{"request":{"systemInstruction":{"role":"user","parts":[{"text":"You are Amp, a coding agent."}]},"contents":[{"role":"user","parts":[{"text":"Fix the bug"}]},{"role":"model","parts":[{"text":"Done."}]},{"role":"user","parts":[{"text":"Now add a test"}]}]}}`)
+	prepared2, err2 := executor.buildPreparedRequest(context.Background(), auth, "tok-1", "gemini-4-neon-high", turn2Payload, true, "", antigravityBaseURLDaily, "", "")
+	if err2 != nil {
+		t.Fatalf("turn 2 buildPreparedRequest() error = %v", err2)
+	}
+
+	// Baseline in systemInstruction, scrubbed caller prompt in contents.0.parts.0, wrapped user prompt in contents.0.parts.1.
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "turn1", body: prepared1.bodyBytes},
+		{name: "turn2", body: prepared2.bodyBytes},
+	} {
+		if got := ojson.GetBytes(tc.body, "request.systemInstruction.parts.0.text").String(); got != helps.DefaultAntigravitySystemInstructionBaseline {
+			t.Fatalf("%s systemInstruction = %q, want default baseline", tc.name, got)
+		}
+		if got := ojson.GetBytes(tc.body, "request.contents.0.parts.0.text").String(); got != "<system-instructions>\nYou are the assistant, a coding agent.\n</system-instructions>" {
+			t.Fatalf("%s relocated system part = %q", tc.name, got)
+		}
+		userPart := ojson.GetBytes(tc.body, "request.contents.0.parts.1.text").String()
+		if !strings.HasPrefix(userPart, "<USER_REQUEST>") || !strings.Contains(userPart, "Fix the bug") {
+			t.Fatalf("%s user part = %q, want wrapped Fix the bug", tc.name, userPart)
+		}
+	}
+
+	// Stable root fingerprint keeps sessionId and trajectory_id identical across turns 1 and 2.
+	sess1 := ojson.GetBytes(prepared1.bodyBytes, "request.sessionId").String()
+	sess2 := ojson.GetBytes(prepared2.bodyBytes, "request.sessionId").String()
+	if sess1 == "" || sess1 != sess2 {
+		t.Fatalf("sessionId drifted across turns: turn1=%q turn2=%q", sess1, sess2)
+	}
+	if prepared1.trajectoryID == "" || prepared1.trajectoryID != prepared2.trajectoryID {
+		t.Fatalf("trajectoryID drifted across turns: turn1=%q turn2=%q", prepared1.trajectoryID, prepared2.trajectoryID)
+	}
+
+	// web_search requests must NOT have their search system prompt overwritten or relocated.
+	wsPayload := []byte(`{"requestType":"web_search","request":{"systemInstruction":{"role":"user","parts":[{"text":"You are a search engine bot."}]},"contents":[{"role":"user","parts":[{"text":"weather in nyc"}]}]}}`)
+	wsPrepared, errWS := executor.buildPreparedRequest(context.Background(), auth, "tok-1", "gemini-4-neon-high", wsPayload, true, "", antigravityBaseURLDaily, "", "")
+	if errWS != nil {
+		t.Fatalf("web_search buildPreparedRequest() error = %v", errWS)
+	}
+	if got := ojson.GetBytes(wsPrepared.bodyBytes, "request.systemInstruction.parts.0.text").String(); got != "You are a search engine bot." {
+		t.Fatalf("web_search systemInstruction = %q, want untouched search prompt", got)
+	}
+	if got := len(ojson.GetBytes(wsPrepared.bodyBytes, "request.contents.0.parts").Array()); got != 1 {
+		t.Fatalf("web_search contents.0.parts len = %d, want 1", got)
+	}
+
+	// image_gen requests must NOT get an injected coding-assistant systemInstruction.
+	imgPayload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"a red fox"}]}]}}`)
+	imgPrepared, errImg := executor.buildPreparedRequest(context.Background(), auth, "tok-1", "gemini-3.1-flash-image", imgPayload, false, "", antigravityBaseURLDaily, "", "")
+	if errImg != nil {
+		t.Fatalf("image_gen buildPreparedRequest() error = %v", errImg)
+	}
+	if ojson.GetBytes(imgPrepared.bodyBytes, "request.systemInstruction").Exists() {
+		t.Fatalf("image_gen unexpectedly received systemInstruction: %s", ojson.GetBytes(imgPrepared.bodyBytes, "request.systemInstruction").Raw)
+	}
+}

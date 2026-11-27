@@ -290,6 +290,15 @@ type AntigravityConfig struct {
 	// mutating tool names, property keys, enums, defaults, or other schema fields.
 	ToolDescriptionReplacements map[string]string `yaml:"tool-description-replacements,omitempty" json:"tool-description-replacements,omitempty"`
 
+	// MoveSystemInstructionToUser moves caller request.systemInstruction into the
+	// first user message and sets a clean agy baseline in request.systemInstruction.
+	MoveSystemInstructionToUser bool `yaml:"move-system-instruction-to-user,omitempty" json:"move-system-instruction-to-user,omitempty"`
+
+	// SystemInstructionBaseline is an optional custom baseline systemInstruction
+	// text used when move-system-instruction-to-user is true (defaults to the short
+	// agy preamble when empty).
+	SystemInstructionBaseline string `yaml:"system-instruction-baseline,omitempty" json:"system-instruction-baseline,omitempty"`
+
 	// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
 

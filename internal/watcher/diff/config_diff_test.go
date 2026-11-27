@@ -435,6 +435,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			SensitiveWords:              []string{"old-word"},
 			SystemPromptReplacements:    map[string]string{"Old": "New"},
 			ToolDescriptionReplacements: map[string]string{"OldTool": "NewTool"},
+			MoveSystemInstructionToUser: false,
+			SystemInstructionBaseline:   "old",
 			StopOnBare429:               &oldStopOnBare429,
 			MaxConcurrentRequests:       1,
 			MaxRPM:                      10,
@@ -472,6 +474,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			SensitiveWords:              []string{"new-word-1", "new-word-2"},
 			SystemPromptReplacements:    map[string]string{"A": "B", "C": "D"},
 			ToolDescriptionReplacements: map[string]string{"T1": "R1", "T2": "R2"},
+			MoveSystemInstructionToUser: true,
+			SystemInstructionBaseline:   "newer-baseline",
 			StopOnBare429:               &newStopOnBare429,
 			MaxConcurrentRequests:       4,
 			MaxRPM:                      60,
@@ -532,6 +536,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
 	expectContains(t, details, "antigravity.system-prompt-replacements: 1 -> 2")
 	expectContains(t, details, "antigravity.tool-description-replacements: 1 -> 2")
+	expectContains(t, details, "antigravity.move-system-instruction-to-user: false -> true")
+	expectContains(t, details, "antigravity.system-instruction-baseline: len 3 -> 14")
 	expectContains(t, details, "antigravity.stop-on-bare-429: false -> true")
 	expectContains(t, details, "antigravity.max-concurrent-requests: 1 -> 4")
 	expectContains(t, details, "antigravity.max-rpm: 10 -> 60")
