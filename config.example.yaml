@@ -1336,6 +1336,8 @@ oauth:
       #   "an Amp thread": "a session thread"
       # stop-on-bare-429: false       # optional: on a bare 429 (no ErrorInfo reason, RetryInfo, or Retry-After) return it to the client
                                     # without cooling the credential or rotating to other credentials (default: false = cool down and rotate)
+      # max-concurrent-requests: 0    # optional: per-credential cap on concurrent in-flight Antigravity requests; extra requests wait (<= 0 disables, default)
+      # max-rpm: 0                    # optional: per-credential sliding 60s window cap on Antigravity requests; extra requests wait (<= 0 disables, default)
       # connection-pool:              # optional: upstream HTTP connection pool settings
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)

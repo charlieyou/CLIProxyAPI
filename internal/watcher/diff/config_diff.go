@@ -132,6 +132,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Antigravity.StopOnBare429 != newCfg.Antigravity.StopOnBare429 {
 		changes = append(changes, fmt.Sprintf("antigravity.stop-on-bare-429: %t -> %t", oldCfg.Antigravity.StopOnBare429, newCfg.Antigravity.StopOnBare429))
 	}
+	if oldCfg.Antigravity.MaxConcurrentRequests != newCfg.Antigravity.MaxConcurrentRequests {
+		changes = append(changes, fmt.Sprintf("antigravity.max-concurrent-requests: %d -> %d", oldCfg.Antigravity.MaxConcurrentRequests, newCfg.Antigravity.MaxConcurrentRequests))
+	}
+	if oldCfg.Antigravity.MaxRPM != newCfg.Antigravity.MaxRPM {
+		changes = append(changes, fmt.Sprintf("antigravity.max-rpm: %d -> %d", oldCfg.Antigravity.MaxRPM, newCfg.Antigravity.MaxRPM))
+	}
 	if !reflect.DeepEqual(oldCfg.Devin.SensitiveWords, newCfg.Devin.SensitiveWords) {
 		changes = append(changes, fmt.Sprintf("devin.sensitive-words: %d -> %d", len(oldCfg.Devin.SensitiveWords), len(newCfg.Devin.SensitiveWords)))
 	}

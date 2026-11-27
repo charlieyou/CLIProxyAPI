@@ -123,6 +123,12 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	translated = requestPayload
 	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
 
+	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth)
+	if errLimit != nil {
+		err = errLimit
+		return resp, err
+	}
+	defer releaseRateLimit()
 	httpReq = helps.WithLatencyDiagnosticTrace(httpReq)
 	emitAntigravityUpstreamAttempt(ctx, auth, selection.ID, false, useCredits)
 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
@@ -329,6 +335,12 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	translated = requestPayload
 	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
 
+	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth)
+	if errLimit != nil {
+		err = errLimit
+		return resp, err
+	}
+	defer releaseRateLimit()
 	httpReq = helps.WithLatencyDiagnosticTrace(httpReq)
 	emitAntigravityUpstreamAttempt(ctx, auth, selection.ID, true, useCredits)
 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)

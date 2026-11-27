@@ -969,6 +969,16 @@ func antigravityAuthID(auth *cliproxyauth.Auth) string {
 	return strings.TrimSpace(auth.ID)
 }
 
+// acquireAntigravityRateLimit waits for the optional per-credential
+// antigravity.max-concurrent-requests and antigravity.max-rpm caps. The
+// returned release function must be called once the upstream exchange ends.
+func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, auth *cliproxyauth.Auth) (func(), error) {
+	if e == nil || e.cfg == nil {
+		return func() {}, nil
+	}
+	return helps.AcquireAntigravityRateLimit(ctx, antigravityTransportScope(auth), e.cfg.Antigravity.MaxConcurrentRequests, e.cfg.Antigravity.MaxRPM)
+}
+
 const (
 	antigravitySignatureGrantScopeMetadataKey       = "cpa_signature_cache_grant"
 	antigravitySignatureGrantBindingMetadataKey     = "cpa_signature_cache_grant_binding"

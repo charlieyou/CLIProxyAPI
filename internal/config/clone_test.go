@@ -589,3 +589,37 @@ func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
 		t.Fatalf("Antigravity.StopOnBare429 after migration = false, want true\n%s", migrated)
 	}
 }
+
+func TestParseConfigBytes_AntigravityRateLimits(t *testing.T) {
+	for name, raw := range map[string]string{
+		"legacy": "antigravity:\n  max-concurrent-requests: 2\n  max-rpm: 30\n",
+		"v8":     "config-version: 8\noauth:\n  providers:\n    antigravity:\n      max-concurrent-requests: 2\n      max-rpm: 30\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "v8" {
+				if errValidate := ValidateV8Config([]byte(raw)); errValidate != nil {
+					t.Fatalf("ValidateV8Config() error = %v", errValidate)
+				}
+			}
+			cfg, errParse := ParseConfigBytes([]byte(raw))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if cfg.Antigravity.MaxConcurrentRequests != 2 || cfg.Antigravity.MaxRPM != 30 {
+				t.Fatalf("Antigravity rate limits = (%d, %d), want (2, 30)", cfg.Antigravity.MaxConcurrentRequests, cfg.Antigravity.MaxRPM)
+			}
+			cloned := cfg.CloneForRuntime()
+			if cloned.Antigravity.MaxConcurrentRequests != 2 || cloned.Antigravity.MaxRPM != 30 {
+				t.Fatalf("cloned Antigravity rate limits = (%d, %d), want (2, 30)", cloned.Antigravity.MaxConcurrentRequests, cloned.Antigravity.MaxRPM)
+			}
+		})
+	}
+
+	cfg, errParse := ParseConfigBytes([]byte("antigravity:\n  sensitive-words: [\"API\"]\n"))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	if cfg.Antigravity.MaxConcurrentRequests != 0 || cfg.Antigravity.MaxRPM != 0 {
+		t.Fatalf("default Antigravity rate limits = (%d, %d), want disabled (0, 0)", cfg.Antigravity.MaxConcurrentRequests, cfg.Antigravity.MaxRPM)
+	}
+}

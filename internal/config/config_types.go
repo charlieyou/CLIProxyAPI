@@ -300,6 +300,16 @@ type AntigravityConfig struct {
 	// without cooling the credential. Defaults to false (upstream cooldown and
 	// rotation) when omitted.
 	StopOnBare429 bool `yaml:"stop-on-bare-429,omitempty" json:"stop-on-bare-429,omitempty"`
+
+	// MaxConcurrentRequests caps concurrent in-flight Antigravity inference
+	// requests per credential; additional requests wait for a free slot.
+	// Zero or a negative value disables the cap (default).
+	MaxConcurrentRequests int `yaml:"max-concurrent-requests,omitempty" json:"max-concurrent-requests,omitempty"`
+
+	// MaxRPM caps Antigravity inference requests per credential within a
+	// sliding 60-second window; additional requests wait until the window
+	// admits them. Zero or a negative value disables the cap (default).
+	MaxRPM int `yaml:"max-rpm,omitempty" json:"max-rpm,omitempty"`
 }
 
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.

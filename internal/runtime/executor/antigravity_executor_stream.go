@@ -121,6 +121,17 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	}
 	translated = requestPayload
 	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
+	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth)
+	if errLimit != nil {
+		err = errLimit
+		return nil, err
+	}
+	streamOwnsRelease := false
+	defer func() {
+		if !streamOwnsRelease {
+			releaseRateLimit()
+		}
+	}()
 	httpReq = helps.WithLatencyDiagnosticTrace(httpReq)
 	emitAntigravityUpstreamAttempt(ctx, auth, selection.ID, true, useCredits)
 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate_stream").Do(httpReq)
@@ -166,7 +177,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	replayAccumulator := newAntigravityReasoningReplayAccumulator(replayScope, replayRequestPayload)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	stopDeliverySupport := usage.SupportStreamDelivery(ctx)
+	streamOwnsRelease = true
 	go func(resp *http.Response) {
+		defer releaseRateLimit()
 		defer func() {
 			if errClose := resp.Body.Close(); errClose != nil {
 				log.Errorf("antigravity executor: close response line error: %v", errClose)
@@ -206,6 +219,12 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				}
 			}
 			close(out)
+			// The upstream exchange is over; close it and free the slot before
+			// waiting on the HTTP consumer, which may retry on this credential first.
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("antigravity executor: close response body error: %v", errClose)
+			}
+			releaseRateLimit()
 			if translatedErrorStopped {
 				return
 			}
