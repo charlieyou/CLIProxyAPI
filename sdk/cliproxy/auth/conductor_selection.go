@@ -3403,6 +3403,11 @@ func (m *Manager) annotatePoolCooldownTerminalErrorAt(ctx context.Context, provi
 	if statusCodeFromError(lastErr) != http.StatusTooManyRequests {
 		return lastErr
 	}
+	// The fork's agy build (main e29156a5e) returns an Antigravity 429 as is,
+	// without a pool-wide recovery deadline or a derived Retry-After header.
+	if isAntigravityProviderName(upstreamAttemptProviderFromError(lastErr)) || allAntigravityProviders(providers) {
+		return lastErr
+	}
 	var marker interface{ IsModelCooldown() bool }
 	if errors.As(lastErr, &marker) && marker != nil && marker.IsModelCooldown() {
 		return lastErr
@@ -3423,6 +3428,18 @@ func (m *Manager) annotatePoolCooldownTerminalErrorAt(ctx context.Context, provi
 		return lastErr
 	}
 	return &poolCooldownTerminalError{cause: lastErr, deadline: deadline}
+}
+
+func allAntigravityProviders(providers []string) bool {
+	if len(providers) == 0 {
+		return false
+	}
+	for _, provider := range providers {
+		if !isAntigravityProviderName(provider) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, err error) {

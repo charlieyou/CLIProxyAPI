@@ -5518,72 +5518,14 @@
       ]
     },
     {
-      "id": "claude-opus-5-5-high",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "display_name": "Claude Opus 5.5 (High)",
-      "name": "claude-opus-5-5-high",
-      "description": "Claude Opus 5.5 (High)",
-      "context_length": 1000000,
-      "max_completion_tokens": 128000,
-      "thinking": {
-        "min": 1024,
-        "max": 64000,
-        "zero_allowed": true,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ]
-    },
-    {
-      "id": "claude-sonnet-5-5-high",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "display_name": "Claude Sonnet 5.5 (High)",
-      "name": "claude-sonnet-5-5-high",
-      "description": "Claude Sonnet 5.5 (High)",
-      "context_length": 1000000,
-      "max_completion_tokens": 128000,
-      "thinking": {
-        "min": 1024,
-        "max": 64000,
-        "zero_allowed": true,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ]
-    },
-    {
-      "id": "gemini-4-argon-high",
+      "id": "gemini-3.6-flash-high",
       "object": "model",
       "owned_by": "antigravity",
       "type": "antigravity",
       "supports_web_search": true,
-      "display_name": "Gemini 4 Argon",
-      "name": "gemini-4-argon-high",
-      "description": "Gemini 4 Argon (High)",
+      "display_name": "Gemini 3.6 Flash",
+      "name": "gemini-3.6-flash-high",
+      "description": "Gemini 3.6 Flash (High)",
       "context_length": 1048576,
       "max_completion_tokens": 65536,
       "thinking": {
@@ -5591,6 +5533,7 @@
         "max": 65535,
         "dynamic_allowed": true,
         "levels": [
+          "minimal",
           "low",
           "medium",
           "high"
@@ -5610,14 +5553,14 @@
       }
     },
     {
-      "id": "gemini-4-carbon-high",
+      "id": "gemini-3.7-flash-high",
       "object": "model",
       "owned_by": "antigravity",
       "type": "antigravity",
       "supports_web_search": true,
-      "display_name": "Gemini 4 Carbon",
-      "name": "gemini-4-carbon-high",
-      "description": "Gemini 4 Carbon (High)",
+      "display_name": "Gemini 3.7 Flash",
+      "name": "gemini-3.7-flash-high",
+      "description": "Gemini 3.7 Flash (High)",
       "context_length": 1048576,
       "max_completion_tokens": 65536,
       "thinking": {
@@ -5628,76 +5571,6 @@
           "low",
           "medium",
           "high"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "audio",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ],
-      "native_capabilities": {
-        "web_search": true
-      }
-    },
-    {
-      "id": "gemini-4-hydrogen-xhigh",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "supports_web_search": true,
-      "display_name": "Gemini 4 Hydrogen",
-      "name": "gemini-4-hydrogen-xhigh",
-      "description": "Gemini 4 Hydrogen (XHigh)",
-      "context_length": 1048576,
-      "max_completion_tokens": 65536,
-      "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "audio",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ],
-      "native_capabilities": {
-        "web_search": true
-      }
-    },
-    {
-      "id": "gemini-4-neon-xhigh",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "supports_web_search": true,
-      "display_name": "Gemini 4 Neon",
-      "name": "gemini-4-neon-xhigh",
-      "description": "Gemini 4 Neon (XHigh)",
-      "context_length": 1048576,
-      "max_completion_tokens": 65536,
-      "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh"
         ]
       },
       "supportedInputModalities": [
@@ -5722,40 +5595,6 @@
       "display_name": "Gemini 3.8 Flash",
       "name": "gemini-3.8-flash-high",
       "description": "Gemini 3.8 Flash (High)",
-      "context_length": 1048576,
-      "max_completion_tokens": 65536,
-      "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "audio",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ],
-      "native_capabilities": {
-        "web_search": true
-      }
-    },
-    {
-      "id": "gemini-3.8-flash-tiered",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "supports_web_search": true,
-      "display_name": "Gemini 3.8 Flash (Tiered)",
-      "name": "gemini-3.8-flash-tiered",
-      "description": "Gemini 3.8 Flash (Tiered)",
       "context_length": 1048576,
       "max_completion_tokens": 65536,
       "thinking": {
@@ -5847,6 +5686,74 @@
       }
     },
     {
+      "id": "gemini-pro-agent",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "supports_web_search": true,
+      "display_name": "Gemini 3.1 Pro (High)",
+      "name": "gemini-pro-agent",
+      "description": "Gemini 3.1 Pro (High)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65535,
+      "thinking": {
+        "min": 1,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "supports_web_search": true,
+      "display_name": "Gemini 3.1 Pro (Low)",
+      "name": "gemini-3.1-pro-low",
+      "description": "Gemini 3.1 Pro (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65535,
+      "thinking": {
+        "min": 1,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      }
+    },
+    {
       "id": "gpt-oss-120b-medium",
       "object": "model",
       "owned_by": "antigravity",
@@ -5929,10 +5836,938 @@
       ],
       "supportedOutputModalities": [
         "text"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 3.8 Flash",
+      "name": "gemini-3.8-flash",
+      "description": "Gemini 3.8 Flash",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
       ],
-      "native_capabilities": {
-        "web_search": true
-      }
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 3.8 Flash (Low)",
+      "name": "gemini-3.8-flash-low",
+      "description": "Gemini 3.8 Flash (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 3.8 Flash (Medium)",
+      "name": "gemini-3.8-flash-medium",
+      "description": "Gemini 3.8 Flash (Medium)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-neon",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Neon",
+      "name": "gemini-4-neon",
+      "description": "Gemini 4 Neon",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-neon-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Neon (Low)",
+      "name": "gemini-4-neon-low",
+      "description": "Gemini 4 Neon (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-neon-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Neon (Medium)",
+      "name": "gemini-4-neon-medium",
+      "description": "Gemini 4 Neon (Medium)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-neon-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Neon (High)",
+      "name": "gemini-4-neon-high",
+      "description": "Gemini 4 Neon (High)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-neon-xhigh",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Neon (XHigh)",
+      "name": "gemini-4-neon-xhigh",
+      "description": "Gemini 4 Neon (XHigh)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-carbon",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Carbon",
+      "name": "gemini-4-carbon",
+      "description": "Gemini 4 Carbon",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 128,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-carbon-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Carbon (Low)",
+      "name": "gemini-4-carbon-low",
+      "description": "Gemini 4 Carbon (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 128,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-carbon-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Carbon (Medium)",
+      "name": "gemini-4-carbon-medium",
+      "description": "Gemini 4 Carbon (Medium)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 128,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-carbon-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Carbon (High)",
+      "name": "gemini-4-carbon-high",
+      "description": "Gemini 4 Carbon (High)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 128,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Argon",
+      "name": "gemini-4-argon",
+      "description": "Gemini 4 Argon",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Argon (Low)",
+      "name": "gemini-4-argon-low",
+      "description": "Gemini 4 Argon (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Argon (Medium)",
+      "name": "gemini-4-argon-medium",
+      "description": "Gemini 4 Argon (Medium)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Argon (High)",
+      "name": "gemini-4-argon-high",
+      "description": "Gemini 4 Argon (High)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Hydrogen",
+      "name": "gemini-4-hydrogen",
+      "description": "Gemini 4 Hydrogen",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Hydrogen (Low)",
+      "name": "gemini-4-hydrogen-low",
+      "description": "Gemini 4 Hydrogen (Low)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Hydrogen (Medium)",
+      "name": "gemini-4-hydrogen-medium",
+      "description": "Gemini 4 Hydrogen (Medium)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Hydrogen (High)",
+      "name": "gemini-4-hydrogen-high",
+      "description": "Gemini 4 Hydrogen (High)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen-xhigh",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 4 Hydrogen (XHigh)",
+      "name": "gemini-4-hydrogen-xhigh",
+      "description": "Gemini 4 Hydrogen (XHigh)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-pro-orchestrator-neon",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Orchestrator (Neon)",
+      "name": "gemini-pro-orchestrator-neon",
+      "description": "Orchestrator (Neon)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-pro-orchestrator",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Orchestrator (Carbon)",
+      "name": "gemini-pro-orchestrator",
+      "description": "Orchestrator (Carbon)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "thinking": {
+        "min": 128,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-pro-orchestrator-argon",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Orchestrator (Argon)",
+      "name": "gemini-pro-orchestrator-argon",
+      "description": "Orchestrator (Argon)",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 32,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 5.5",
+      "name": "claude-opus-5-5",
+      "description": "Claude Opus 5.5",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 5.5 (Low)",
+      "name": "claude-opus-5-5-low",
+      "description": "Claude Opus 5.5 (Low)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 5.5 (Medium)",
+      "name": "claude-opus-5-5-medium",
+      "description": "Claude Opus 5.5 (Medium)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 5.5 (High)",
+      "name": "claude-opus-5-5-high",
+      "description": "Claude Opus 5.5 (High)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Sonnet 5.5",
+      "name": "claude-sonnet-5-5",
+      "description": "Claude Sonnet 5.5",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-low",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Sonnet 5.5 (Low)",
+      "name": "claude-sonnet-5-5-low",
+      "description": "Claude Sonnet 5.5 (Low)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-medium",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Sonnet 5.5 (Medium)",
+      "name": "claude-sonnet-5-5-medium",
+      "description": "Claude Sonnet 5.5 (Medium)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-high",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Sonnet 5.5 (High)",
+      "name": "claude-sonnet-5-5-high",
+      "description": "Claude Sonnet 5.5 (High)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     }
   ],
   "xai": [

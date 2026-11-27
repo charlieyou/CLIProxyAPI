@@ -10,6 +10,7 @@ import (
 	"time"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -354,7 +355,7 @@ func DeleteCachedSignatureRequired(ctx context.Context, modelName, text string) 
 
 // HasValidSignature checks if a signature is valid (non-empty and long enough)
 func HasValidSignature(modelName, signature string) bool {
-	return (signature != "" && len(signature) >= MinValidSignatureLen) || (signature == "skip_thought_signature_validator" && GetModelGroup(modelName) == "gemini")
+	return (signature != "" && len(signature) >= MinValidSignatureLen) || (internalsignature.IsAntigravityThoughtSignatureBypass(signature) && GetModelGroup(modelName) == "gemini")
 }
 
 func GetModelGroup(modelName string) string {

@@ -251,11 +251,11 @@ func TestPrepareRequestAuthTransportErrorKeepsRotating(t *testing.T) {
 	}
 }
 
-// TestPrepareRequestAuthStopPreservesRetryAfterHeader verifies that when a
-// request-scoped stop rule matches an upstream 429 from PrepareRequestAuth, the
-// returned stop error still exposes the trusted Retry-After header so the
-// client receives the provider-supplied recovery deadline.
-func TestPrepareRequestAuthStopPreservesRetryAfterHeader(t *testing.T) {
+// TestPrepareRequestAuthStopOnAntigravityHasNoDerivedRetryAfter verifies that a
+// request-scoped stop rule matching an upstream 429 from PrepareRequestAuth
+// stops rotation. The credential is Antigravity, so, as in the agy build, the
+// stop error carries no trusted Retry-After derived from the executor hint.
+func TestPrepareRequestAuthStopOnAntigravityHasNoDerivedRetryAfter(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
@@ -283,8 +283,8 @@ func TestPrepareRequestAuthStopPreservesRetryAfterHeader(t *testing.T) {
 	if got := executor.prepareCalls.Load(); got != 1 {
 		t.Fatalf("prepare calls = %d, want 1 (request-scoped stop must prevent rotation)", got)
 	}
-	if hdr := SafeResponseHeaders(errExecute).Get("Retry-After"); hdr == "" {
-		t.Fatalf("expected Retry-After header on stop error, headers=%v", SafeResponseHeaders(errExecute))
+	if hdr := SafeResponseHeaders(errExecute).Get("Retry-After"); hdr != "" {
+		t.Fatalf("Retry-After = %q on Antigravity stop error, want none (agy parity)", hdr)
 	}
 }
 

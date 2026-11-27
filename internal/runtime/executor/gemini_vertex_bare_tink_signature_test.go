@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"github.com/MoeForge/moego/base64"
 	"io"
@@ -74,40 +73,6 @@ func TestGeminiExecutorReplacesVertexBareTinkSignature(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("functionCall missing from upstream body: %s", upstreamBody)
-	}
-}
-
-func TestAntigravityExecutorReplacesVertexBareTinkSignature(t *testing.T) {
-	sig := testVertexBareTinkSignature()
-	var upstreamBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read request body: %v", err)
-		}
-		upstreamBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":` + vertexBareTinkTestOKResponse + `}`))
-	}))
-	defer server.Close()
-
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
-	auth := testAntigravityAuth(server.URL)
-	auth.Metadata["project_id"] = "project-1"
-	req := cliproxyexecutor.Request{Model: "gemini-3.6-flash-high", Payload: vertexBareTinkGeminiHistory(sig)}
-	_, errExec := exec.Execute(context.Background(), auth, req, cliproxyexecutor.Options{
-		SourceFormat:    sdktranslator.FormatGemini,
-		ResponseFormat:  sdktranslator.FormatGemini,
-		OriginalRequest: req.Payload,
-	})
-	if len(upstreamBody) == 0 {
-		t.Fatalf("upstream body was not captured; Execute error = %v", errExec)
-	}
-	if bytes.Contains(upstreamBody, []byte(sig)) {
-		t.Fatalf("Vertex bare-Tink signature leaked to Antigravity upstream: %s", upstreamBody)
-	}
-	if !bytes.Contains(upstreamBody, []byte(internalsignature.GeminiSkipThoughtSignatureValidator)) {
-		t.Fatalf("bypass sentinel missing from Antigravity upstream: %s", upstreamBody)
 	}
 }
 

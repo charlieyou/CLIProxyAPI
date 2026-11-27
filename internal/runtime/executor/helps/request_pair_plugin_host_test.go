@@ -53,9 +53,11 @@ func TestRequestPairWithEmptyPluginHostSanitizesSignaturesOnce(t *testing.T) {
 				} else {
 					base, work = helps.TranslateRequestPairWithAPIKeyModelCompatibility(t.Context(), nil, &config.Config{}, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatAntigravity, "gemini-3.6-flash-high", payload, payload, stream, route == "api-key-compat")
 				}
-				const message = "gemini request: sanitized 9 thoughtSignatures"
-				if count := strings.Count(logs.String(), message); count != 1 {
-					t.Fatalf("host=%T stream=%v route=%s: sanitation logs = %d, want 1; logs=%s", host, stream, route, count, logs.String())
+				// Antigravity uses the agy build's sanitizer, which logs once per
+				// sanitized part: one pass over the 9 unsigned siblings logs 9 lines.
+				const message = "gemini request: sanitized thoughtSignature before upstream"
+				if count := strings.Count(logs.String(), message); count != 9 {
+					t.Fatalf("host=%T stream=%v route=%s: sanitation logs = %d, want 9 (one pass); logs=%s", host, stream, route, count, logs.String())
 				}
 				if !bytes.Equal(base, work) {
 					t.Fatal("same input produced different translations")

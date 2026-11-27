@@ -920,7 +920,7 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildStreamErrorResponseBody(status, errText, errMsg.Error)
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
 		},
 		CloseError: func() *interfaces.ErrorMessage {

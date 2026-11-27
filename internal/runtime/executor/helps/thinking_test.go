@@ -8,6 +8,7 @@ import (
 	helps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/gemini"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
@@ -98,7 +99,10 @@ func TestApplyThinkingWithSourcePayloadPreservesOriginalOnlySummary(t *testing.T
 	}
 }
 
-func TestApplyThinkingWithSourcePayload_AntigravityClaudeThinkingDisplayUpdates(t *testing.T) {
+// Antigravity requests run the agy replication's (v7) summary pipeline, which
+// does not turn Claude thinking.display "updates" into includeThoughts, so the
+// translated and thinking-applied payload carries none.
+func TestApplyAgyRequestThinking_AntigravityClaudeThinkingDisplayUpdates(t *testing.T) {
 	source := []byte(`{"model":"gemini-3.8-flash-high","max_tokens":4096,"thinking":{"type":"adaptive","display":"updates"},"messages":[{"role":"user","content":"Hello, think first."}]}`)
 	translated := sdktranslator.TranslateRequest(
 		sdktranslator.FormatClaude,
@@ -108,25 +112,22 @@ func TestApplyThinkingWithSourcePayload_AntigravityClaudeThinkingDisplayUpdates(
 		false,
 	)
 
-	out, err := helps.ApplyThinkingWithSourcePayload(
+	out, err := helps.ApplyAgyRequestThinking(
 		translated,
-		source,
-		source,
-		"gemini-3.8-flash-high",
+		cliproxyexecutor.Request{Model: "gemini-3.8-flash-high", Payload: source, Format: sdktranslator.FormatClaude},
+		cliproxyexecutor.Options{OriginalRequest: source, SourceFormat: sdktranslator.FormatClaude},
 		sdktranslator.FormatClaude.String(),
 		sdktranslator.FormatAntigravity.String(),
 		"antigravity",
 	)
 	if err != nil {
-		t.Fatalf("ApplyThinkingWithSourcePayload() error = %v", err)
+		t.Fatalf("ApplyAgyRequestThinking() error = %v", err)
 	}
-	include := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts")
-	if !include.Exists() || !include.Bool() {
-		t.Fatalf("includeThoughts not enabled: %s", out)
+	if include := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts"); include.Exists() {
+		t.Fatalf("includeThoughts = %s, want absent as in the agy build: %s", include.Raw, out)
 	}
-	level := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel").String()
-	if level != "HIGH" {
-		t.Fatalf("thinkingLevel = %q, want HIGH: %s", level, out)
+	if level := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel").String(); level != "high" {
+		t.Fatalf("thinkingLevel = %q, want high: %s", level, out)
 	}
 }
 

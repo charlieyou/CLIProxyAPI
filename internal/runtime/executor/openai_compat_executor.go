@@ -1397,6 +1397,14 @@ type statusErr struct {
 	tosAppealURLText   string
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
+	// requestStop and availabilityNeutral are set only by the Antigravity
+	// executor for bare 429s: stop retrying/rotating and record the attempt
+	// without cooling the credential.
+	requestStop         bool
+	availabilityNeutral bool
+	// verbatimBody is set only by the Antigravity executor: the fork's agy
+	// build forwarded upstream error JSON to clients byte for byte.
+	verbatimBody bool
 }
 
 func (e statusErr) Error() string {
@@ -1405,11 +1413,14 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
-func (e statusErr) Unwrap() error              { return e.cause }
-func (e statusErr) StatusCode() int            { return e.code }
-func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
-func (e statusErr) IsRequestScoped() bool      { return e.requestScoped }
-func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
+func (e statusErr) Unwrap() error               { return e.cause }
+func (e statusErr) StatusCode() int             { return e.code }
+func (e statusErr) RetryAfter() *time.Duration  { return e.retryAfter }
+func (e statusErr) IsRequestScoped() bool       { return e.requestScoped }
+func (e statusErr) IsCredentialScoped() bool    { return e.credentialScoped }
+func (e statusErr) IsRequestStop() bool         { return e.requestStop }
+func (e statusErr) IsAvailabilityNeutral() bool { return e.availabilityNeutral }
+func (e statusErr) PreservesErrorBody() bool    { return e.verbatimBody }
 
 // LogDiagnostic lets upstream failure logs explain a sanitized client message.
 func (e statusErr) LogDiagnostic() string { return e.diagnostic }

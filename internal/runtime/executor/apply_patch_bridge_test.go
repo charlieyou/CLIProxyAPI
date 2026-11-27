@@ -194,7 +194,7 @@ func TestApplyPatchBridgeLiveHTTPPreviewMatrix(t *testing.T) {
 		{"custom-compat", "chat", false}, {"claude", "claude", false}, {"claude-oauth", "claude", false},
 		{"gemini-interactions", "interactions", false}, {"devin", "devin", false},
 		{"xai", "responses", false}, {"meta", "responses", false}, {"kimi", "responses", false},
-		{"gemini", "gemini", true}, {"vertex", "gemini", true}, {"antigravity", "antigravity", true},
+		{"gemini", "gemini", true}, {"vertex", "gemini", true},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
 			release := make(chan struct{})

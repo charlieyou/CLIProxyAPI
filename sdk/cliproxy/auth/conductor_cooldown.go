@@ -1893,6 +1893,7 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 					var ownModelNonQuotaDeadline time.Time
 					isForceResult := isForceCooldownError(result.Error)
 					appliedCredQuotaWrap := false
+					antigravityQuarantined := false
 					if result.Error != nil {
 						state.LastError = cloneError(result.Error)
 						recordAntigravityCreditsRetryHint(state.LastError, result)
@@ -1963,6 +1964,13 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 						state.Unavailable = true
 						state.Status = StatusDisabled
 						state.StatusMessage = "tos_violation"
+					} else if isAntigravityForbiddenAccountError(auth, statusCode) {
+						antigravityQuarantined = true
+						quarantineAntigravityForbiddenAuth(auth, result.Error, now)
+						state.Status = StatusDisabled
+						state.Unavailable = true
+						state.NextRetryAfter = time.Time{}
+						state.StatusMessage = auth.StatusMessage
 					} else {
 						switch statusCode {
 						case 401, 402, 403:
@@ -2141,7 +2149,7 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 						}
 					}
 
-					if disableCooling && !isTOSViolationResultError(result.Error) && state.NextRetryAfter.IsZero() && state.Quota.NextRecoverAt.IsZero() {
+					if disableCooling && !isTOSViolationResultError(result.Error) && !antigravityQuarantined && state.NextRetryAfter.IsZero() && state.Quota.NextRecoverAt.IsZero() {
 						state.Unavailable = false
 						state.Quota.Exceeded = false
 					}
@@ -2299,7 +2307,7 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 						auth.Unavailable = true
 						auth.NextRetryAfter = time.Time{}
 						persistTOSAppealMetadata(auth, result.Error)
-					} else {
+					} else if !antigravityQuarantined {
 						auth.Status = StatusError
 					}
 					updateAggregatedAvailability(auth, now)
@@ -2517,6 +2525,16 @@ func (m *Manager) updateSessionAffinity(result Result) {
 	}); ok && affinity != nil {
 		affinity.OnResult(result)
 	}
+}
+
+// recordStreamExecutionResult records a stream failure, keeping executor-marked
+// availability-neutral failures out of local cooldown state.
+func (m *Manager) recordStreamExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool, availabilityNeutral bool) {
+	if availabilityNeutral && !ephemeral {
+		m.recordAvailabilityNeutralResult(ctx, result)
+		return
+	}
+	m.recordExecutionResult(ctx, result, auth, ephemeral)
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
@@ -4495,6 +4513,42 @@ func isRequestInvalidError(err error) bool {
 	return false
 }
 
+func isAntigravityForbiddenAccountError(auth *Auth, statusCode int) bool {
+	return auth != nil &&
+		strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") &&
+		statusCode == http.StatusForbidden
+}
+
+// quarantineAntigravityForbiddenAuth immediately disables a flagged/banned
+// Antigravity credential on HTTP 403 (such as VALIDATION_REQUIRED or account
+// disabled) instead of retrying every 30 minutes or bypassing cooldown under
+// disable-cooling. Manual re-enabling or fresh login is required to resume use.
+func quarantineAntigravityForbiddenAuth(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = true
+	auth.Unavailable = true
+	auth.Status = StatusDisabled
+	auth.NextRetryAfter = time.Time{}
+	auth.credentialRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = true
+	auth.Metadata["quarantined"] = true
+	msg := ""
+	if resultErr != nil {
+		msg = strings.ToUpper(strings.TrimSpace(resultErr.Message))
+	}
+	if strings.Contains(msg, "VALIDATION_REQUIRED") {
+		auth.StatusMessage = "antigravity account verification required (403)"
+	} else {
+		auth.StatusMessage = "antigravity account forbidden (403)"
+	}
+}
+
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) (time.Time, time.Time) {
 	if auth == nil {
 		return time.Time{}, time.Time{}
@@ -4515,7 +4569,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		return time.Time{}, time.Time{}
 	}
 	defer func() {
-		if disableCooling && !isTOSViolationResultError(resultErr) && auth.NextRetryAfter.IsZero() && auth.Quota.NextRecoverAt.IsZero() {
+		if disableCooling && !isTOSViolationResultError(resultErr) && !auth.Disabled && auth.Status != StatusDisabled && auth.NextRetryAfter.IsZero() && auth.Quota.NextRecoverAt.IsZero() {
 			auth.Unavailable = false
 			auth.Quota.Exceeded = false
 		}
@@ -4585,6 +4639,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
+	} else if isAntigravityForbiddenAccountError(auth, statusCode) {
+		quarantineAntigravityForbiddenAuth(auth, resultErr, now)
+		return time.Time{}, time.Time{}
 	} else {
 		switch statusCode {
 		case 401:

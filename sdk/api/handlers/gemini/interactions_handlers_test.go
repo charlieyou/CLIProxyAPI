@@ -237,7 +237,7 @@ func TestInteractionsAntigravityModelUsesTranslatorBridge(t *testing.T) {
 	model := "interactions-antigravity-bridge-model"
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1internal:generateContent" {
+		if r.URL.Path != "/v1internal:streamGenerateContent" {
 			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
@@ -288,11 +288,11 @@ func TestInteractionsAntigravityModelUsesTranslatorBridge(t *testing.T) {
 	if ojson.GetBytesNoCopy(upstreamBody, "input").Exists() {
 		t.Fatalf("upstream body still contains raw interactions input: %s", string(upstreamBody))
 	}
-	if got := ojson.GetBytesNoCopy(upstreamBody, "request.contents.0.parts.0.text").String(); got != "hi" {
-		t.Fatalf("upstream request text = %q, want hi. Body: %s", got, string(upstreamBody))
+	if got := ojson.GetBytesNoCopy(upstreamBody, "request.contents.0.parts.0.text").String(); !strings.Contains(got, "<USER_REQUEST>\nhi\n</USER_REQUEST>") || !strings.Contains(got, "<ADDITIONAL_METADATA>") {
+		t.Fatalf("upstream request text = %q, want <USER_REQUEST> wrapped hi. Body: %s", got, string(upstreamBody))
 	}
-	if got := ojson.GetBytesNoCopy(upstreamBody, "request.generationConfig.topP").Float(); got != 0.8 {
-		t.Fatalf("upstream topP = %v, want 0.8. Body: %s", got, string(upstreamBody))
+	if ojson.GetBytesNoCopy(upstreamBody, "request.generationConfig.topP").Exists() {
+		t.Fatalf("non-agy topP should be stripped from antigravity upstream body: %s", string(upstreamBody))
 	}
 	if got := ojson.GetBytesNoCopy(rec.Body.Bytes(), "steps.0.content.0.text").String(); got != "translated-ok" {
 		t.Fatalf("response text = %q, want translated-ok. Body: %s", got, rec.Body.String())

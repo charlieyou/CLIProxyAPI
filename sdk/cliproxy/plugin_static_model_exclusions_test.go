@@ -179,39 +179,6 @@ func TestRegisterModelsForAuth_PluginStaticExclusionsDoNotMatchNativeAliases(t *
 	}
 }
 
-func TestAntigravityModelsForHints_PluginStaticModelsFollowExclusions(t *testing.T) {
-	const provider = "antigravity"
-	cfg := &config.Config{OAuthExcludedModels: map[string][]string{provider: {pluginStaticGlobalModel}}}
-	service := &Service{cfg: cfg, pluginHost: newPluginStaticModelHost(t, provider)}
-	hints := antigravityModelCapabilityHints{ModelIDs: map[string]struct{}{"gemini-3.1-flash-lite": {}}}
-
-	for _, tc := range []struct {
-		name          string
-		ownRules      string
-		wantGlobal    bool
-		wantCredValue bool
-	}{
-		{name: "global rules", wantGlobal: false, wantCredValue: true},
-		{name: "credential rules override global", ownRules: pluginStaticCredentialModel, wantGlobal: true, wantCredValue: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			auth := antigravityTestAuth(t.Name(), "http://127.0.0.1:1")
-			if tc.ownRules != "" {
-				auth.Attributes["excluded_models"] = tc.ownRules
-			}
-
-			present := make(map[string]bool)
-			for _, model := range service.antigravityModelsForHints(auth, hints) {
-				present[model.ID] = true
-			}
-
-			if present[pluginStaticGlobalModel] != tc.wantGlobal || present[pluginStaticCredentialModel] != tc.wantCredValue {
-				t.Fatalf("plugin static models = (%t,%t), want (%t,%t); models = %v", present[pluginStaticGlobalModel], present[pluginStaticCredentialModel], tc.wantGlobal, tc.wantCredValue, present)
-			}
-		})
-	}
-}
-
 type multiProviderModelRegistrar struct {
 	registrations []pluginapi.ProviderModels
 }

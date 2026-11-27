@@ -13,7 +13,6 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -44,175 +43,6 @@ func issue7513RequestPayload(format sdktranslator.Format, model string, stream b
 	default:
 		return []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
 	}
-}
-
-func TestIssue7513_AntigravityZeroOutputAbnormalFinishReturns502BeforeBootstrap(t *testing.T) {
-	reasons := []string{"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MALFORMED_RESPONSE"}
-	formats := []sdktranslator.Format{
-		sdktranslator.FormatGemini,
-		sdktranslator.FormatClaude,
-		sdktranslator.FormatOpenAI,
-		sdktranslator.FormatOpenAIResponse,
-	}
-
-	for _, reason := range reasons {
-		for _, format := range formats {
-			for _, model := range []string{"gemini-4-hydrogen", "gemini-3-pro"} {
-				// gemini-3-pro exercises AntigravityExecutor.executeClaudeNonStream in Execute().
-				if model == "gemini-3-pro" && format != sdktranslator.FormatClaude && format != sdktranslator.FormatGemini {
-					continue
-				}
-				t.Run(reason+"/"+format.String()+"/"+model, func(t *testing.T) {
-					body := `{"response":{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"` + reason + `"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"thoughtsTokenCount":313,"totalTokenCount":443},"modelVersion":"` + model + `","responseId":"resp-ag-7513"}}`
-					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						if strings.Contains(r.URL.Path, "streamGenerateContent") {
-							w.Header().Set("Content-Type", "text/event-stream")
-							_, _ = io.WriteString(w, "data: "+body+"\n\n")
-							return
-						}
-						w.Header().Set("Content-Type", "application/json")
-						_, _ = io.WriteString(w, body)
-					}))
-					defer server.Close()
-
-					auth := &cliproxyauth.Auth{
-						ID:       "ag-" + t.Name(),
-						Provider: "antigravity",
-						Metadata: map[string]any{
-							"access_token": "token-123",
-							"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-							"project_id":   "project-1",
-						},
-						Attributes: map[string]string{"base_url": server.URL},
-					}
-					capture := &malformedFunctionCallUsageCapture{authID: auth.ID, records: make(chan usage.Record, 2)}
-					usage.RegisterNamedPlugin(t.Name(), capture)
-					t.Cleanup(func() {
-						usage.RegisterNamedPlugin(t.Name(), malformedFunctionCallUsageNoop{})
-					})
-
-					exec := NewAntigravityExecutor(&config.Config{})
-					nonStreamReq := cliproxyexecutor.Request{
-						Model:   model,
-						Payload: issue7513RequestPayload(format, model, false),
-					}
-					nonStreamOpts := cliproxyexecutor.Options{
-						SourceFormat:   format,
-						ResponseFormat: format,
-					}
-					_, errExec := exec.Execute(context.Background(), auth, nonStreamReq, nonStreamOpts)
-					if errExec == nil {
-						t.Fatalf("Execute() error = nil, want 502 error for %s", reason)
-					}
-					status, okStatus := errExec.(interface{ StatusCode() int })
-					if !okStatus || status.StatusCode() != http.StatusBadGateway {
-						t.Fatalf("Execute() error = %T %v, want status 502", errExec, errExec)
-					}
-					assertMalformedFunctionCallFailedUsage(t, capture.records)
-
-					streamReq := cliproxyexecutor.Request{
-						Model:   model,
-						Payload: issue7513RequestPayload(format, model, true),
-					}
-					streamOpts := cliproxyexecutor.Options{
-						SourceFormat:   format,
-						ResponseFormat: format,
-						Stream:         true,
-					}
-					streamRes, errStream := exec.ExecuteStream(context.Background(), auth, streamReq, streamOpts)
-					if errStream != nil {
-						t.Fatalf("ExecuteStream() error = %v", errStream)
-					}
-					var emittedPayloads [][]byte
-					var streamErr error
-					for chunk := range streamRes.Chunks {
-						if chunk.Err != nil {
-							streamErr = chunk.Err
-							continue
-						}
-						if len(bytes.TrimSpace(chunk.Payload)) > 0 {
-							emittedPayloads = append(emittedPayloads, bytes.Clone(chunk.Payload))
-						}
-					}
-					if len(emittedPayloads) > 0 {
-						t.Fatalf("ExecuteStream() emitted %d payload chunk(s) before error, want 0 so readStreamBootstrap does not commit 200: %q", len(emittedPayloads), emittedPayloads)
-					}
-					if streamErr == nil {
-						t.Fatalf("ExecuteStream() chunk.Err = nil, want 502 error for %s", reason)
-					}
-					streamStatus, okStreamStatus := streamErr.(interface{ StatusCode() int })
-					if !okStreamStatus || streamStatus.StatusCode() != http.StatusBadGateway {
-						t.Fatalf("ExecuteStream() chunk.Err = %T %v, want status 502", streamErr, streamErr)
-					}
-					assertMalformedFunctionCallFailedUsage(t, capture.records)
-				})
-			}
-		}
-	}
-}
-
-func TestIssue7513_AntigravityLeadingEmptyAndSplitUsageZeroOutputReturns502WithoutPayload(t *testing.T) {
-	leadingEmpty := `{"response":{"candidates":[{"content":{"role":"model","parts":[]}}],"modelVersion":"gemini-4-hydrogen","responseId":"resp-split-7513"}}`
-	finishChunk := `{"response":{"candidates":[{"content":{"role":"model"},"finishReason":"UNEXPECTED_TOOL_CALL"}],"modelVersion":"gemini-4-hydrogen","responseId":"resp-split-7513"}}`
-	usageChunk := `{"response":{"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"thoughtsTokenCount":313,"totalTokenCount":443},"modelVersion":"gemini-4-hydrogen","responseId":"resp-split-7513"}}`
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: "+leadingEmpty+"\n\ndata: "+finishChunk+"\n\ndata: "+usageChunk+"\n\n")
-	}))
-	defer server.Close()
-
-	auth := &cliproxyauth.Auth{
-		ID:       t.Name(),
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"access_token": "token-123",
-			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-			"project_id":   "project-1",
-		},
-		Attributes: map[string]string{"base_url": server.URL},
-	}
-	capture := &malformedFunctionCallUsageCapture{authID: auth.ID, records: make(chan usage.Record, 1)}
-	usage.RegisterNamedPlugin(t.Name(), capture)
-	t.Cleanup(func() {
-		usage.RegisterNamedPlugin(t.Name(), malformedFunctionCallUsageNoop{})
-	})
-
-	exec := NewAntigravityExecutor(&config.Config{})
-	streamRes, errStream := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gemini-4-hydrogen",
-		Payload: issue7513RequestPayload(sdktranslator.FormatGemini, "gemini-4-hydrogen", true),
-	}, cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FormatGemini,
-		ResponseFormat: sdktranslator.FormatGemini,
-		Stream:         true,
-	})
-	if errStream != nil {
-		t.Fatalf("ExecuteStream() error = %v", errStream)
-	}
-
-	var emittedPayloads [][]byte
-	var streamErr error
-	for chunk := range streamRes.Chunks {
-		if chunk.Err != nil {
-			streamErr = chunk.Err
-			continue
-		}
-		if len(bytes.TrimSpace(chunk.Payload)) > 0 {
-			emittedPayloads = append(emittedPayloads, bytes.Clone(chunk.Payload))
-		}
-	}
-	if len(emittedPayloads) > 0 {
-		t.Fatalf("ExecuteStream() emitted %d payload chunk(s), want 0: %q", len(emittedPayloads), emittedPayloads)
-	}
-	if streamErr == nil {
-		t.Fatal("ExecuteStream() chunk.Err = nil, want 502")
-	}
-	status, okStatus := streamErr.(interface{ StatusCode() int })
-	if !okStatus || status.StatusCode() != http.StatusBadGateway {
-		t.Fatalf("ExecuteStream() chunk.Err = %T %v, want 502", streamErr, streamErr)
-	}
-	assertMalformedFunctionCallFailedUsage(t, capture.records)
 }
 
 func issue7513GeminiOrVertexExecutor(t *testing.T, provider, baseURL, authID string) (context.Context, cliproxyauth.ProviderExecutor, *cliproxyauth.Auth) {
@@ -553,67 +383,8 @@ func TestIssue7513_ZeroOutputGuardsPreserveValidContentAndToolCalls(t *testing.T
 	}
 }
 
-func TestIssue7513_AntigravityPostThinkingZeroOutputEmitsTerminalError(t *testing.T) {
-	thoughtChunk := `{"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"thinking only"}]}}],"modelVersion":"gemini-4-hydrogen","responseId":"resp-thought-7513"}}`
-	malformedChunk := `{"response":{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"UNEXPECTED_TOOL_CALL"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"thoughtsTokenCount":313,"totalTokenCount":443},"modelVersion":"gemini-4-hydrogen","responseId":"resp-thought-7513"}}`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: "+thoughtChunk+"\n\ndata: "+malformedChunk+"\n\n")
-	}))
-	defer server.Close()
-
-	auth := &cliproxyauth.Auth{
-		ID:       t.Name(),
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"access_token": "token-123",
-			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-			"project_id":   "project-1",
-		},
-		Attributes: map[string]string{"base_url": server.URL},
-	}
-	capture := &malformedFunctionCallUsageCapture{authID: auth.ID, records: make(chan usage.Record, 1)}
-	usage.RegisterNamedPlugin(t.Name(), capture)
-	t.Cleanup(func() {
-		usage.RegisterNamedPlugin(t.Name(), malformedFunctionCallUsageNoop{})
-	})
-
-	exec := NewAntigravityExecutor(&config.Config{})
-	streamRes, errStream := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gemini-4-hydrogen",
-		Payload: issue7513RequestPayload(sdktranslator.FormatGemini, "gemini-4-hydrogen", true),
-	}, cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FormatGemini,
-		ResponseFormat: sdktranslator.FormatGemini,
-		Stream:         true,
-	})
-	if errStream != nil {
-		t.Fatalf("ExecuteStream() error = %v", errStream)
-	}
-	var combined bytes.Buffer
-	var streamErr error
-	for chunk := range streamRes.Chunks {
-		if chunk.Err != nil {
-			streamErr = chunk.Err
-			continue
-		}
-		combined.Write(chunk.Payload)
-	}
-	if streamErr == nil {
-		t.Fatalf("ExecuteStream() chunk.Err = nil, want 502 after post-thinking UNEXPECTED_TOOL_CALL; payload=%s", combined.String())
-	}
-	status, okStatus := streamErr.(interface{ StatusCode() int })
-	if !okStatus || status.StatusCode() != http.StatusBadGateway {
-		t.Fatalf("ExecuteStream() chunk.Err = %T %v, want 502", streamErr, streamErr)
-	}
-	if strings.Contains(combined.String(), "UNEXPECTED_TOOL_CALL") {
-		t.Fatalf("stream unexpectedly forwarded abnormal terminal frame after post-thinking fault: %s", combined.String())
-	}
-	assertMalformedFunctionCallFailedUsage(t, capture.records)
-}
-
 func TestIssue7513_PostThinkingSplitUsageClaudeEmitsBlockStopAndError(t *testing.T) {
-	for _, provider := range []string{"antigravity", "gemini"} {
+	for _, provider := range []string{"gemini"} {
 		t.Run(provider, func(t *testing.T) {
 			var frame1, frame2, frame3 string
 			if provider == "antigravity" {
@@ -703,7 +474,7 @@ func TestIssue7513_PostThinkingSplitUsageClaudeEmitsBlockStopAndError(t *testing
 }
 
 func TestIssue7513_EarlyPreliminaryUsageDoesNotLoseFinalUsageOnZeroOutputFailure(t *testing.T) {
-	for _, provider := range []string{"antigravity", "gemini"} {
+	for _, provider := range []string{"gemini"} {
 		t.Run(provider, func(t *testing.T) {
 			var frame1, frame2, frame3 string
 			if provider == "antigravity" {
@@ -780,7 +551,7 @@ func TestIssue7513_EarlyPreliminaryUsageDoesNotLoseFinalUsageOnZeroOutputFailure
 }
 
 func TestIssue7513_EmptyFunctionCallPlaceholderReturns502(t *testing.T) {
-	for _, provider := range []string{"antigravity", "gemini"} {
+	for _, provider := range []string{"gemini"} {
 		t.Run(provider, func(t *testing.T) {
 			var body string
 			model := "gemini-4-argon"
@@ -1027,66 +798,6 @@ func TestIssue7513_ThoughtChunkStreamsSynchronouslyBeforeNextChunkForTTFT(t *tes
 		if chunk.Err != nil {
 			t.Fatalf("unexpected trailing chunk error: %v", chunk.Err)
 		}
-	}
-}
-
-func TestIssue7513_ZeroOutputAbnormalFinishDoesNotCommitReasoningReplay(t *testing.T) {
-	internalcache.ClearAntigravityReasoningReplayCache()
-	t.Cleanup(internalcache.ClearAntigravityReasoningReplayCache)
-
-	sessionKey := "session:replay-zero-output-7513"
-	body := `{"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"thinking","thoughtSignature":"sig-should-not-cache"}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":10,"totalTokenCount":60},"modelVersion":"gemini-3-flash-agent"}}`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "streamGenerateContent") {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: "+body+"\n\n")
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, body)
-	}))
-	defer server.Close()
-
-	auth := &cliproxyauth.Auth{
-		ID:       t.Name(),
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"access_token": "token-123",
-			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-			"project_id":   "project-1",
-		},
-		Attributes: map[string]string{"base_url": server.URL},
-	}
-	exec := NewAntigravityExecutor(&config.Config{})
-	opts := cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FormatGemini,
-		ResponseFormat: sdktranslator.FormatGemini,
-		Metadata:       map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionKey},
-	}
-
-	_, errExec := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gemini-3-flash-agent",
-		Payload: issue7513RequestPayload(sdktranslator.FormatGemini, "gemini-3-flash-agent", false),
-	}, opts)
-	if errExec == nil {
-		t.Fatal("Execute() error = nil, want 502")
-	}
-	if items, ok := internalcache.GetAntigravityReasoningReplayItems("gemini-3-flash-agent", sessionKey); ok && len(items) > 0 {
-		t.Fatalf("non-stream zero-output failure unexpectedly committed replay items: %d", len(items))
-	}
-
-	opts.Stream = true
-	streamRes, errStream := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gemini-3-flash-agent",
-		Payload: issue7513RequestPayload(sdktranslator.FormatGemini, "gemini-3-flash-agent", true),
-	}, opts)
-	if errStream != nil {
-		t.Fatalf("ExecuteStream() error = %v", errStream)
-	}
-	for range streamRes.Chunks {
-	}
-	if items, ok := internalcache.GetAntigravityReasoningReplayItems("gemini-3-flash-agent", sessionKey); ok && len(items) > 0 {
-		t.Fatalf("stream zero-output failure unexpectedly committed replay items: %d", len(items))
 	}
 }
 

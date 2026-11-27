@@ -295,11 +295,9 @@ type AntigravityConfig struct {
 	// "disabled" to explicitly disable the pause.
 	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
 
-	// StopOnBare429 stops retrying and rotating credentials on a bare 429 (no
-	// ErrorInfo reason, RetryInfo, or Retry-After) and returns it to the client
-	// without cooling the credential. Defaults to false (upstream cooldown and
-	// rotation) when omitted.
-	StopOnBare429 bool `yaml:"stop-on-bare-429,omitempty" json:"stop-on-bare-429,omitempty"`
+	// StopOnBare429 stops retrying/rotating on bare/signal-less 429 responses
+	// without cooling the credential when true (default true when nil).
+	StopOnBare429 *bool `yaml:"stop-on-bare-429,omitempty" json:"stop-on-bare-429,omitempty"`
 
 	// MaxConcurrentRequests caps concurrent in-flight Antigravity inference
 	// requests per credential; additional requests wait for a free slot.
@@ -315,11 +313,11 @@ type AntigravityConfig struct {
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.
 type AntigravityConnectionPoolConfig struct {
 	// Enabled controls whether upstream connection pooling is enabled.
-	// Defaults to false (short-lived connection mode). Set to true to enable connection pooling.
+	// Defaults to true (matching agy's persistent HTTP/1.1 client). Set to false for short-lived connection mode.
 	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 
 	// IdleConnTimeout specifies how long an idle connection stays in the pool before expiring.
-	// Defaults to "30s". Capped at 210s to prevent exceeding Google Frontend (GFE) 240s cutoff.
+	// Defaults to "90s". Capped at 210s to prevent exceeding Google Frontend (GFE) 240s cutoff.
 	IdleConnTimeout string `yaml:"idle-conn-timeout,omitempty" json:"idle-conn-timeout,omitempty"`
 
 	// MaxIdleConnsPerHost specifies the maximum number of idle connections to retain per host per credential.

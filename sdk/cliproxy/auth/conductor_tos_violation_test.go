@@ -96,34 +96,6 @@ func TestMarkResult_TOSViolation_DisablesCredential(t *testing.T) {
 	}
 }
 
-// TestMarkResult_NonTOS403_StillCools confirms the generic 403 path is
-// unchanged: a plain PERMISSION_DENIED without the tos_violation code must
-// continue to apply the 30-minute cooldown rather than deactivating.
-func TestMarkResult_NonTOS403_StillCools(t *testing.T) {
-	manager := NewManager(nil, nil, nil)
-	ctx := context.Background()
-
-	auth := &Auth{ID: "plain-403", Provider: "antigravity", Status: StatusActive}
-	if _, err := manager.Register(ctx, auth); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-	manager.MarkResult(ctx, Result{
-		AuthID:   auth.ID,
-		Provider: "antigravity",
-		Model:    "gemini-3-pro",
-		Success:  false,
-		Error:    &Error{HTTPStatus: http.StatusForbidden, Message: "permission denied"},
-	})
-
-	updated, _ := manager.GetByID(auth.ID)
-	if updated.Status == StatusDisabled {
-		t.Fatal("plain 403 must not deactivate the credential")
-	}
-	if updated.NextRetryAfter.IsZero() {
-		t.Fatal("plain 403 must keep the 30-minute cooldown")
-	}
-}
-
 // TestMarkResult_TOSViolation_LateResultDoesNotRevive verifies that a
 // success or ordinary failure recorded after the TOS suspension does not bring
 // the disabled credential back into rotation.

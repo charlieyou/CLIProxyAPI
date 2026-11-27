@@ -129,8 +129,16 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !equalStringMap(oldCfg.Antigravity.ToolDescriptionReplacements, newCfg.Antigravity.ToolDescriptionReplacements) {
 		changes = append(changes, fmt.Sprintf("antigravity.tool-description-replacements: %d -> %d", len(oldCfg.Antigravity.ToolDescriptionReplacements), len(newCfg.Antigravity.ToolDescriptionReplacements)))
 	}
-	if oldCfg.Antigravity.StopOnBare429 != newCfg.Antigravity.StopOnBare429 {
-		changes = append(changes, fmt.Sprintf("antigravity.stop-on-bare-429: %t -> %t", oldCfg.Antigravity.StopOnBare429, newCfg.Antigravity.StopOnBare429))
+	oldStopOnBare429 := "<nil>"
+	if oldCfg.Antigravity.StopOnBare429 != nil {
+		oldStopOnBare429 = fmt.Sprintf("%t", *oldCfg.Antigravity.StopOnBare429)
+	}
+	newStopOnBare429 := "<nil>"
+	if newCfg.Antigravity.StopOnBare429 != nil {
+		newStopOnBare429 = fmt.Sprintf("%t", *newCfg.Antigravity.StopOnBare429)
+	}
+	if oldStopOnBare429 != newStopOnBare429 {
+		changes = append(changes, fmt.Sprintf("antigravity.stop-on-bare-429: %s -> %s", oldStopOnBare429, newStopOnBare429))
 	}
 	if oldCfg.Antigravity.MaxConcurrentRequests != newCfg.Antigravity.MaxConcurrentRequests {
 		changes = append(changes, fmt.Sprintf("antigravity.max-concurrent-requests: %d -> %d", oldCfg.Antigravity.MaxConcurrentRequests, newCfg.Antigravity.MaxConcurrentRequests))

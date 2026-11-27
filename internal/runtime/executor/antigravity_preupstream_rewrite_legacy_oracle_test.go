@@ -11,6 +11,7 @@ import (
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util/agyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -198,7 +199,7 @@ func legacySanitizeAntigravityRequestSchemas(payloadStr string, useAntigravitySc
 		if !ojson.Get(payloadStr, oldPath).Exists() {
 			continue
 		}
-		renamed, errRename := util.RenameKey(payloadStr, oldPath, base+".parameters")
+		renamed, errRename := agyutil.RenameKey(payloadStr, oldPath, base+".parameters")
 		if errRename != nil {
 			log.Debugf("antigravity: failed to rename %s: %v", oldPath, errRename)
 			continue
@@ -208,9 +209,9 @@ func legacySanitizeAntigravityRequestSchemas(payloadStr string, useAntigravitySc
 
 	toolSchemaCleaner := util.CleanJSONSchemaForGemini
 	if useAntigravitySchema {
-		toolSchemaCleaner = util.CleanJSONSchemaForAntigravity
+		toolSchemaCleaner = agyutil.CleanJSONSchemaForAntigravity
 	}
-	responseSchemaCleaner := util.CleanJSONSchemaForAntigravityResponse
+	responseSchemaCleaner := agyutil.CleanJSONSchemaForAntigravityResponse
 	cleanNestedToolSchema := func(schemaRaw string) string {
 		return cleanNestedSchema(toolSchemaCleaner, schemaRaw)
 	}

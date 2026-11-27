@@ -6,13 +6,8 @@ package executor
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"crypto/tls"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -21,13 +16,13 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	antigravityclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -37,14 +32,14 @@ const (
 	antigravityBaseURLDaily                = "https://daily-cloudcode-pa.googleapis.com"
 	antigravitySandboxBaseURLDaily         = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 	antigravityBaseURLProd                 = "https://cloudcode-pa.googleapis.com"
-	antigravityCountTokensPath             = "/v1internal:countTokens"
 	antigravityStreamPath                  = "/v1internal:streamGenerateContent"
 	antigravityGeneratePath                = "/v1internal:generateContent"
+	antigravityWriteTrajectoryAclsPath     = "/v1internal:writeTrajectoryAcls"
 	antigravityClientID                    = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	antigravityClientSecret                = "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"
 	antigravityAuthType                    = "antigravity"
-	antigravityRequestTokenSafetyWindow    = 5 * time.Minute
-	antigravityCreditsHintRefreshInterval  = cliproxyauth.AntigravityCreditsHintRefreshInterval
+	antigravityRequestTokenSafetyWindow    = 30 * time.Second
+	antigravityCreditsHintRefreshInterval  = 10 * time.Minute
 	antigravityCreditsHintRefreshTimeout   = 5 * time.Second
 	antigravityShortQuotaCooldownThreshold = 5 * time.Minute
 	antigravityInstantRetryThreshold       = 3 * time.Second
@@ -53,10 +48,7 @@ const (
 
 // AntigravityExecutor proxies requests to the antigravity upstream.
 type AntigravityExecutor struct {
-	cfg           *config.Config
-	matcherMu     sync.RWMutex
-	lastWordsKey  string
-	cachedMatcher *helps.SensitiveWordMatcher
+	cfg *config.Config
 }
 
 // NewAntigravityExecutor creates a new Antigravity executor instance.
@@ -70,62 +62,12 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
-func (e *AntigravityExecutor) getSensitiveWordMatcher() *helps.SensitiveWordMatcher {
-	if e == nil || e.cfg == nil {
-		return nil
-	}
-	words := e.cfg.Antigravity.SensitiveWords
-	replacements := e.cfg.Antigravity.SensitiveWordsReplace
-	patterns := e.cfg.Antigravity.SensitivePatternsReplace
-	if len(words) == 0 && len(replacements) == 0 && len(patterns) == 0 {
-		return nil
-	}
-	key := helps.SensitiveWordConfigCacheKeyWithPatterns(words, replacements, patterns)
-	e.matcherMu.RLock()
-	if e.lastWordsKey == key {
-		m := e.cachedMatcher
-		e.matcherMu.RUnlock()
-		return m
-	}
-	e.matcherMu.RUnlock()
-
-	e.matcherMu.Lock()
-	defer e.matcherMu.Unlock()
-	if e.lastWordsKey == key {
-		return e.cachedMatcher
-	}
-	e.lastWordsKey = key
-	e.cachedMatcher = helps.BuildAntigravitySensitiveWordMatcherWithPatterns(words, replacements, patterns)
-	return e.cachedMatcher
-}
-
 func (e *AntigravityExecutor) obfuscateSensitiveWords(payload []byte) []byte {
-	matcher := e.getSensitiveWordMatcher()
-	if matcher == nil {
+	if e == nil || e.cfg == nil || len(e.cfg.Antigravity.SensitiveWords) == 0 {
 		return payload
 	}
-	return helps.ObfuscateSensitiveWordsInSystemInstruction(payload, matcher)
-}
-
-func (e *AntigravityExecutor) obfuscateSensitiveWordsDoc(doc *ojson.Doc) bool {
-	if doc == nil {
-		return false
-	}
-	matcher := e.getSensitiveWordMatcher()
-	if matcher == nil {
-		return false
-	}
-	return helps.ObfuscateSensitiveWordsInSystemInstructionDoc(doc, matcher)
-}
-
-// applyToolDescriptionReplacementsDoc scrubs request.tools description strings.
-// Callers run it after schema sanitization so bare MCP property maps and
-// inlined local $ref targets are covered too.
-func (e *AntigravityExecutor) applyToolDescriptionReplacementsDoc(doc *ojson.Doc) bool {
-	if e == nil || e.cfg == nil {
-		return false
-	}
-	return helps.ApplyAntigravityToolDescriptionReplacements(doc, e.cfg.Antigravity.ToolDescriptionReplacements)
+	matcher := helps.BuildAgySensitiveWordMatcher(e.cfg.Antigravity.SensitiveWords)
+	return helps.AgyObfuscateSensitiveWordsInSystemInstruction(payload, matcher)
 }
 
 // Each Antigravity credential gets its own HTTP/1.1 connection pool. Sessions routed
@@ -135,6 +77,8 @@ func (e *AntigravityExecutor) applyToolDescriptionReplacementsDoc(doc *ojson.Doc
 var (
 	antigravityBaseTransport = defaultAntigravityBaseTransport()
 	antigravityTransports    = helps.NewTransportCache[antigravityTransportKey](antigravityTransportCacheCapacity)
+	antigravityOAuthMu       sync.Mutex
+	antigravityOAuthClients  = make(map[string]http.RoundTripper)
 )
 
 const (
@@ -164,10 +108,9 @@ const (
 	// Prevents unbounded connection pool expansion in multi-credential environments.
 	antigravityMaxAllowedMaxIdleConnsPerHost = 100
 
-	// antigravityDefaultIdleConnTimeout is the default idle connection timeout (30 seconds).
-	// Kept strictly far below Google Frontend (GFE / ESF) 240-second cutoff to prevent
-	// client-side reuse of half-closed connections that cause connection resets.
-	antigravityDefaultIdleConnTimeout = 30 * time.Second
+	// antigravityDefaultIdleConnTimeout matches Go's http.DefaultTransport (90 seconds),
+	// staying well below Google Frontend (GFE / ESF) 240-second idle keep-alive cutoff.
+	antigravityDefaultIdleConnTimeout = 90 * time.Second
 
 	// antigravityMaxAllowedIdleConnTimeout is the hard upper bound on IdleConnTimeout (210 seconds).
 	// Kept strictly below Google Frontend (GFE / ESF) 240.0-second HTTP/1.1 idle keep-alive cutoff
@@ -183,33 +126,30 @@ const (
 )
 
 type antigravityPoolSettings struct {
-	shortMode                   bool
-	idleConnTimeout             time.Duration
-	maxIdleConnsPerHost         int
-	maxIdleConnsPerHostExplicit bool
+	shortMode           bool
+	idleConnTimeout     time.Duration
+	maxIdleConnsPerHost int
 }
 
 func resolveAntigravityPoolSettings(cfg *config.Config) antigravityPoolSettings {
-	// By default, upstream connection pooling is disabled (shortMode = true, maxIdleConnsPerHost = -1)
-	// to prevent socket buildup and stale connection errors across rotating credentials.
+	// Default to HTTP/1.1 connection pooling enabled (matching agy's persistent
+	// Cloud Code client). Operators can explicitly opt out with enabled: false,
+	// idle-conn-timeout: "0s", or max-idle-conns-per-host: -1.
 	settings := antigravityPoolSettings{
-		shortMode:           true,
-		maxIdleConnsPerHost: -1,
-		idleConnTimeout:     0,
+		shortMode:           false,
+		maxIdleConnsPerHost: antigravityDefaultMaxIdleConnsPerHost,
+		idleConnTimeout:     antigravityDefaultIdleConnTimeout,
 	}
 	if cfg == nil {
 		return settings
 	}
 
-	// Pooling is active ONLY when explicitly enabled: true
-	if cfg.Antigravity.ConnectionPool.Enabled == nil || !*cfg.Antigravity.ConnectionPool.Enabled {
+	if cfg.Antigravity.ConnectionPool.Enabled != nil && !*cfg.Antigravity.ConnectionPool.Enabled {
+		settings.shortMode = true
+		settings.maxIdleConnsPerHost = -1
+		settings.idleConnTimeout = 0
 		return settings
 	}
-
-	// Enabled is true: initialize default pool settings
-	settings.shortMode = false
-	settings.idleConnTimeout = antigravityDefaultIdleConnTimeout
-	settings.maxIdleConnsPerHost = antigravityDefaultMaxIdleConnsPerHost
 
 	rawTimeout := strings.TrimSpace(cfg.Antigravity.ConnectionPool.IdleConnTimeout)
 	if rawTimeout != "" {
@@ -232,7 +172,7 @@ func resolveAntigravityPoolSettings(cfg *config.Config) antigravityPoolSettings 
 
 	if cfg.Antigravity.ConnectionPool.MaxIdleConnsPerHost != nil {
 		val := *cfg.Antigravity.ConnectionPool.MaxIdleConnsPerHost
-		if val <= 0 {
+		if val < 0 {
 			settings.shortMode = true
 			settings.maxIdleConnsPerHost = -1
 			settings.idleConnTimeout = 0
@@ -242,7 +182,6 @@ func resolveAntigravityPoolSettings(cfg *config.Config) antigravityPoolSettings 
 			val = antigravityMaxAllowedMaxIdleConnsPerHost
 		}
 		settings.maxIdleConnsPerHost = val
-		settings.maxIdleConnsPerHostExplicit = true
 	}
 
 	if settings.maxIdleConnsPerHost < 0 {
@@ -256,6 +195,20 @@ func resolveAntigravityPoolSettings(cfg *config.Config) antigravityPoolSettings 
 // Used during configuration hot-reloads to ensure updated pool parameters apply immediately.
 func ResetAntigravityTransports() {
 	antigravityTransports.Purge()
+	var oauthToClose []http.RoundTripper
+	antigravityOAuthMu.Lock()
+	for _, rt := range antigravityOAuthClients {
+		if rt != nil {
+			oauthToClose = append(oauthToClose, rt)
+		}
+	}
+	clear(antigravityOAuthClients)
+	antigravityOAuthMu.Unlock()
+	for _, rt := range oauthToClose {
+		if closer, ok := rt.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
 }
 
 // AntigravityTransportsLen reports the current number of cached Antigravity transports.
@@ -275,22 +228,37 @@ func closeAntigravityAuthIdleTransports(auth *cliproxyauth.Auth) {
 	antigravityTransports.CloseMatching(func(key antigravityTransportKey) bool {
 		return key.credential == scope
 	})
+	oauthPrefix := scope + "|"
+	var oauthToClose []http.RoundTripper
+	antigravityOAuthMu.Lock()
+	for key, rt := range antigravityOAuthClients {
+		if strings.HasPrefix(key, oauthPrefix) {
+			delete(antigravityOAuthClients, key)
+			if rt != nil {
+				oauthToClose = append(oauthToClose, rt)
+			}
+		}
+	}
+	antigravityOAuthMu.Unlock()
+	for _, rt := range oauthToClose {
+		if closer, ok := rt.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
 }
 
 // antigravityTransportKey identifies one connection pool. At most one of proxy and
 // base is set: proxy for a credential-scoped proxy pool, base for a transport handed
 // in through the request context, and neither for a direct pool.
-// Resolved pool settings (shortMode, idleConnTimeout, maxIdleConnsPerHost,
-// maxIdleConnsPerHostExplicit) are included in the key to prevent stale transport
-// reuse across configuration hot-reloads under load.
+// Resolved pool settings (shortMode, idleConnTimeout, maxIdleConnsPerHost) are included
+// in the key to prevent stale transport reuse across configuration hot-reloads under load.
 type antigravityTransportKey struct {
-	credential                  string
-	proxy                       string
-	base                        *http.Transport
-	shortMode                   bool
-	idleConnTimeout             time.Duration
-	maxIdleConnsPerHost         int
-	maxIdleConnsPerHostExplicit bool
+	credential          string
+	proxy               string
+	base                *http.Transport
+	shortMode           bool
+	idleConnTimeout     time.Duration
+	maxIdleConnsPerHost int
 }
 
 func defaultAntigravityBaseTransport() *http.Transport {
@@ -300,31 +268,20 @@ func defaultAntigravityBaseTransport() *http.Transport {
 	return &http.Transport{}
 }
 
-func cloneTransportWithHTTP11(base *http.Transport, cfgs ...*config.Config) *http.Transport {
+func cloneTransportWithHTTP11(base *http.Transport, proxyURL string, cfgs ...*config.Config) *http.Transport {
 	if base == nil {
 		return nil
 	}
 
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	if clone.TLSClientConfig == nil {
-		clone.TLSClientConfig = &tls.Config{}
-	} else {
-		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
-	}
-	// Native Antigravity sends no ALPN extension. With HTTP/2 disabled above,
-	// an empty NextProtos keeps the wire shape aligned while using HTTP/1.1.
-	clone.TLSClientConfig.NextProtos = nil
+	clone := misc.ConfigureAntigravityHTTP11Transport(base, proxyURL)
 	applyAntigravityPoolLimits(clone, cfgs...)
 	return clone
 }
 
 // applyAntigravityPoolLimits configures connection pool parameters for Antigravity.
 // Default: IdleConnTimeout=30s, MaxIdleConnsPerHost=2.
-// IdleConnTimeout is strictly capped at 210s (antigravityMaxAllowedIdleConnTimeout),
-// keeping a 30s safety margin below the Google Frontend (GFE / ESF) 240s HTTP/1.1 idle cutoff.
+// IdleConnTimeout is strictly capped at 240s (antigravityMaxAllowedIdleConnTimeout)
+// matching the Google Frontend (GFE / ESF) HTTP/1.1 idle cutoff.
 // If short-lived connection mode is configured, MaxIdleConnsPerHost is set to -1
 // so idle connections are closed immediately upon request completion.
 func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Config) {
@@ -348,13 +305,8 @@ func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Confi
 		return
 	}
 
-	// Apply MaxIdleConnsPerHost:
-	// If explicitly configured, honor the configured limit even when lower than the base transport.
-	// Otherwise, ensure at least the default limit (Go treats 0 as DefaultMaxIdleConnsPerHost = 2)
-	// while preserving larger operator-configured base transport limits.
-	if settings.maxIdleConnsPerHostExplicit {
-		transport.MaxIdleConnsPerHost = settings.maxIdleConnsPerHost
-	} else if transport.MaxIdleConnsPerHost < settings.maxIdleConnsPerHost {
+	// Go treats 0 as DefaultMaxIdleConnsPerHost (2). Ensure at least configured/default limit.
+	if transport.MaxIdleConnsPerHost < settings.maxIdleConnsPerHost {
 		transport.MaxIdleConnsPerHost = settings.maxIdleConnsPerHost
 	}
 
@@ -366,7 +318,7 @@ func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Confi
 	// Apply IdleConnTimeout:
 	// If the config explicitly specified a timeout, apply settings.idleConnTimeout.
 	// If config did not specify a timeout:
-	// - if base transport already has a timeout > 0, preserve it (capped at 210s).
+	// - if base transport already has a timeout > 0, preserve it (capped at 240s).
 	// - otherwise, apply default 30s.
 	rawTimeout := ""
 	if cfg != nil {
@@ -394,22 +346,21 @@ func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, c
 	}
 	settings := resolveAntigravityPoolSettings(cfg)
 	key := antigravityTransportKey{
-		credential:                  antigravityTransportScope(auth),
-		base:                        base,
-		shortMode:                   settings.shortMode,
-		idleConnTimeout:             settings.idleConnTimeout,
-		maxIdleConnsPerHost:         settings.maxIdleConnsPerHost,
-		maxIdleConnsPerHostExplicit: settings.maxIdleConnsPerHostExplicit,
+		credential:          antigravityTransportScope(auth),
+		base:                base,
+		shortMode:           settings.shortMode,
+		idleConnTimeout:     settings.idleConnTimeout,
+		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
 	}
 	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
-		return cloneTransportWithHTTP11(base, cfgs...), nil
+		return cloneTransportWithHTTP11(base, "", cfgs...), nil
 	})
 	if errGet != nil {
 		// Defensive only: the builder above cannot fail. Never return nil here, because a
 		// nil Transport makes http.Client fall back to http.DefaultTransport, which
 		// advertises h2 over ALPN and would break the Antigravity wire fingerprint.
 		log.Debugf("antigravity executor: cache HTTP/1.1 transport failed: %v", errGet)
-		return cloneTransportWithHTTP11(base, cfgs...)
+		return cloneTransportWithHTTP11(base, "", cfgs...)
 	}
 	return transport
 }
@@ -429,12 +380,11 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
 	}
 	settings := resolveAntigravityPoolSettings(cfg)
 	key := antigravityTransportKey{
-		credential:                  antigravityTransportScope(auth),
-		proxy:                       proxyURL,
-		shortMode:                   settings.shortMode,
-		idleConnTimeout:             settings.idleConnTimeout,
-		maxIdleConnsPerHost:         settings.maxIdleConnsPerHost,
-		maxIdleConnsPerHostExplicit: settings.maxIdleConnsPerHostExplicit,
+		credential:          antigravityTransportScope(auth),
+		proxy:               proxyURL,
+		shortMode:           settings.shortMode,
+		idleConnTimeout:     settings.idleConnTimeout,
+		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
 	}
 	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
 		base, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
@@ -444,7 +394,7 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
 		if base == nil {
 			return nil, fmt.Errorf("antigravity executor: proxy setting produced no transport")
 		}
-		return cloneTransportWithHTTP11(base, cfgs...), nil
+		return cloneTransportWithHTTP11(base, proxyURL, cfgs...), nil
 	})
 	if errGet != nil {
 		// The caller falls back to NewProxyAwareHTTPClient, which reports the failure
@@ -455,65 +405,12 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
 }
 
 // antigravityTransportScope returns the connection-pool scope for one credential.
-// Runtime auths always carry an ID. The credential marker is included when available
-// so replacing the account behind a stable ID cannot reuse the previous account's
-// keep-alive TCP/TLS connections. Incomplete auth objects, such as those built by
-// tests, plugins or SDK embedders, fall back to another stable marker so they neither
-// share a pool with an unrelated OAuth identity nor allocate a fresh pool on every
-// request.
+// Runtime auths always carry an ID. Incomplete auth objects, such as those built by
+// tests, plugins or SDK embedders, fall back to another stable credential marker so
+// they neither share a pool with an unrelated OAuth identity nor allocate a fresh
+// pool, and with it a fresh set of pool goroutines, on every single request.
 func antigravityTransportScope(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return antigravityAnonymousTransportScope
-	}
-
-	credentialScope := antigravityTransportCredentialScope(auth)
-	identity := ""
-	if id := strings.TrimSpace(auth.ID); id != "" {
-		identity = "id:" + id
-	} else if auth.Attributes != nil {
-		if path := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); path != "" {
-			identity = "path:" + path
-		} else if source := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); source != "" {
-			identity = "source:" + source
-		}
-	}
-	if identity != "" {
-		if credentialScope != "" {
-			return identity + "|" + credentialScope
-		}
-		if auth.RegistrationEpoch > 0 {
-			return fmt.Sprintf("%s|epoch:%d", identity, auth.RegistrationEpoch)
-		}
-		return identity
-	}
-	if credentialScope != "" {
-		return credentialScope
-	}
-	return antigravityAnonymousTransportScope
-}
-
-func antigravityTransportCredentialScope(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	// The refresh token is preferred over the access token because it stays stable
-	// across access-token rotation. Refresh requests also run before any access token
-	// exists, so this keeps their connection in the same credential pool.
-	if refresh := strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")); refresh != "" {
-		return antigravityCredentialScope("refresh:", refresh)
-	}
-	if access := strings.TrimSpace(metaStringValue(auth.Metadata, "access_token")); access != "" {
-		return antigravityCredentialScope("token:", access)
-	}
-	return ""
-}
-
-// antigravityCredentialScope derives a pool scope from secret credential material.
-// Only a short digest is retained, and it is never logged, so a pool key cannot be
-// used to recover the credential it came from.
-func antigravityCredentialScope(prefix, secret string) string {
-	digest := sha256.Sum256([]byte(secret))
-	return prefix + hex.EncodeToString(digest[:8])
+	return helps.AntigravityCredentialScope(auth)
 }
 
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
@@ -521,8 +418,7 @@ func antigravityCredentialScope(prefix, secret string) string {
 // negotiates TLS 1.3 without advertising an ALPN protocol and therefore never uses h2.
 // The underlying Transport is always shared so keep-alive connections survive across
 // requests instead of forcing a fresh TCP + TLS handshake every time.
-func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
-	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	// Native Antigravity reuses one transport across requests. Opt into a
 	// credential-scoped proxy transport only here so other providers keep their
 	// existing lifecycle and different OAuth identities remain isolated.
@@ -534,7 +430,7 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 		// context transport fallback, preserving the previous behavior.
 	}
 
-	client := helps.NewProxyAwareHTTPClient(httptransport.WithoutDecorator(ctx), cfg, auth, timeout)
+	client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
 	// Direct requests share an HTTP/1.1 pool only within the selected credential.
 	if client.Transport == nil {
 		client.Transport = antigravityHTTP11Transport(auth, antigravityBaseTransport, cfg)
@@ -559,6 +455,71 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	return client
 }
 
+// newAntigravityOAuthHTTPClient creates an HTTP client for OAuth token refresh
+// (oauth2.googleapis.com), matching agy's HTTP/2-capable client with the exact
+// agy 1.5.14 uTLS ClientHello (ALPN ["h2", "http/1.1"]). It returns owned=true
+// when the caller should call CloseIdleConnections on the returned client.
+func pooledAntigravityOAuthRoundTripper(credScope, proxyURL string) http.RoundTripper {
+	key := credScope + "|" + strings.TrimSpace(proxyURL)
+	antigravityOAuthMu.Lock()
+	defer antigravityOAuthMu.Unlock()
+	if rt, ok := antigravityOAuthClients[key]; ok && rt != nil {
+		return rt
+	}
+	if len(antigravityOAuthClients) >= 512 {
+		for _, rt := range antigravityOAuthClients {
+			if closer, ok := rt.(interface{ CloseIdleConnections() }); ok {
+				closer.CloseIdleConnections()
+			}
+		}
+		clear(antigravityOAuthClients)
+	}
+	rt := misc.NewAntigravityDualProtoRoundTripper(antigravityBaseTransport, proxyURL)
+	antigravityOAuthClients[key] = rt
+	return rt
+}
+
+func newAntigravityOAuthHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (*http.Client, bool) {
+	if proxyURL := antigravityProxyURL(ctx, cfg, auth); proxyURL != "" {
+		return &http.Client{
+			Transport: pooledAntigravityOAuthRoundTripper(antigravityTransportScope(auth), proxyURL),
+			Timeout:   timeout,
+		}, false
+	}
+	if ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			if tr, isHTTP := rt.(*http.Transport); isHTTP {
+				if tr == nil {
+					tr = antigravityBaseTransport
+				}
+				return &http.Client{
+					Transport: misc.NewAntigravityDualProtoRoundTripper(tr, ""),
+					Timeout:   timeout,
+				}, true
+			}
+			// Preserve non-*http.Transport mocks/custom round trippers verbatim.
+			return &http.Client{Transport: rt, Timeout: timeout}, false
+		}
+	}
+	return &http.Client{
+		Transport: pooledAntigravityOAuthRoundTripper(antigravityTransportScope(auth), ""),
+		Timeout:   timeout,
+	}, false
+}
+
+// AntigravityHTTP11Transport returns the credential-scoped HTTP/1.1 uTLS
+// connection pool shared with AntigravityExecutor for the given validated
+// effectiveProxy (empty for direct). Callers must not close idle connections
+// on the returned transport.
+func AntigravityHTTP11Transport(cfg *config.Config, auth *cliproxyauth.Auth, effectiveProxy string) *http.Transport {
+	if trimmed := strings.TrimSpace(effectiveProxy); trimmed != "" {
+		if transport := antigravityProxiedHTTP11Transport(auth, trimmed, cfg); transport != nil {
+			return transport
+		}
+	}
+	return antigravityHTTP11Transport(auth, antigravityBaseTransport, cfg)
+}
+
 func antigravityProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) string {
 	if proxyURL := cliproxyexecutor.RequestProxyURL(ctx); proxyURL != "" {
 		return proxyURL
@@ -575,19 +536,11 @@ func antigravityProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxy
 }
 
 func sanitizeAntigravityGeminiRequestSignatures(modelName string, rawJSON []byte) []byte {
-	if !antigravityUsesReasoningReplayCache(modelName) {
+	if !agyAntigravityUsesReasoningReplayCache(modelName) {
 		return rawJSON
 	}
-	rawJSON = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(rawJSON, "request.contents")
-	return normalizeAntigravityGeminiFunctionResponseRoles(rawJSON)
-}
-
-func sanitizeAntigravityGeminiRequestSignaturesDoc(modelName string, doc *ojson.Doc) {
-	if doc == nil || !antigravityUsesReasoningReplayCache(modelName) {
-		return
-	}
-	internalsignature.SanitizeNonVertexGeminiRequestThoughtSignaturesDoc(doc, "request.contents")
-	normalizeAntigravityGeminiFunctionResponseRolesDoc(doc)
+	rawJSON = internalsignature.SanitizeAgyGeminiRequestThoughtSignatures(rawJSON, "request.contents")
+	return agyNormalizeAntigravityGeminiFunctionResponseRoles(rawJSON)
 }
 
 // ensureAntigravityGeminiLeadingUserContent prepends a synthetic empty user turn
@@ -597,14 +550,7 @@ func ensureAntigravityGeminiLeadingUserContent(modelName string, payload []byte)
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		return payload
 	}
-	return helps.EnsureGeminiLeadingUserContent(payload, "request.contents")
-}
-
-func ensureAntigravityGeminiLeadingUserContentDoc(modelName string, doc *ojson.Doc) bool {
-	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
-		return false
-	}
-	return helps.EnsureGeminiLeadingUserContentDoc(doc, "request.contents")
+	return helps.EnsureAgyGeminiLeadingUserContent(payload, "request.contents")
 }
 
 // ensureAntigravityGeminiTrailingUserContent appends a synthetic empty user turn
@@ -614,37 +560,16 @@ func ensureAntigravityGeminiTrailingUserContent(modelName string, payload []byte
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		return payload
 	}
-	return helps.EnsureGeminiTrailingUserContent(payload, "request.contents")
-}
-
-func ensureAntigravityGeminiTrailingUserContentDoc(modelName string, doc *ojson.Doc) bool {
-	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
-		return false
-	}
-	return helps.EnsureGeminiTrailingUserContentDoc(doc, "request.contents")
+	return helps.EnsureAgyGeminiTrailingUserContent(payload, "request.contents")
 }
 
 // ensureAntigravityGeminiBoundaryUserContent normalizes both leading and trailing
-// turns for Gemini targets. A trailing reasoning-only model turn is dropped first
-// so the request does not rely only on a synthetic empty user turn (#6530).
-// Claude targets are left unchanged.
+// turns for Gemini targets. Claude targets are left unchanged.
 func ensureAntigravityGeminiBoundaryUserContent(modelName string, payload []byte) []byte {
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		return payload
 	}
-	payload = helps.DropGeminiTrailingThoughtOnlyContent(payload, "request.contents")
-	return helps.EnsureGeminiBoundaryUserContent(payload, "request.contents")
-}
-
-func ensureAntigravityGeminiBoundaryUserContentDoc(modelName string, doc *ojson.Doc) bool {
-	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
-		return false
-	}
-	changed := helps.DropGeminiTrailingThoughtOnlyContentDoc(doc, "request.contents")
-	if helps.EnsureGeminiBoundaryUserContentDoc(doc, "request.contents") {
-		changed = true
-	}
-	return changed
+	return helps.EnsureAgyGeminiBoundaryUserContent(payload, "request.contents")
 }
 
 type antigravityContentEdit struct {
@@ -655,31 +580,11 @@ type antigravityContentEdit struct {
 	replacement []byte
 }
 
-func normalizeAntigravityGeminiFunctionResponseRolesDoc(doc *ojson.Doc) bool {
-	if doc == nil {
-		return false
-	}
-	contents := doc.Get("request.contents")
-	if !contents.IsArray() {
-		return false
-	}
-	wrapped := []byte(`{"request":{"contents":` + contents.Raw + `}}`)
-	normalized := normalizeAntigravityGeminiFunctionResponseRoles(wrapped)
-	if bytes.Equal(normalized, wrapped) {
-		return false
-	}
-	updatedContents := util.GetGJSONBytesNoCopy(normalized, "request.contents")
-	if !updatedContents.IsArray() || updatedContents.Raw == contents.Raw {
-		return false
-	}
-	return doc.SetRawBytes("request.contents", []byte(updatedContents.Raw)) == nil
-}
-
 // normalizeAntigravityGeminiFunctionResponseRoles edits each response turn in
 // isolation, then splices all changed turns into the request with one body copy.
 // Applying SJSON once per field made large histories scale with history size
 // multiplied by the number of tool turns.
-func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
+func agyNormalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 	rawJSON = repairAntigravityGeminiFunctionResponseNames(rawJSON)
 	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
 	if !contents.IsArray() {
@@ -737,7 +642,7 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 			return true
 		}
 
-		var contentDoc *ojson.Doc
+		var contentJSON []byte
 		contentChanged := false
 		if len(pending) > 0 && len(responses) > 0 {
 			ordered := make([]json.RawMessage, 0, partCount)
@@ -761,10 +666,26 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 			}
 			if len(ordered) == len(responseParts) {
 				ordered = append(ordered, otherParts...)
-				encoded, errMarshal := json.Marshal(ordered)
-				if errMarshal == nil && !bytes.Equal(encoded, []byte(parts.Raw)) {
-					contentDoc = ojson.NewDoc([]byte(content.Raw))
-					if errSet := contentDoc.SetRawBytes("parts", encoded); errSet == nil {
+				// Join raw JSON parts directly instead of json.Marshal(ordered),
+				// because encoding/json escapes <, >, and & inside json.RawMessage
+				// into \u003c/\u003e/\u0026 even when part order did not change.
+				var buf bytes.Buffer
+				buf.Grow(len(parts.Raw) + 2)
+				buf.WriteByte('[')
+				for i, rawPart := range ordered {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					if errCompact := json.Compact(&buf, rawPart); errCompact != nil {
+						buf.Write(rawPart)
+					}
+				}
+				buf.WriteByte(']')
+				encoded := buf.Bytes()
+				if !bytes.Equal(encoded, []byte(parts.Raw)) {
+					contentJSON = []byte(content.Raw)
+					if updated, errSet := ojson.SetRawBytes(contentJSON, "parts", encoded); errSet == nil {
+						contentJSON = updated
 						contentChanged = true
 					}
 				}
@@ -772,17 +693,17 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 		}
 		pending = nil
 		if !hasOtherPart && content.Get("role").String() != "model" {
-			if contentDoc == nil {
-				contentDoc = ojson.NewDoc([]byte(content.Raw))
+			if contentJSON == nil {
+				contentJSON = []byte(content.Raw)
 			}
-			if errSet := contentDoc.Set("role", "model"); errSet == nil {
+			if updated, errSet := ojson.SetBytes(contentJSON, "role", "model"); errSet == nil {
+				contentJSON = updated
 				contentChanged = true
 			}
 		}
-		if !contentChanged || contentDoc == nil {
+		if !contentChanged {
 			return true
 		}
-		contentJSON := contentDoc.Bytes()
 
 		start := content.Index
 		end := start + len(content.Raw)
@@ -797,29 +718,29 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 		})
 		return true
 	})
-	return applyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
+	return agyApplyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
 }
 
 // applyAntigravityIndexedEdits splices collected JSON fragments into the original
 // request with one body copy. Applying SJSON once per field made large histories
 // scale with history size multiplied by the number of edits.
-func applyAntigravityIndexedEdits(rawJSON []byte, edits []antigravityContentEdit, validOffsets bool) []byte {
+func agyApplyAntigravityIndexedEdits(rawJSON []byte, edits []antigravityContentEdit, validOffsets bool) []byte {
 	if len(edits) == 0 {
 		return rawJSON
 	}
-	if !validOffsets || !ojson.ValidBytes(rawJSON) {
-		return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+	if !validOffsets {
+		return agyApplyAntigravityContentEditsWithSJSON(rawJSON, edits)
 	}
 
 	finalSize := len(rawJSON)
 	cursor := 0
 	for _, edit := range edits {
 		if edit.start < cursor {
-			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+			return agyApplyAntigravityContentEditsWithSJSON(rawJSON, edits)
 		}
 		finalSize += len(edit.replacement) - (edit.end - edit.start)
 		if finalSize < 0 {
-			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+			return agyApplyAntigravityContentEditsWithSJSON(rawJSON, edits)
 		}
 		cursor = edit.end
 	}
@@ -835,22 +756,18 @@ func applyAntigravityIndexedEdits(rawJSON []byte, edits []antigravityContentEdit
 
 // applyAntigravityContentEditsWithSJSON preserves the legacy path semantics if
 // a GJSON result cannot be proven to point into the original request bytes.
-func applyAntigravityContentEditsWithSJSON(rawJSON []byte, edits []antigravityContentEdit) []byte {
-	doc := ojson.NewDoc(rawJSON)
-	changed := false
+func agyApplyAntigravityContentEditsWithSJSON(rawJSON []byte, edits []antigravityContentEdit) []byte {
+	out := rawJSON
 	for _, edit := range edits {
 		path := edit.path
 		if path == "" {
 			path = fmt.Sprintf("request.contents.%d", edit.index)
 		}
-		if errSet := doc.SetRawBytes(path, edit.replacement); errSet == nil {
-			changed = true
+		if updated, errSet := ojson.SetRawBytes(out, path, edit.replacement); errSet == nil {
+			out = updated
 		}
 	}
-	if !changed {
-		return rawJSON
-	}
-	return doc.Bytes()
+	return out
 }
 
 // repairAntigravityGeminiFunctionResponseNames copies missing or placeholder
@@ -925,7 +842,7 @@ func repairAntigravityGeminiFunctionResponseNames(rawJSON []byte) []byte {
 		})
 		return true
 	})
-	return applyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
+	return agyApplyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
 }
 
 func validateAntigravityRequestSignatures(ctx context.Context, modelName string, from sdktranslator.Format, rawJSON []byte) ([]byte, error) {
@@ -933,17 +850,13 @@ func validateAntigravityRequestSignatures(ctx context.Context, modelName string,
 		return rawJSON, nil
 	}
 	before := countClaudeThinkingBlocks(rawJSON)
-	if antigravityUsesReasoningReplayCache(modelName) {
+	if agyAntigravityUsesReasoningReplayCache(modelName) {
 		rawJSON = antigravityclaude.StripInvalidGeminiSignatureThinkingBlocks(rawJSON)
 		logAntigravitySignatureStrip(before, countClaudeThinkingBlocks(rawJSON), "provider_cleanup", "empty_or_non_gemini_signature")
 		return rawJSON, nil
 	}
-	// Claude models accept only Claude-format thinking signatures. In cache mode,
-	// unsigned thinking blocks must survive until the translator recovers a
-	// signature for the current credential scope.
-	if !cache.SignatureCacheEnabled() {
-		rawJSON = antigravityclaude.StripEmptySignatureThinkingBlocks(rawJSON)
-	}
+	// Claude models accept only Claude-format thinking signatures.
+	rawJSON = antigravityclaude.StripEmptySignatureThinkingBlocks(rawJSON)
 	logAntigravitySignatureStrip(before, countClaudeThinkingBlocks(rawJSON), "prefix_cleanup", "empty_or_non_claude_signature")
 	if cache.SignatureCacheEnabled() {
 		return rawJSON, nil
@@ -1065,41 +978,29 @@ func (e *AntigravityExecutor) Identifier() string { return antigravityAuthType }
 
 // PrepareRequest injects Antigravity credentials into the outgoing HTTP request.
 func (e *AntigravityExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
-	_, errPrepare := e.prepareRequestWithAuth(req, auth)
-	return errPrepare
-}
-
-func (e *AntigravityExecutor) prepareRequestWithAuth(req *http.Request, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if req == nil {
-		return auth, nil
+		return nil
 	}
-	token, updatedAuth, errToken := e.ensureAccessToken(req.Context(), auth)
+	token, _, errToken := e.ensureAccessToken(req.Context(), auth)
 	if errToken != nil {
-		return nil, errToken
-	}
-	if updatedAuth != nil {
-		auth = updatedAuth
+		return errToken
 	}
 	if strings.TrimSpace(token) == "" {
-		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+		return statusErr{code: http.StatusUnauthorized, msg: "missing access token", credentialScoped: true}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	return auth, nil
+	return nil
 }
 
 // HttpRequest injects Antigravity credentials into the request and executes it.
 // It uses a whitelist approach: all incoming headers are stripped and only
-// the minimum set required by the Antigravity protocol (plus per-credential
-// custom header:* attributes) is explicitly set.
+// the minimum set required by the Antigravity protocol is explicitly set.
 func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, fmt.Errorf("antigravity executor: request is nil")
 	}
 	if ctx == nil {
 		ctx = req.Context()
-	}
-	if antigravityInTOSPause(e.cfg, auth) {
-		return nil, newAntigravityTOSPauseStatusErr()
 	}
 	httpReq := req.WithContext(ctx)
 
@@ -1112,141 +1013,23 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	// --- Whitelist: save only the headers we need from the original request ---
 	contentType := httpReq.Header.Get("Content-Type")
 
-	// Wipe ALL incoming headers without mutating the caller's header map or panicking on nil Header.
-	httpReq.Header = make(http.Header)
+	// Wipe ALL incoming headers
+	for k := range httpReq.Header {
+		delete(httpReq.Header, k)
+	}
 
 	// --- Set only the headers Antigravity actually sends ---
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
 	}
-
-	// Inject Authorization: Bearer <token> and adopt any refreshed/newer auth snapshot.
-	effectiveAuth, errPrepare := e.prepareRequestWithAuth(httpReq, auth)
-	if errPrepare != nil {
-		return nil, errPrepare
-	}
-	if effectiveAuth != nil {
-		auth = effectiveAuth
-	}
-
 	// Content-Length is managed automatically by Go's http.Client from the Body
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
 
-	if httpReq.URL != nil {
-		if host := strings.TrimSpace(httpReq.URL.Host); host != "" {
-			httpReq.Host = host
-		}
+	// Inject Authorization: Bearer <token>
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return nil, err
 	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
 
-	httpClient := helps.WithAntigravityHTTPClientTrace(newAntigravityHTTPClient(ctx, e.cfg, auth, 0), auth, "http_request")
-	installAntigravityHTTPRequestRedirectPolicy(httpClient, attrs)
+	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
-
-func installAntigravityHTTPRequestRedirectPolicy(client *http.Client, attrs map[string]string) {
-	if client == nil {
-		return
-	}
-	customNames := antigravityCustomHeaderNames(attrs)
-	previous := client.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if antigravityCrossOriginRedirect(req, via) {
-			stripAntigravityCrossOriginHeaders(req, customNames)
-		}
-		if previous != nil {
-			return previous(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
-}
-
-func antigravityCustomHeaderNames(attrs map[string]string) map[string]struct{} {
-	if len(attrs) == 0 {
-		return nil
-	}
-	names := make(map[string]struct{})
-	for k := range attrs {
-		if !strings.HasPrefix(k, "header:") {
-			continue
-		}
-		name := strings.TrimSpace(strings.TrimPrefix(k, "header:"))
-		if name == "" {
-			continue
-		}
-		names[strings.ToLower(name)] = struct{}{}
-	}
-	if len(names) == 0 {
-		return nil
-	}
-	return names
-}
-
-func stripAntigravityCrossOriginHeaders(req *http.Request, customNames map[string]struct{}) {
-	if req == nil {
-		return
-	}
-	req.Host = ""
-	for name := range req.Header {
-		lower := strings.ToLower(name)
-		if lower == "authorization" || lower == "host" {
-			delete(req.Header, name)
-			continue
-		}
-		if _, ok := customNames[lower]; ok {
-			delete(req.Header, name)
-		}
-	}
-}
-
-func antigravityCrossOriginRedirect(req *http.Request, via []*http.Request) bool {
-	if req == nil || len(via) == 0 || via[0] == nil {
-		return false
-	}
-	origin := via[0].URL
-	if !antigravitySameRedirectOrigin(origin, req.URL) {
-		return true
-	}
-	for _, hop := range via[1:] {
-		if hop == nil || !antigravitySameRedirectOrigin(origin, hop.URL) {
-			return true
-		}
-	}
-	return false
-}
-
-func antigravitySameRedirectOrigin(a, b *url.URL) bool {
-	if a == nil || b == nil || a.Hostname() == "" || b.Hostname() == "" {
-		return false
-	}
-	return strings.EqualFold(a.Scheme, b.Scheme) &&
-		strings.EqualFold(a.Hostname(), b.Hostname()) &&
-		antigravityRedirectOriginPort(a) == antigravityRedirectOriginPort(b)
-}
-
-func antigravityRedirectOriginPort(u *url.URL) string {
-	if u == nil {
-		return ""
-	}
-	if port := u.Port(); port != "" {
-		return port
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http":
-		return "80"
-	case "https":
-		return "443"
-	default:
-		return ""
-	}
-}
-
-// SupportsApplyPatch reports the actual executor contract, independent of its provider name.
-func (e *AntigravityExecutor) SupportsApplyPatch() bool { return e != nil }

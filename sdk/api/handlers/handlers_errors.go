@@ -115,6 +115,10 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
+	h.writeErrorResponse(c, msg, BuildErrorResponseBodyWithError)
+}
+
+func (h *BaseAPIHandler) writeErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage, buildBody func(status int, errText string, err error) []byte) {
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
@@ -156,7 +160,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil {
 		errCause = msg.Error
 	}
-	body := BuildErrorResponseBodyWithError(status, errText, errCause)
+	body := buildBody(status, errText, errCause)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

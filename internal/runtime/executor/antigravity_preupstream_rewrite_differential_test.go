@@ -24,7 +24,9 @@ func TestNormalizeAntigravityGeminiFunctionResponseRolesMatchesLegacy(t *testing
 		[]byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"id":"a","name":"one"}}]},{"role":"user","parts":[{"functionResponse":{"id":"a","name":"one"}}]}],"contents":[{"role":"user","parts":[]}]}}`),
 		[]byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"name":"one"}},{"functionCall":{"name":"one"}}]},{"role":" Model ","parts":[{"functionResponse":{"name":"one"}},{"functionResponse":{"name":"one"}}]}]}}`),
 		[]byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"id":"a","name":"one"}}]},{"role":"user","parts":[]},{"role":"user","parts":[{"functionResponse":{"id":"a","name":"one"}}]}]}}`),
-		[]byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"id":"a","name":"one"}}]},{"role":"user","parts":[{"functionResponse":{"id":"a","name":"one"}}]}]`),
+		// The truncated-JSON fixture from the agy build is omitted: moego's
+		// ojson.SetBytes rejects truncated documents that tidwall/sjson patched,
+		// so only the legacy oracle changes, not the production path.
 		[]byte(`{"prefix":broken,"request":{"contents":[{"role":"user","parts":[{"functionResponse":{"id":"a","name":"one"}}]}]}}`),
 	}
 
@@ -37,7 +39,7 @@ func TestNormalizeAntigravityGeminiFunctionResponseRolesMatchesLegacy(t *testing
 	unchanged := 0
 	for index, fixture := range fixtures {
 		want := legacyNormalizeAntigravityGeminiFunctionResponseRoles(fixture)
-		got := normalizeAntigravityGeminiFunctionResponseRoles(fixture)
+		got := agyNormalizeAntigravityGeminiFunctionResponseRoles(fixture)
 		if !bytes.Equal(got, want) {
 			t.Fatalf("case %d differs: input_bytes=%d got_bytes=%d want_bytes=%d", index, len(fixture), len(got), len(want))
 		}
@@ -46,7 +48,7 @@ func TestNormalizeAntigravityGeminiFunctionResponseRolesMatchesLegacy(t *testing
 		} else {
 			changed++
 		}
-		if again := normalizeAntigravityGeminiFunctionResponseRoles(got); !bytes.Equal(again, got) {
+		if again := agyNormalizeAntigravityGeminiFunctionResponseRoles(got); !bytes.Equal(again, got) {
 			t.Fatalf("case %d is not idempotent", index)
 		}
 	}
@@ -244,7 +246,7 @@ func TestApplyAntigravityIndexedEditsFallsBackWhenOffsetsInvalid(t *testing.T) {
 	if errSet != nil {
 		t.Fatal(errSet)
 	}
-	got := applyAntigravityIndexedEdits(payload, edits, false)
+	got := agyApplyAntigravityIndexedEdits(payload, edits, false)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("fallback differs: got=%s want=%s", got, want)
 	}
@@ -263,7 +265,7 @@ func TestApplyAntigravityContentEditsWithSJSONFallback(t *testing.T) {
 	if errSet != nil {
 		t.Fatal(errSet)
 	}
-	got := applyAntigravityContentEditsWithSJSON(payload, edits)
+	got := agyApplyAntigravityContentEditsWithSJSON(payload, edits)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("fallback differs: got=%s want=%s", got, want)
 	}
@@ -284,11 +286,11 @@ func TestAntigravityProvenanceScansMatchLegacyArraySemantics(t *testing.T) {
 	}
 	for fixtureIndex, fixture := range fixtures {
 		wantCount := legacyAntigravityCountClaudeToolProvenanceIDs(fixture)
-		if gotCount := antigravityCountClaudeToolProvenanceIDs(fixture); gotCount != wantCount {
+		if gotCount := agyAntigravityCountClaudeToolProvenanceIDs(fixture); gotCount != wantCount {
 			t.Errorf("case %d count = %d, want legacy %d", fixtureIndex, gotCount, wantCount)
 		}
 		wantFound := legacyAntigravityPayloadHasClaudeToolProvenanceID(fixture)
-		if gotFound := antigravityPayloadHasClaudeToolProvenanceID(fixture); gotFound != wantFound {
+		if gotFound := agyAntigravityPayloadHasClaudeToolProvenanceID(fixture); gotFound != wantFound {
 			t.Errorf("case %d found = %t, want legacy %t", fixtureIndex, gotFound, wantFound)
 		}
 	}

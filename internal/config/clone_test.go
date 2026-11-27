@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -550,16 +551,20 @@ api-keys:
 }
 
 func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
+	effective := func(v *bool) bool { return v == nil || *v }
 	for name, tc := range map[string]struct {
-		raw  string
-		want bool
+		raw     string
+		wantNil bool
+		want    bool
 	}{
-		"omitted": {raw: "antigravity:\n  sensitive-words: [\"API\"]\n", want: false},
-		"legacy":  {raw: "antigravity:\n  stop-on-bare-429: true\n", want: true},
-		"v8":      {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: true\n", want: true},
+		"omitted":      {raw: "antigravity:\n  sensitive-words: [\"API\"]\n", wantNil: true, want: true},
+		"legacy":       {raw: "antigravity:\n  stop-on-bare-429: true\n", want: true},
+		"legacy-false": {raw: "antigravity:\n  stop-on-bare-429: false\n", want: false},
+		"v8":           {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: true\n", want: true},
+		"v8-false":     {raw: "config-version: 8\noauth:\n  providers:\n    antigravity:\n      stop-on-bare-429: false\n", want: false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if name == "v8" {
+			if strings.HasPrefix(name, "v8") {
 				if errValidate := ValidateV8Config([]byte(tc.raw)); errValidate != nil {
 					t.Fatalf("ValidateV8Config() error = %v", errValidate)
 				}
@@ -568,16 +573,20 @@ func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
 			if errParse != nil {
 				t.Fatalf("ParseConfigBytes() error = %v", errParse)
 			}
-			if cfg.Antigravity.StopOnBare429 != tc.want {
-				t.Fatalf("Antigravity.StopOnBare429 = %v, want %v", cfg.Antigravity.StopOnBare429, tc.want)
+			if (cfg.Antigravity.StopOnBare429 == nil) != tc.wantNil || effective(cfg.Antigravity.StopOnBare429) != tc.want {
+				t.Fatalf("Antigravity.StopOnBare429 = %v, want nil=%v effective=%v", cfg.Antigravity.StopOnBare429, tc.wantNil, tc.want)
 			}
-			if cloned := cfg.CloneForRuntime(); cloned.Antigravity.StopOnBare429 != tc.want {
-				t.Fatalf("cloned Antigravity.StopOnBare429 = %v, want %v", cloned.Antigravity.StopOnBare429, tc.want)
+			cloned := cfg.CloneForRuntime()
+			if effective(cloned.Antigravity.StopOnBare429) != tc.want {
+				t.Fatalf("cloned Antigravity.StopOnBare429 = %v, want effective %v", cloned.Antigravity.StopOnBare429, tc.want)
+			}
+			if cfg.Antigravity.StopOnBare429 != nil && cloned.Antigravity.StopOnBare429 == cfg.Antigravity.StopOnBare429 {
+				t.Fatal("cloned StopOnBare429 shares pointer with original")
 			}
 		})
 	}
 
-	migrated, changed, errNormalize := NormalizeConfigLayout([]byte("antigravity:\n  stop-on-bare-429: true\n"), true)
+	migrated, changed, errNormalize := NormalizeConfigLayout([]byte("antigravity:\n  stop-on-bare-429: false\n"), true)
 	if errNormalize != nil || !changed {
 		t.Fatalf("NormalizeConfigLayout() changed=%v error=%v", changed, errNormalize)
 	}
@@ -585,8 +594,8 @@ func TestParseConfigBytes_AntigravityStopOnBare429(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("ParseConfigBytes(migrated) error = %v", errParse)
 	}
-	if !cfg.Antigravity.StopOnBare429 {
-		t.Fatalf("Antigravity.StopOnBare429 after migration = false, want true\n%s", migrated)
+	if effective(cfg.Antigravity.StopOnBare429) {
+		t.Fatalf("Antigravity.StopOnBare429 after migration = %v, want false\n%s", cfg.Antigravity.StopOnBare429, migrated)
 	}
 }
 

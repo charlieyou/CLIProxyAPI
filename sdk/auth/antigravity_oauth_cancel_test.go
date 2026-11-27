@@ -2,18 +2,12 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func allocateFreeCallbackPort(t *testing.T) int {
@@ -85,79 +79,5 @@ func TestAntigravityCallbackServerDuplicateRequestDoesNotBlock(t *testing.T) {
 	defer cancel()
 	if errShutdown := srv.Shutdown(shutdownCtx); errShutdown != nil {
 		t.Fatalf("callback server shutdown stalled or failed: %v", errShutdown)
-	}
-}
-
-type staticRoundTripper func(*http.Request) (*http.Response, error)
-
-func (f staticRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
-type doneSignalingContext struct {
-	context.Context
-	once    sync.Once
-	entered chan struct{}
-}
-
-func (c *doneSignalingContext) Done() <-chan struct{} {
-	c.once.Do(func() {
-		close(c.entered)
-	})
-	return c.Context.Done()
-}
-
-func TestAntigravityLoginRespectsContextCancel(t *testing.T) {
-	origTransport := http.DefaultTransport
-	t.Cleanup(func() {
-		http.DefaultTransport = origTransport
-	})
-	http.DefaultTransport = staticRoundTripper(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("127.0.0.1")),
-			Request:    req,
-		}, nil
-	})
-
-	freePort := allocateFreeCallbackPort(t)
-	baseCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	waitCtx := &doneSignalingContext{
-		Context: baseCtx,
-		entered: make(chan struct{}),
-	}
-
-	type loginResult struct {
-		auth *coreauth.Auth
-		err  error
-	}
-	doneCh := make(chan loginResult, 1)
-
-	go func() {
-		record, errLogin := AntigravityAuthenticator{}.Login(waitCtx, &config.Config{}, &LoginOptions{
-			NoBrowser:    true,
-			CallbackPort: freePort,
-		})
-		doneCh <- loginResult{auth: record, err: errLogin}
-	}()
-
-	select {
-	case <-waitCtx.entered:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("AntigravityAuthenticator.Login did not enter callback wait loop")
-	}
-
-	cancel()
-
-	select {
-	case res := <-doneCh:
-		if !errors.Is(res.err, context.Canceled) {
-			t.Fatalf("expected context.Canceled, got auth=%v err=%v", res.auth, res.err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatalf("AntigravityAuthenticator.Login did not return after context cancellation")
 	}
 }

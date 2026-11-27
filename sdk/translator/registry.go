@@ -7,6 +7,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/agythinking"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -145,9 +146,9 @@ func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format
 	r.mu.RUnlock()
 
 	if fn != nil {
-		summaryConfig := thinking.ExtractTranslatedSummaryConfig(req.Body, from.String(), to.String())
+		applySummary := extractSummaryConfig(req.Body, from, to)
 		req = fn(ctx, req)
-		req.Body = thinking.ApplySummaryConfigForModel(req.Body, to.String(), req.Model, summaryConfig)
+		req.Body = applySummary(req.Body, req.Model)
 		if hooks != nil {
 			// Request normalizers run after native translation and own the final
 			// provider payload, including any summary field they remove.
@@ -179,12 +180,29 @@ func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format
 	before := configurationUpdates(req.Body)
 	req.Body = hooks.NormalizeRequest(ctx, from, to, req.Model, req.Body, req.Stream)
 	req.ConfigurationUpdatesChanged = req.ConfigurationUpdatesChanged || updatesChanged(before, configurationUpdates(req.Body))
-	summaryConfig := thinking.ExtractTranslatedSummaryConfig(req.Body, from.String(), to.String())
+	applySummary := extractSummaryConfig(req.Body, from, to)
 	if translated, ok := hooks.TranslateRequest(ctx, from, to, req.Model, req.Body, req.Stream); ok {
-		req.Body = thinking.ApplySummaryConfigForModel(translated, to.String(), req.Model, summaryConfig)
+		req.Body = applySummary(translated, req.Model)
 	}
 	req.Format = to
 	return req
+}
+
+// extractSummaryConfig captures the source summary intent and returns the
+// function that applies it to the translated body. Antigravity targets keep the
+// agy replication's frozen v7 summary pipeline (source-only extraction and v7
+// placement rules); every other target uses the v8 pipeline unchanged.
+func extractSummaryConfig(body []byte, from, to Format) func(translated []byte, model string) []byte {
+	if to == FormatAntigravity {
+		summaryConfig := agythinking.ExtractSummaryConfig(body, from.String())
+		return func(translated []byte, model string) []byte {
+			return agythinking.ApplySummaryConfigForModel(translated, to.String(), model, summaryConfig)
+		}
+	}
+	summaryConfig := thinking.ExtractTranslatedSummaryConfig(body, from.String(), to.String())
+	return func(translated []byte, model string) []byte {
+		return thinking.ApplySummaryConfigForModel(translated, to.String(), model, summaryConfig)
+	}
 }
 
 // configurationUpdates captures only Responses update items before and after a plugin

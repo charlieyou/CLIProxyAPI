@@ -2,16 +2,15 @@ package antigravity
 
 import (
 	"context"
-	"errors"
+	"crypto/sha256"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"testing/synctest"
 	"time"
-	"unicode/utf8"
+
+	"github.com/MoeForge/moego/base64"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -20,18 +19,101 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestBuildAuthURLIncludesAICodeScope(t *testing.T) {
-	parsedURL, err := url.Parse(NewAntigravityAuth(nil, nil).BuildAuthURL("state", "http://localhost/callback"))
+func TestBuildAuthURLWithPKCEMatchesAgy(t *testing.T) {
+	verifier, challenge, err := GeneratePKCE()
+	if err != nil {
+		t.Fatalf("GeneratePKCE() error = %v", err)
+	}
+	if len(verifier) != 43 || len(challenge) != 43 {
+		t.Fatalf("PKCE lengths = (%d, %d), want (43, 43)", len(verifier), len(challenge))
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	if want := base64.RawURLEncoding.EncodeToString(sum[:]); challenge != want {
+		t.Fatalf("challenge = %q, want %q", challenge, want)
+	}
+
+	state, err := GenerateState()
+	if err != nil {
+		t.Fatalf("GenerateState() error = %v", err)
+	}
+	if len(state) != 22 {
+		t.Fatalf("len(state) = %d, want 22", len(state))
+	}
+
+	auth := NewAntigravityAuth(nil, nil)
+	rawURL := auth.BuildAuthURLWithPKCE(state, OOBRedirectURI, challenge)
+	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		t.Fatalf("parse auth URL: %v", err)
 	}
-
-	for _, scope := range strings.Fields(parsedURL.Query().Get("scope")) {
-		if scope == "https://www.googleapis.com/auth/aicode" {
-			return
-		}
+	if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != "https://accounts.google.com/o/oauth2/auth" {
+		t.Fatalf("endpoint = %q", got)
 	}
-	t.Fatalf("authorization URL scope does not include %q", "https://www.googleapis.com/auth/aicode")
+	q := parsed.Query()
+	if q.Get("code_challenge") != challenge || q.Get("code_challenge_method") != "S256" {
+		t.Fatalf("PKCE query mismatch: challenge=%q method=%q", q.Get("code_challenge"), q.Get("code_challenge_method"))
+	}
+	if q.Get("redirect_uri") != OOBRedirectURI {
+		t.Fatalf("redirect_uri = %q, want %q", q.Get("redirect_uri"), OOBRedirectURI)
+	}
+	scopes := strings.Fields(q.Get("scope"))
+	if len(scopes) != 7 || scopes[5] != "https://www.googleapis.com/auth/aicode" || scopes[6] != "openid" {
+		t.Fatalf("scopes = %v", scopes)
+	}
+}
+
+func TestExtractAuthCode(t *testing.T) {
+	code, state, oauthErr := ExtractAuthCode("https://antigravity.google/oauth-callback?state=st1&code=4/0Aabc")
+	if code != "4/0Aabc" || state != "st1" || oauthErr != "" {
+		t.Fatalf("got (%q, %q, %q)", code, state, oauthErr)
+	}
+	code, state, oauthErr = ExtractAuthCode("4/0Abarecode")
+	if code != "4/0Abarecode" || state != "" || oauthErr != "" {
+		t.Fatalf("bare got (%q, %q, %q)", code, state, oauthErr)
+	}
+	code, state, oauthErr = ExtractAuthCode("https://antigravity.google/oauth-callback?state=st2&error=access_denied")
+	if code != "" || state != "st2" || oauthErr != "access_denied" {
+		t.Fatalf("err got (%q, %q, %q)", code, state, oauthErr)
+	}
+}
+
+func TestEmailFromIDToken(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"email":"user@example.com"}`))
+	if got := EmailFromIDToken(header + "." + payload + ".sig"); got != "user@example.com" {
+		t.Fatalf("EmailFromIDToken() = %q, want user@example.com", got)
+	}
+	if got := EmailFromIDToken("not-a-jwt"); got != "" {
+		t.Fatalf("EmailFromIDToken(invalid) = %q, want empty", got)
+	}
+}
+
+func TestExchangeCodeForTokensWithPKCE(t *testing.T) {
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		vals, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if vals.Get("code_verifier") != "verifier-123" {
+			t.Fatalf("code_verifier = %q, want verifier-123", vals.Get("code_verifier"))
+		}
+		if vals.Get("redirect_uri") != OOBRedirectURI {
+			t.Fatalf("redirect_uri = %q", vals.Get("redirect_uri"))
+		}
+		if ua := req.Header.Get("User-Agent"); ua != "" {
+			t.Fatalf("token exchange should leave Go default UA, got %q", ua)
+		}
+		return jsonResponse(`{"access_token":"tok","refresh_token":"ref","expires_in":3599,"token_type":"Bearer","id_token":"a.b.c"}`), nil
+	})})
+
+	tok, err := auth.ExchangeCodeForTokensWithPKCE(context.Background(), "code-1", OOBRedirectURI, "verifier-123")
+	if err != nil {
+		t.Fatalf("ExchangeCodeForTokensWithPKCE error: %v", err)
+	}
+	if tok.AccessToken != "tok" || tok.IDToken != "a.b.c" {
+		t.Fatalf("unexpected token response: %+v", tok)
+	}
 }
 
 func TestFetchProjectIDFromLoadCodeAssist(t *testing.T) {
@@ -39,16 +121,16 @@ func TestFetchProjectIDFromLoadCodeAssist(t *testing.T) {
 		if req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
 			t.Fatalf("unexpected request URL: %s", req.URL.String())
 		}
-		assertLoadCodeAssistHeaders(t, req)
+		assertControlPlaneHeaders(t, req)
 		assertJSONContains(t, req, `"ideType":"ANTIGRAVITY"`)
-		return jsonResponse(`{"cloudaicompanionProject":"cogent-snow-4mnnp"}`), nil
+		return jsonResponse(`{"cloudaicompanionProject":"aicode-consumers"}`), nil
 	})})
 
 	projectID, err := auth.FetchProjectID(context.Background(), "access-token")
 	if err != nil {
 		t.Fatalf("FetchProjectID error: %v", err)
 	}
-	if projectID != "cogent-snow-4mnnp" {
+	if projectID != "aicode-consumers" {
 		t.Fatalf("projectID = %q", projectID)
 	}
 }
@@ -58,19 +140,19 @@ func TestFetchProjectIDFallsBackToDailyOnboardUser(t *testing.T) {
 	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.String() {
 		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-			assertLoadCodeAssistHeaders(t, req)
+			assertControlPlaneHeaders(t, req)
 			return jsonResponse(`{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`), nil
 		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
 			sawOnboard = true
-			assertOnboardUserHeaders(t, req)
-			assertJSONContains(t, req, `"tier_id":"free-tier"`)
-			assertJSONContains(t, req, `"ide_type":"ANTIGRAVITY"`)
+			assertControlPlaneHeaders(t, req)
+			assertJSONContains(t, req, `"tierId":"free-tier"`)
+			assertJSONContains(t, req, `"ideType":"ANTIGRAVITY"`)
 			return jsonResponse(`{
 				"done": true,
 				"response": {
 					"cloudaicompanionProject": {
-						"id": "cogent-snow-4mnnp",
-						"name": "cogent-snow-4mnnp",
+						"id": "aicode-consumers",
+						"name": "aicode-consumers",
 						"projectNumber": "22597072101"
 					}
 				}
@@ -88,8 +170,75 @@ func TestFetchProjectIDFallsBackToDailyOnboardUser(t *testing.T) {
 	if !sawOnboard {
 		t.Fatalf("expected onboardUser fallback")
 	}
-	if projectID != "cogent-snow-4mnnp" {
+	if projectID != "aicode-consumers" {
 		t.Fatalf("projectID = %q", projectID)
+	}
+}
+
+func TestOnboardUserPollsOperationWithGET(t *testing.T) {
+	oldDelay := antigravityOnboardPollDelay
+	antigravityOnboardPollDelay = time.Millisecond
+	t.Cleanup(func() { antigravityOnboardPollDelay = oldDelay })
+
+	var seen []string
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		seen = append(seen, req.Method+" "+req.URL.String())
+		assertControlPlaneHeaders(t, req)
+		switch len(seen) {
+		case 1:
+			if req.Method != http.MethodPost || req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser" {
+				t.Fatalf("attempt 1 = %s %s", req.Method, req.URL.String())
+			}
+			body, _ := io.ReadAll(req.Body)
+			if string(body) != `{"tierId":"free-tier", "metadata":{"ideType":"ANTIGRAVITY"}}` {
+				t.Fatalf("attempt 1 body = %s", string(body))
+			}
+			return jsonResponse(`{"name":"operations/onboard-123","done":false}`), nil
+		case 2:
+			if req.Method != http.MethodGet || req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal/operations/onboard-123" {
+				t.Fatalf("attempt 2 = %s %s", req.Method, req.URL.String())
+			}
+			if ct := req.Header.Get("Content-Type"); ct != "" {
+				t.Fatalf("GET poll leaked Content-Type=%q", ct)
+			}
+			return jsonResponse(`{"name":"operations/onboard-123","done":true,"response":{"cloudaicompanionProject":{"id":"proj-lro-1"}}}`), nil
+		default:
+			t.Fatalf("unexpected attempt %d: %s %s", len(seen), req.Method, req.URL.String())
+			return nil, nil
+		}
+	})})
+
+	projectID, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
+	if err != nil {
+		t.Fatalf("OnboardUser error: %v", err)
+	}
+	if projectID != "proj-lro-1" {
+		t.Fatalf("projectID = %q, want proj-lro-1", projectID)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %v, want 2 (POST + GET)", seen)
+	}
+}
+
+func TestOnboardUserFailsFastOnLROErrorAndMarshalDisableTelemetryBody(t *testing.T) {
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(`{"name":"v1internal/operations/err-1","done":true,"error":{"code":7,"message":"ineligible"}}`), nil
+	})})
+	if _, err := auth.OnboardUser(context.Background(), "access-token", ""); err == nil || !strings.Contains(err.Error(), "ineligible") {
+		t.Fatalf("OnboardUser error = %v, want ineligible failure", err)
+	}
+
+	got := string(marshalAntigravityDisableTelemetryBody([]byte(`{
+		"telemetryEnabled": true,
+		"userDataCollectionForceDisabled": false,
+		"marketingEmailsEnabled": true,
+		"consumerTermsAccepted": false,
+		"gcpTermsAccepted": null,
+		"futureSetting": "keep"
+	}`)))
+	want := `{"userSettings":{"marketingEmailsEnabled":true, "consumerTermsAccepted":false, "futureSetting":"keep"}}`
+	if got != want {
+		t.Fatalf("marshalAntigravityDisableTelemetryBody() = %q, want %q", got, want)
 	}
 }
 
@@ -115,43 +264,142 @@ func TestFetchProjectIDUpstreamForbiddenReturnsStatus403(t *testing.T) {
 	}
 }
 
-func assertLoadCodeAssistHeaders(t *testing.T, req *http.Request) {
+func TestFetchUserInfoUsesDefaultUAAndFetchesAvatar(t *testing.T) {
+	var avatarFetched bool
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://www.googleapis.com/oauth2/v2/userinfo":
+			if ua := req.Header.Get("User-Agent"); ua != "" {
+				t.Fatalf("userinfo User-Agent = %q, want empty (Go default)", ua)
+			}
+			return jsonResponse(`{"email":"person@example.com","picture":"https://lh3.googleusercontent.com/a/avatar=s96-c"}`), nil
+		case "https://lh3.googleusercontent.com/a/avatar=s96-c":
+			avatarFetched = true
+			if ua := req.Header.Get("User-Agent"); ua != "" {
+				t.Fatalf("avatar User-Agent = %q, want empty (Go default)", ua)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("img")),
+			}, nil
+		default:
+			t.Fatalf("unexpected URL: %s", req.URL.String())
+			return nil, nil
+		}
+	})})
+
+	email, err := auth.FetchUserInfo(context.Background(), "access-token")
+	if err != nil {
+		t.Fatalf("FetchUserInfo error: %v", err)
+	}
+	if email != "person@example.com" {
+		t.Fatalf("email = %q", email)
+	}
+	if !avatarFetched {
+		t.Fatal("expected avatar picture URL to be fetched after userinfo")
+	}
+}
+
+func TestRunCompanionControlPlaneParsesStateAndExperiments(t *testing.T) {
+	var calls []string
+	var setUserSettingsBody string
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.String())
+		switch req.URL.String() {
+		case "https://www.googleapis.com/oauth2/v2/userinfo":
+			return jsonResponse(`{"email":"person@example.com","picture":"https://lh3.googleusercontent.com/a/test=s96-c"}`), nil
+		case "https://lh3.googleusercontent.com/a/test=s96-c":
+			return jsonResponse(``), nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
+			return jsonResponse(`{"cloudaicompanionProject":"aicode-consumers","paidTier":{"id":"g1-ultra-tier"}}`), nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo":
+			return jsonResponse(`{"userSettings":{"telemetryEnabled":true,"consumerTermsAccepted":true},"regionCode":"US"}`), nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:setUserSettings":
+			raw, _ := io.ReadAll(req.Body)
+			setUserSettingsBody = string(raw)
+			assertControlPlaneHeaders(t, req)
+			return jsonResponse(`{"userSettings":{"consumerTermsAccepted":true}}`), nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:listExperiments":
+			return jsonResponse(`{"experimentIds":["exp1"],"flags":[{"name":"use-aicode-mendel","boolValue":true}]}`), nil
+		case "https://aicode.googleapis.com/v1alpha:fetchLicenses":
+			return jsonResponse(`{"licenses":[{"userTier":"g1-ultra-tier"}]}`), nil
+		default:
+			return jsonResponse(`{}`), nil
+		}
+	})})
+
+	state := auth.RunCompanionControlPlane(context.Background(), "access-token", "aicode-consumers")
+	if state == nil {
+		t.Fatal("expected non-nil CompanionState")
+	}
+	if state.PaidTierID != "g1-ultra-tier" {
+		t.Fatalf("PaidTierID = %q, want g1-ultra-tier", state.PaidTierID)
+	}
+	if state.RegionCode != "US" {
+		t.Fatalf("RegionCode = %q, want US", state.RegionCode)
+	}
+	if setUserSettingsBody != `{"userSettings":{"consumerTermsAccepted":true}}` {
+		t.Fatalf("setUserSettings body = %q, want %q", setUserSettingsBody, `{"userSettings":{"consumerTermsAccepted":true}}`)
+	}
+	if state.TelemetryEnabled == nil || *state.TelemetryEnabled {
+		t.Fatalf("TelemetryEnabled = %v, want false after setUserSettings opt-out", state.TelemetryEnabled)
+	}
+	if state.UseAICodeMendel == nil || !*state.UseAICodeMendel {
+		t.Fatalf("UseAICodeMendel = %v, want true", state.UseAICodeMendel)
+	}
+	if len(calls) != 11 {
+		t.Fatalf("expected 11 companion calls (including setUserSettings opt-out), got %d: %v", len(calls), calls)
+	}
+}
+
+func TestWarmupSessionIssuesAgyControlPlaneSequence(t *testing.T) {
+	var urls []string
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		urls = append(urls, req.Method+" "+req.URL.String())
+		if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "antigravity/cli/") {
+			t.Fatalf("User-Agent = %q", got)
+		}
+		return jsonResponse(`{}`), nil
+	})})
+
+	auth.WarmupSession(context.Background(), "access-token", "aicode-consumers")
+	want := []string{
+		"POST https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAdminControls",
+		"POST https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo",
+		"POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+		"POST https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+		"POST https://daily-cloudcode-pa.googleapis.com/v1internal:listExperiments",
+		"GET https://aicode.googleapis.com/v1alpha:fetchConfig",
+		"GET https://aicode.googleapis.com/v1alpha:fetchLicenses",
+	}
+	if len(urls) != len(want) {
+		t.Fatalf("warmup calls = %v, want %v", urls, want)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Fatalf("call[%d] = %q, want %q", i, urls[i], want[i])
+		}
+	}
+}
+
+func assertControlPlaneHeaders(t *testing.T, req *http.Request) {
 	t.Helper()
 	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
 		t.Fatalf("Authorization = %q", got)
 	}
 	if got := req.Header.Get("Accept"); got != "" {
-		t.Fatalf("Accept = %q, want omitted", got)
+		t.Fatalf("Accept = %q, want empty", got)
 	}
 	if got := req.Header.Get("X-Goog-Api-Client"); got != "" {
 		t.Fatalf("X-Goog-Api-Client = %q, want empty", got)
 	}
 	userAgent := req.Header.Get("User-Agent")
-	if !strings.HasPrefix(userAgent, "antigravity/hub/") {
+	if !strings.HasPrefix(userAgent, "antigravity/cli/") {
 		t.Fatalf("User-Agent = %q", userAgent)
 	}
-	if strings.Contains(userAgent, "google-api-nodejs-client/") {
-		t.Fatalf("User-Agent = %q", userAgent)
-	}
-}
-
-func assertOnboardUserHeaders(t *testing.T, req *http.Request) {
-	t.Helper()
-	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
-		t.Fatalf("Authorization = %q", got)
-	}
-	if got := req.Header.Get("Accept"); got != "*/*" {
-		t.Fatalf("Accept = %q", got)
-	}
-	if got := req.Header.Get("X-Goog-Api-Client"); got != "gl-node/22.21.1" {
-		t.Fatalf("X-Goog-Api-Client = %q", got)
-	}
-	userAgent := req.Header.Get("User-Agent")
-	if !strings.HasPrefix(userAgent, "antigravity/hub/") {
-		t.Fatalf("User-Agent = %q", userAgent)
-	}
-	if !strings.Contains(userAgent, "google-api-nodejs-client/10.3.0") {
-		t.Fatalf("User-Agent = %q", userAgent)
+	if !strings.Contains(userAgent, "aidev_client;") {
+		t.Fatalf("User-Agent missing aidev_client: %q", userAgent)
 	}
 }
 
@@ -174,565 +422,4 @@ func jsonResponse(body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-}
-
-func TestFetchProjectIDTooManyRequestsPreservesRetryAfter(t *testing.T) {
-	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		header := make(http.Header)
-		header.Set("Retry-After", "45")
-		return &http.Response{
-			StatusCode: http.StatusTooManyRequests,
-			Header:     header,
-			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":429,"message":"rate limited"}}`)),
-		}, nil
-	})})
-
-	_, err := auth.FetchProjectID(context.Background(), "access-token")
-	if err == nil {
-		t.Fatalf("expected error from 429 response")
-	}
-	type retryAfterProvider interface {
-		RetryAfter() *time.Duration
-	}
-	rap, ok := err.(retryAfterProvider)
-	if !ok {
-		t.Fatalf("expected error to expose RetryAfter, got %T (%v)", err, err)
-	}
-	if got := rap.RetryAfter(); got == nil || *got != 45*time.Second {
-		t.Fatalf("RetryAfter() = %v, want 45s", got)
-	}
-}
-
-func TestFetchProjectIDEmptyResponseWrapsErrProjectIDNotFound(t *testing.T) {
-	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.String() {
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-			return jsonResponse(`{"cloudaicompanionProject":{}}`), nil
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
-			return jsonResponse(`{"done":true,"response":{"cloudaicompanionProject":{}}}`), nil
-		default:
-			t.Fatalf("unexpected request URL: %s", req.URL.String())
-			return nil, nil
-		}
-	})})
-
-	_, err := auth.FetchProjectID(context.Background(), "access-token")
-	if !errors.Is(err, ErrProjectIDNotFound) {
-		t.Fatalf("FetchProjectID() err = %v, want errors.Is(_, ErrProjectIDNotFound)", err)
-	}
-}
-
-func TestOnboardUserPreservesFullResponseBodyOnHTTPStatusError(t *testing.T) {
-	longBody := `{"error":{"code":403,"message":"` + strings.Repeat("x", 260) + `","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}`
-	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.String() {
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-			return jsonResponse(`{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`), nil
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
-			return &http.Response{
-				StatusCode: http.StatusForbidden,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(longBody)),
-			}, nil
-		default:
-			t.Fatalf("unexpected request URL: %s", req.URL.String())
-			return nil, nil
-		}
-	})})
-
-	_, err := auth.FetchProjectID(context.Background(), "access-token")
-	var httpErr *HTTPStatusError
-	if !errors.As(err, &httpErr) || httpErr == nil {
-		t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-	}
-	if got := string(httpErr.ResponseBody()); got != longBody {
-		t.Fatalf("ResponseBody() len=%d, want full untruncated body len=%d", len(got), len(longBody))
-	}
-}
-
-func TestOnboardUserIncompletePollingDoesNotWrapErrProjectIDNotFound(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		onboardCalls := 0
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-				return jsonResponse(`{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`), nil
-			case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
-				onboardCalls++
-				return jsonResponse(`{"done":false}`), nil
-			default:
-				t.Fatalf("unexpected request URL: %s", req.URL.String())
-				return nil, nil
-			}
-		})})
-
-		_, err := auth.FetchProjectID(context.Background(), "access-token")
-		if err == nil {
-			t.Fatal("FetchProjectID() = nil, want incomplete onboarding error")
-		}
-		if onboardCalls != 5 {
-			t.Fatalf("onboardCalls = %d, want 5", onboardCalls)
-		}
-		if errors.Is(err, ErrProjectIDNotFound) {
-			t.Fatalf("FetchProjectID() err = %v, must NOT wrap ErrProjectIDNotFound when onboarding did not complete", err)
-		}
-		if !strings.Contains(err.Error(), "did not complete") {
-			t.Fatalf("FetchProjectID() err = %v, want incomplete onboarding message", err)
-		}
-	})
-}
-
-func TestOnboardUserCompletedOperationErrorDoesNotWrapErrProjectIDNotFound(t *testing.T) {
-	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.String() {
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-			return jsonResponse(`{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`), nil
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
-			return jsonResponse(`{"done":true,"error":{"code":14,"message":"UNAVAILABLE"}}`), nil
-		default:
-			t.Fatalf("unexpected request URL: %s", req.URL.String())
-			return nil, nil
-		}
-	})})
-
-	_, err := auth.FetchProjectID(context.Background(), "access-token")
-	if err == nil {
-		t.Fatal("FetchProjectID() = nil, want onboardUser operation error")
-	}
-	if errors.Is(err, ErrProjectIDNotFound) {
-		t.Fatalf("FetchProjectID() err = %v, must NOT wrap ErrProjectIDNotFound when done=true carries an operation error", err)
-	}
-	if !strings.Contains(err.Error(), "14") || !strings.Contains(err.Error(), "UNAVAILABLE") {
-		t.Fatalf("FetchProjectID() err = %v, want preserved operation error code and message", err)
-	}
-}
-
-func TestOnboardUserCompletedOperationPermissionDeniedPreservesHTTP403AndBody(t *testing.T) {
-	const lroTOSBody = `{"done":true,"error":{"code":7,"message":"Violation of Terms of Service","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudaicompanion.googleapis.com","metadata":{"appeal_url":"https://forms.gle/lroAppeal","appeal_url_link_text":"Submit Appeal"}}]}}`
-	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.String() {
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
-			return jsonResponse(`{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`), nil
-		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
-			return jsonResponse(lroTOSBody), nil
-		default:
-			t.Fatalf("unexpected request URL: %s", req.URL.String())
-			return nil, nil
-		}
-	})})
-
-	_, err := auth.FetchProjectID(context.Background(), "access-token")
-	if err == nil {
-		t.Fatal("FetchProjectID() = nil, want HTTPStatusError 403 for LRO PERMISSION_DENIED")
-	}
-	var httpErr *HTTPStatusError
-	if !errors.As(err, &httpErr) || httpErr == nil {
-		t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-	}
-	if httpErr.StatusCode() != http.StatusForbidden {
-		t.Fatalf("StatusCode() = %d, want 403", httpErr.StatusCode())
-	}
-	if got := string(httpErr.ResponseBody()); got != lroTOSBody {
-		t.Fatalf("ResponseBody() = %q, want full LRO body %q", got, lroTOSBody)
-	}
-}
-
-type boundedCountingReader struct {
-	remaining int64
-	readBytes atomic.Int64
-	fill      byte
-}
-
-func (r *boundedCountingReader) Read(p []byte) (int, error) {
-	if r.remaining <= 0 {
-		return 0, io.EOF
-	}
-	n := len(p)
-	if int64(n) > r.remaining {
-		n = int(r.remaining)
-	}
-	for i := 0; i < n; i++ {
-		p[i] = r.fill
-	}
-	r.remaining -= int64(n)
-	r.readBytes.Add(int64(n))
-	return n, nil
-}
-
-func (r *boundedCountingReader) Close() error {
-	return nil
-}
-
-func TestOnboardUserPreservesStructuredErrorDetailsPast200Bytes(t *testing.T) {
-	t.Run("403 TOS_VIOLATION envelope past 200 bytes", func(t *testing.T) {
-		tosBody := `{"error":{"code":403,"message":"` + strings.Repeat("account suspended notice ", 12) + `","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudaicompanion.googleapis.com","metadata":{"appeal_url":"https://forms.gle/testAppeal7759"}}]}}`
-		if len(tosBody) < 500 {
-			t.Fatalf("test fixture too short: len=%d", len(tosBody))
-		}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusForbidden,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(tosBody)),
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if httpErr.StatusCode() != http.StatusForbidden {
-			t.Fatalf("StatusCode() = %d, want 403", httpErr.StatusCode())
-		}
-		if !strings.Contains(httpErr.Error(), "TOS_VIOLATION") {
-			t.Fatalf("Error() lost TOS_VIOLATION detail: %q", httpErr.Error())
-		}
-		if !strings.Contains(httpErr.Error(), "https://forms.gle/testAppeal7759") {
-			t.Fatalf("Error() lost appeal_url detail: %q", httpErr.Error())
-		}
-		if got := string(httpErr.ResponseBody()); got != tosBody {
-			t.Fatalf("ResponseBody() = %q, want %q", got, tosBody)
-		}
-	})
-
-	t.Run("429 RetryInfo past 200 bytes and Retry-After header", func(t *testing.T) {
-		rateLimitBody := `{"error":{"code":429,"message":"` + strings.Repeat("quota exceeded detail ", 14) + `","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"37s"}]}}`
-		if len(rateLimitBody) < 400 {
-			t.Fatalf("test fixture too short: len=%d", len(rateLimitBody))
-		}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			hdr := make(http.Header)
-			hdr.Set("Retry-After", "42")
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Header:     hdr,
-				Body:       io.NopCloser(strings.NewReader(rateLimitBody)),
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if httpErr.StatusCode() != http.StatusTooManyRequests {
-			t.Fatalf("StatusCode() = %d, want 429", httpErr.StatusCode())
-		}
-		if !strings.Contains(httpErr.Error(), `"retryDelay":"37s"`) {
-			t.Fatalf("Error() lost retryDelay detail: %q", httpErr.Error())
-		}
-		if got := httpErr.RetryAfter(); got == nil || *got != 42*time.Second {
-			t.Fatalf("RetryAfter() = %v, want 42s", got)
-		}
-	})
-}
-
-func TestAuthErrorMessageTruncationRespectsUTF8AndSafeCap(t *testing.T) {
-	// Place a 3-byte UTF-8 rune ("中") straddling both byte 200 and byte 8192 (8<<10).
-	shortBody := strings.Repeat("a", 199) + "中" + strings.Repeat("b", 80)
-	longBody := strings.Repeat("a", (8<<10)-1) + "中" + strings.Repeat("z", 2048)
-
-	t.Run("OnboardUser mid-UTF-8 around byte 200 is not corrupted", func(t *testing.T) {
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusForbidden,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(shortBody)),
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if !utf8.ValidString(httpErr.Error()) {
-			t.Fatalf("Error() contains invalid UTF-8: %q", httpErr.Error())
-		}
-		if !strings.Contains(httpErr.Error(), "中"+strings.Repeat("b", 80)) {
-			t.Fatalf("Error() truncated short UTF-8 body unexpectedly: %q", httpErr.Error())
-		}
-	})
-
-	t.Run("OnboardUser caps very large error message cleanly on UTF-8 boundary", func(t *testing.T) {
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(longBody)),
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if !utf8.ValidString(httpErr.Error()) {
-			t.Fatalf("Error() contains invalid UTF-8: len=%d", len(httpErr.Error()))
-		}
-		if len(httpErr.Error()) > (8<<10)+64 {
-			t.Fatalf("Error() length = %d, want bounded around 8 KiB", len(httpErr.Error()))
-		}
-		if len(httpErr.Error()) < (8 << 10) {
-			t.Fatalf("Error() length = %d, want close to 8 KiB cap (not 200-byte slice)", len(httpErr.Error()))
-		}
-	})
-
-	t.Run("FetchProjectID caps very large error message cleanly on UTF-8 boundary", func(t *testing.T) {
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(longBody)),
-			}, nil
-		})})
-
-		_, err := auth.FetchProjectID(context.Background(), "access-token")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if !utf8.ValidString(httpErr.Error()) {
-			t.Fatalf("Error() contains invalid UTF-8: len=%d", len(httpErr.Error()))
-		}
-		if len(httpErr.Error()) > (8<<10)+64 {
-			t.Fatalf("Error() length = %d, want bounded around 8 KiB", len(httpErr.Error()))
-		}
-	})
-}
-
-func TestOnboardUserPollingCancelsImmediatelyOnContextDone(t *testing.T) {
-	t.Run("context canceled during polling sleep", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) {
-			var attempts atomic.Int32
-			auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				if errCtx := req.Context().Err(); errCtx != nil {
-					return nil, errCtx
-				}
-				attempts.Add(1)
-				return jsonResponse(`{"done":false}`), nil
-			})})
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			errCh := make(chan error, 1)
-			go func() {
-				_, err := auth.OnboardUser(ctx, "access-token", "free-tier")
-				errCh <- err
-			}()
-
-			// Wait until OnboardUser has completed attempt 1 and is durably blocked in its retry delay.
-			synctest.Wait()
-			if got := attempts.Load(); got != 1 {
-				t.Fatalf("attempts before cancel = %d, want 1", got)
-			}
-
-			cancelAt := time.Now()
-			cancel()
-			err := <-errCh
-			elapsed := time.Since(cancelAt)
-
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("OnboardUser() err = %v, want context.Canceled", err)
-			}
-			if elapsed != 0 {
-				t.Fatalf("OnboardUser() took %v after cancel, want immediate exit without 2s sleep", elapsed)
-			}
-			if got := attempts.Load(); got != 1 {
-				t.Fatalf("attempts after cancel = %d, want 1", got)
-			}
-		})
-	})
-
-	t.Run("context deadline exceeded during polling sleep", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) {
-			var attempts atomic.Int32
-			auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				if errCtx := req.Context().Err(); errCtx != nil {
-					return nil, errCtx
-				}
-				attempts.Add(1)
-				return jsonResponse(`{"done":false}`), nil
-			})})
-
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			defer cancel()
-
-			start := time.Now()
-			_, err := auth.OnboardUser(ctx, "access-token", "free-tier")
-			elapsed := time.Since(start)
-
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("OnboardUser() err = %v, want context.DeadlineExceeded", err)
-			}
-			if elapsed != 500*time.Millisecond {
-				t.Fatalf("OnboardUser() took %v, want 500ms deadline exit", elapsed)
-			}
-			if got := attempts.Load(); got != 1 {
-				t.Fatalf("attempts = %d, want 1", got)
-			}
-		})
-	})
-
-	t.Run("nil context polls safely without panic", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) {
-			var attempts atomic.Int32
-			auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				if attempts.Add(1) == 1 {
-					return jsonResponse(`{"done":false}`), nil
-				}
-				return jsonResponse(`{"done":true,"response":{"cloudaicompanionProject":"nil-ctx-project"}}`), nil
-			})})
-
-			//nolint:staticcheck // intentionally verify nil context defensive handling
-			projectID, err := auth.OnboardUser(nil, "access-token", "free-tier")
-			if err != nil {
-				t.Fatalf("OnboardUser(nil, ...) error: %v", err)
-			}
-			if projectID != "nil-ctx-project" {
-				t.Fatalf("projectID = %q, want %q", projectID, "nil-ctx-project")
-			}
-			if got := attempts.Load(); got != 2 {
-				t.Fatalf("attempts = %d, want 2", got)
-			}
-		})
-	})
-}
-
-func TestTruncateUTF8Bytes(t *testing.T) {
-	cases := []struct {
-		name     string
-		input    string
-		maxBytes int
-		want     string
-	}{
-		{name: "zero max", input: "abc", maxBytes: 0, want: ""},
-		{name: "fits ascii", input: "hello", maxBytes: 10, want: "hello"},
-		{name: "cuts 3-byte rune after byte 1", input: "ab中c", maxBytes: 3, want: "ab"},
-		{name: "cuts 3-byte rune after byte 2", input: "ab中c", maxBytes: 4, want: "ab"},
-		{name: "keeps complete 3-byte rune", input: "ab中c", maxBytes: 5, want: "ab中"},
-		{name: "cuts 4-byte emoji after byte 3", input: "a😀b", maxBytes: 4, want: "a"},
-		{name: "keeps complete 4-byte emoji", input: "a😀b", maxBytes: 5, want: "a😀"},
-		{name: "trims incomplete trailing utf8 from limit reader", input: "abc\xe4\xb8", maxBytes: 16, want: "abc"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := truncateUTF8Bytes(tc.input, tc.maxBytes)
-			if got != tc.want {
-				t.Fatalf("truncateUTF8Bytes(%q, %d) = %q, want %q", tc.input, tc.maxBytes, got, tc.want)
-			}
-			if !utf8.ValidString(got) {
-				t.Fatalf("truncateUTF8Bytes(%q, %d) produced invalid UTF-8: %q", tc.input, tc.maxBytes, got)
-			}
-		})
-	}
-}
-
-func TestFetchProjectIDAndOnboardUserBoundResponseBodyReads(t *testing.T) {
-	const oversizedLen = 4 << 20 // 4 MiB
-	const maxSuccessRead = maxAntigravityAuthResponseBytes + 1
-	const maxErrorRead = maxAntigravityAuthErrorBodyBytes
-
-	t.Run("FetchProjectID bounds 200 response read", func(t *testing.T) {
-		reader := &boundedCountingReader{remaining: oversizedLen, fill: 'a'}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       reader,
-			}, nil
-		})})
-
-		_, err := auth.FetchProjectID(context.Background(), "access-token")
-		if err == nil {
-			t.Fatal("FetchProjectID() = nil, want error for oversized 200 body")
-		}
-		if got := reader.readBytes.Load(); got > maxSuccessRead {
-			t.Fatalf("FetchProjectID read %d bytes from oversized 200 body, want bounded <= %d", got, maxSuccessRead)
-		}
-	})
-
-	t.Run("FetchProjectID bounds error response read and preserves HTTPStatusError", func(t *testing.T) {
-		reader := &boundedCountingReader{remaining: oversizedLen, fill: 'e'}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			hdr := make(http.Header)
-			hdr.Set("Retry-After", "15")
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Header:     hdr,
-				Body:       reader,
-			}, nil
-		})})
-
-		_, err := auth.FetchProjectID(context.Background(), "access-token")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if httpErr.StatusCode() != http.StatusTooManyRequests {
-			t.Fatalf("StatusCode() = %d, want 429", httpErr.StatusCode())
-		}
-		if got := httpErr.RetryAfter(); got == nil || *got != 15*time.Second {
-			t.Fatalf("RetryAfter() = %v, want 15s", got)
-		}
-		if got := reader.readBytes.Load(); got > maxErrorRead {
-			t.Fatalf("FetchProjectID read %d bytes from oversized error body, want bounded <= %d", got, maxErrorRead)
-		}
-		if got := len(httpErr.ResponseBody()); got > maxErrorRead {
-			t.Fatalf("FetchProjectID ResponseBody() len = %d, want <= %d", got, maxErrorRead)
-		}
-	})
-
-	t.Run("OnboardUser bounds 200 response read", func(t *testing.T) {
-		reader := &boundedCountingReader{remaining: oversizedLen, fill: 'a'}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       reader,
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		if err == nil {
-			t.Fatal("OnboardUser() = nil, want error for oversized 200 body")
-		}
-		if got := reader.readBytes.Load(); got > maxSuccessRead {
-			t.Fatalf("OnboardUser read %d bytes from oversized 200 body, want bounded <= %d", got, maxSuccessRead)
-		}
-	})
-
-	t.Run("OnboardUser bounds error response read and preserves HTTPStatusError", func(t *testing.T) {
-		reader := &boundedCountingReader{remaining: oversizedLen, fill: 'e'}
-		auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			hdr := make(http.Header)
-			hdr.Set("Retry-After", "25")
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Header:     hdr,
-				Body:       reader,
-			}, nil
-		})})
-
-		_, err := auth.OnboardUser(context.Background(), "access-token", "free-tier")
-		var httpErr *HTTPStatusError
-		if !errors.As(err, &httpErr) || httpErr == nil {
-			t.Fatalf("expected *HTTPStatusError, got %T (%v)", err, err)
-		}
-		if httpErr.StatusCode() != http.StatusServiceUnavailable {
-			t.Fatalf("StatusCode() = %d, want 503", httpErr.StatusCode())
-		}
-		if got := httpErr.RetryAfter(); got == nil || *got != 25*time.Second {
-			t.Fatalf("RetryAfter() = %v, want 25s", got)
-		}
-		if got := reader.readBytes.Load(); got > maxErrorRead {
-			t.Fatalf("OnboardUser read %d bytes from oversized error body, want bounded <= %d", got, maxErrorRead)
-		}
-		if got := len(httpErr.ResponseBody()); got > maxErrorRead {
-			t.Fatalf("OnboardUser ResponseBody() len = %d, want <= %d", got, maxErrorRead)
-		}
-	})
 }

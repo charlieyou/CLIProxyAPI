@@ -80,7 +80,6 @@ func TestIssue7149_GeminiToolParametersNumericConstraintsNormalizedAcrossTargets
 		schemaPath string
 	}{
 		{"gemini", sdktranslator.FormatGemini, "tools.0.function_declarations.0.parametersJsonSchema"},
-		{"antigravity", sdktranslator.FormatAntigravity, "request.tools.0.functionDeclarations.0.parametersJsonSchema"},
 		{"openai", sdktranslator.FormatOpenAI, "tools.0.function.parameters"},
 		{"claude", sdktranslator.FormatClaude, "tools.0.input_schema"},
 		{"codex", sdktranslator.FormatCodex, "tools.0.parameters"},

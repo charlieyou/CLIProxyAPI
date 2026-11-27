@@ -263,7 +263,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				result.CredentialScope = isCredentialScopedError(chunk.Err)
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				m.recordStreamExecutionResult(ctx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(chunk.Err) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown))
 				if okAction && !isRequestTerminatedError(chunk.Err) && !isRequestStopError(chunk.Err) && !isTOSViolationError(chunk.Err) {
 					if isRequestScopedStop(action, okAction) {
 						chunk.Err = wrapRequestStopError(chunk.Err)
@@ -841,8 +841,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.CredentialScope = true
 			}
 			applyRequestScopedActionToResult(action, okAction, &result)
-			m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
-			errStream = annotateTrustedRetryAfterByHint(errStream)
+			m.recordStreamExecutionResult(execCtx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(errStream) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown))
+			errStream = annotateTrustedRetryAfterForProvider(provider, errStream)
 			if okAction && !isRequestStopError(errStream) && !isTOSViolationError(errStream) && !isRequestScopedStop(action, okAction) {
 				errStream = wrapRequestScopedContinueError(errStream)
 			}
@@ -971,8 +971,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.CredentialScope = true
 				}
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
-				bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
+				m.recordStreamExecutionResult(execCtx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(bootstrapErr) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown))
+				bootstrapErr = annotateTrustedRetryAfterForProvider(provider, bootstrapErr)
 				if isRequestStopError(bootstrapErr) {
 					headerErr := newStreamHeaderError(bootstrapErr, streamResult.Headers)
 					syncPreferredUpstreamError(&upstreamErr, headerErr)
@@ -1011,8 +1011,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if isCredentialScopedError(bootstrapErr) {
 					result.CredentialScope = true
 				}
-				m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
-				bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
+				m.recordStreamExecutionResult(execCtx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(bootstrapErr))
+				bootstrapErr = annotateTrustedRetryAfterForProvider(provider, bootstrapErr)
 				syncPreferredUpstreamError(&upstreamErr, bootstrapErr)
 				return nil, newStreamHeaderError(bootstrapErr, streamResult.Headers)
 			}
@@ -1023,8 +1023,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if isCredentialScopedError(bootstrapErr) {
 					result.CredentialScope = true
 				}
-				m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
-				bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
+				m.recordStreamExecutionResult(execCtx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(bootstrapErr))
+				bootstrapErr = annotateTrustedRetryAfterForProvider(provider, bootstrapErr)
 				bootstrapErr = newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 				syncPreferredUpstreamError(&upstreamErr, bootstrapErr)
 				lastErr = bootstrapErr
@@ -1040,8 +1040,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if isCredentialScopedError(bootstrapErr) {
 				result.CredentialScope = true
 			}
-			m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
-			bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
+			m.recordStreamExecutionResult(execCtx, result, auth, ephemeralResult, isExecutorAvailabilityNeutralError(bootstrapErr))
+			bootstrapErr = annotateTrustedRetryAfterForProvider(provider, bootstrapErr)
 			bootstrapErr = newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 			syncPreferredUpstreamError(&upstreamErr, bootstrapErr)
 			currentErr := bootstrapErr

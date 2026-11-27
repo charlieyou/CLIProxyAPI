@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
@@ -3795,4 +3796,280 @@ func deleteAntigravityPartThoughtSignatureFieldsPartDoc(doc *ojson.Doc) *ojson.D
 		return updated
 	}
 	return doc
+}
+
+// Helpers below keep the upstream session-ID and functionResponse-role semantics that the
+// Gemini, Vertex and AI Studio reasoning replay paths in this file depend on.
+
+func normalizeAntigravityGeminiFunctionResponseRolesDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	contents := doc.Get("request.contents")
+	if !contents.IsArray() {
+		return false
+	}
+	wrapped := []byte(`{"request":{"contents":` + contents.Raw + `}}`)
+	normalized := normalizeAntigravityGeminiFunctionResponseRoles(wrapped)
+	if bytes.Equal(normalized, wrapped) {
+		return false
+	}
+	updatedContents := util.GetGJSONBytesNoCopy(normalized, "request.contents")
+	if !updatedContents.IsArray() || updatedContents.Raw == contents.Raw {
+		return false
+	}
+	return doc.SetRawBytes("request.contents", []byte(updatedContents.Raw)) == nil
+}
+
+// normalizeAntigravityGeminiFunctionResponseRoles edits each response turn in
+// isolation, then splices all changed turns into the request with one body copy.
+// Applying SJSON once per field made large histories scale with history size
+// multiplied by the number of tool turns.
+func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
+	rawJSON = repairAntigravityGeminiFunctionResponseNames(rawJSON)
+	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
+	if !contents.IsArray() {
+		return rawJSON
+	}
+	type functionRef struct {
+		id   string
+		name string
+	}
+
+	edits := make([]antigravityContentEdit, 0)
+	var pending []functionRef
+	validOffsets := true
+	contents.ForEach(func(contentIndex, content ojson.Result) bool {
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			pending = nil
+			return true
+		}
+
+		var calls, responses []functionRef
+		var responseParts, otherParts []json.RawMessage
+		partCount := 0
+		hasOtherPart := false
+		parts.ForEach(func(_, part ojson.Result) bool {
+			partCount++
+			switch {
+			case part.Get("functionCall").Exists():
+				calls = append(calls, functionRef{id: part.Get("functionCall.id").String(), name: part.Get("functionCall.name").String()})
+			case part.Get("functionResponse").Exists():
+				responses = append(responses, functionRef{id: part.Get("functionResponse.id").String(), name: part.Get("functionResponse.name").String()})
+				responseParts = append(responseParts, json.RawMessage(part.Raw))
+			default:
+				hasOtherPart = true
+				otherParts = append(otherParts, json.RawMessage(part.Raw))
+			}
+			return true
+		})
+		if partCount == 0 {
+			pending = nil
+			return true
+		}
+		if len(calls) > 0 && len(responses) == 0 {
+			pending = calls
+			return true
+		}
+		if len(responses) == 0 {
+			if hasOtherPart {
+				pending = nil
+			}
+			return true
+		}
+		if len(calls) > 0 {
+			pending = nil
+			return true
+		}
+
+		var contentDoc *ojson.Doc
+		contentChanged := false
+		if len(pending) > 0 && len(responses) > 0 {
+			ordered := make([]json.RawMessage, 0, partCount)
+			used := make([]bool, len(responses))
+			for _, call := range pending {
+				for responseIndex, response := range responses {
+					if used[responseIndex] {
+						continue
+					}
+					if (call.id != "" && response.id == call.id) || (call.id == "" && call.name != "" && response.name == call.name) {
+						used[responseIndex] = true
+						ordered = append(ordered, responseParts[responseIndex])
+						break
+					}
+				}
+			}
+			for responseIndex := range responses {
+				if !used[responseIndex] {
+					ordered = append(ordered, responseParts[responseIndex])
+				}
+			}
+			if len(ordered) == len(responseParts) {
+				ordered = append(ordered, otherParts...)
+				encoded, errMarshal := json.Marshal(ordered)
+				if errMarshal == nil && !bytes.Equal(encoded, []byte(parts.Raw)) {
+					contentDoc = ojson.NewDoc([]byte(content.Raw))
+					if errSet := contentDoc.SetRawBytes("parts", encoded); errSet == nil {
+						contentChanged = true
+					}
+				}
+			}
+		}
+		pending = nil
+		if !hasOtherPart && content.Get("role").String() != "model" {
+			if contentDoc == nil {
+				contentDoc = ojson.NewDoc([]byte(content.Raw))
+			}
+			if errSet := contentDoc.Set("role", "model"); errSet == nil {
+				contentChanged = true
+			}
+		}
+		if !contentChanged || contentDoc == nil {
+			return true
+		}
+		contentJSON := contentDoc.Bytes()
+
+		start := content.Index
+		end := start + len(content.Raw)
+		if start < 0 || end < start || end > len(rawJSON) || !bytes.Equal(rawJSON[start:end], []byte(content.Raw)) {
+			validOffsets = false
+		}
+		edits = append(edits, antigravityContentEdit{
+			index:       contentIndex.Int(),
+			start:       start,
+			end:         end,
+			replacement: contentJSON,
+		})
+		return true
+	})
+	return applyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
+}
+
+// applyAntigravityIndexedEdits splices collected JSON fragments into the original
+// request with one body copy. Applying SJSON once per field made large histories
+// scale with history size multiplied by the number of edits.
+func applyAntigravityIndexedEdits(rawJSON []byte, edits []antigravityContentEdit, validOffsets bool) []byte {
+	if len(edits) == 0 {
+		return rawJSON
+	}
+	if !validOffsets || !ojson.ValidBytes(rawJSON) {
+		return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+	}
+
+	finalSize := len(rawJSON)
+	cursor := 0
+	for _, edit := range edits {
+		if edit.start < cursor {
+			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+		}
+		finalSize += len(edit.replacement) - (edit.end - edit.start)
+		if finalSize < 0 {
+			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+		}
+		cursor = edit.end
+	}
+	out := make([]byte, 0, finalSize)
+	cursor = 0
+	for _, edit := range edits {
+		out = append(out, rawJSON[cursor:edit.start]...)
+		out = append(out, edit.replacement...)
+		cursor = edit.end
+	}
+	return append(out, rawJSON[cursor:]...)
+}
+
+// applyAntigravityContentEditsWithSJSON preserves the legacy path semantics if
+// a GJSON result cannot be proven to point into the original request bytes.
+func applyAntigravityContentEditsWithSJSON(rawJSON []byte, edits []antigravityContentEdit) []byte {
+	doc := ojson.NewDoc(rawJSON)
+	changed := false
+	for _, edit := range edits {
+		path := edit.path
+		if path == "" {
+			path = fmt.Sprintf("request.contents.%d", edit.index)
+		}
+		if errSet := doc.SetRawBytes(path, edit.replacement); errSet == nil {
+			changed = true
+		}
+	}
+	if !changed {
+		return rawJSON
+	}
+	return doc.Bytes()
+}
+
+func generateSessionID() string {
+	randSourceMutex.Lock()
+	n := int64(randSource.Uint64())
+	randSourceMutex.Unlock()
+	return strconv.FormatInt(n, 10)
+}
+
+func generateStableSessionID(payload []byte) string {
+	contents := util.GetGJSONBytesNoCopy(payload, "request.contents")
+	if !contents.IsArray() {
+		contents = util.GetGJSONBytesNoCopy(payload, "contents")
+	}
+	return generateStableSessionIDFromContents(contents)
+}
+
+func generateStableSessionIDDoc(doc *ojson.Doc) string {
+	return generateStableSessionIDDocForAuth(doc, "")
+}
+
+func generateStableSessionIDDocForAuth(doc *ojson.Doc, authID string) string {
+	if doc == nil {
+		return generateSessionID()
+	}
+	contents := doc.Get("request.contents")
+	if !contents.IsArray() {
+		contents = doc.Get("contents")
+	}
+	return generateStableSessionIDFromContentsForAuth(contents, authID)
+}
+
+func generateStableSessionIDFromContents(contents ojson.Result) string {
+	return generateStableSessionIDFromContentsForAuth(contents, "")
+}
+
+func generateStableSessionIDFromContentsForAuth(contents ojson.Result, authID string) string {
+	if !contents.IsArray() {
+		return generateSessionID()
+	}
+
+	authID = strings.TrimSpace(authID)
+	stableID := ""
+	contents.ForEach(func(_, content ojson.Result) bool {
+		if content.Get("role").String() != "user" {
+			return true
+		}
+		text := ""
+		if parts := content.Get("parts"); parts.IsArray() {
+			parts.ForEach(func(_, part ojson.Result) bool {
+				if candidate := part.Get("text").String(); candidate != "" {
+					text = candidate
+					return false
+				}
+				return true
+			})
+		}
+		if text == "" {
+			return true
+		}
+		var hashInput []byte
+		if authID != "" {
+			// Place variable text and authID before the fixed domain suffix so trailing-byte
+			// changes avalanche into the sign bit of FNV-1a.
+			hashInput = []byte(text + "\x00" + authID + "\x00cli-proxy-api:antigravity:content-session")
+		} else {
+			hashInput = []byte(text)
+		}
+		stableID = helps.HashAntigravitySessionID(hashInput)
+		return false
+	})
+	if stableID != "" {
+		return stableID
+	}
+	return generateSessionID()
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -247,19 +246,6 @@ func antigravityCreditsAllowsCandidateModel(ctx context.Context, auth *Auth, rou
 		}
 		return antigravityCreditsAllowsModelState(auth, existingModelState(auth, targetModel), now)
 	}
-	if opts.RequestAfterAuthInterceptor != nil && antigravityModelHasThinkingGroup(ctx, auth, targetModel) {
-		// An after-auth interceptor may rewrite the thinking effort and select a
-		// different late variant; defer model-level admission to the executor.
-		return true
-	}
-	if requestedModel := antigravityRequestedTargetModel(ctx, auth, routeModel, targetModel, opts, cfg); requestedModel != "" {
-		return antigravityCreditsAllowsSwitchedModelState(auth, existingModelState(auth, requestedModel), now)
-	}
-	if len(opts.OriginalRequest) == 0 && antigravityModelHasThinkingGroup(ctx, auth, targetModel) {
-		// Without a request payload to determine whether a grouped model will
-		// switch variants, do not reject the credential based on the source model.
-		return true
-	}
 	return antigravityCreditsAllowsModelState(auth, existingModelState(auth, targetModel), now)
 }
 
@@ -312,61 +298,6 @@ func antigravityTargetRejected(result Result) bool {
 	return result.Provider == "antigravity" && result.Error != nil && result.Error.Code == antigravityTargetRejectedCode
 }
 
-func antigravityRequestedTargetModel(ctx context.Context, auth *Auth, routeModel, checkModel string, opts cliproxyexecutor.Options, cfg *internalconfig.Config) string {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		return ""
-	}
-	thinkingModel := strings.TrimSpace(checkModel)
-	if thinkingModel == "" || (!thinking.ParseSuffix(thinkingModel).HasSuffix && thinking.ParseSuffix(routeModel).HasSuffix) {
-		thinkingModel = strings.TrimSpace(routeModel)
-	}
-	if thinkingModel == "" {
-		return ""
-	}
-	from := strings.TrimSpace(opts.SourceFormat.String())
-	if from == "" {
-		from = "antigravity"
-	}
-	level := thinking.RequestedAntigravityThinkingLevel(opts.OriginalRequest, from, thinkingModel)
-	if level == "" {
-		return ""
-	}
-	baseModel := strings.TrimSpace(thinking.ParseSuffix(checkModel).ModelName)
-	if baseModel == "" {
-		baseModel = strings.TrimSpace(checkModel)
-	}
-	if baseModel == "" {
-		baseModel = strings.TrimSpace(thinking.ParseSuffix(routeModel).ModelName)
-	}
-	if baseModel == "" {
-		return ""
-	}
-	selected := SelectAntigravityModel(ctx, auth, baseModel, string(level), cfg)
-	if selected.ID == "" || sameCanonicalModelKey(selected.ID, checkModel) {
-		return ""
-	}
-	return selected.ID
-}
-
 func isAuthBlockedByQuotaOrAuthForAntigravityRequest(ctx context.Context, auth *Auth, routeModel, checkModel string, opts cliproxyexecutor.Options, cfg *internalconfig.Config, now time.Time, clientHeaders ...http.Header) bool {
-	if isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, auth, checkModel, now, clientHeaders...) {
-		return true
-	}
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") || len(auth.ModelStates) == 0 {
-		return false
-	}
-	// Prefer the actual target model observed on this request over inferring from
-	// the pre-interceptor request body so a cooldown on a different variant cannot
-	// override the executed variant's classification.
-	if observedModel := antigravityAttemptedModelForAuth(ctx, auth.ID); observedModel != "" {
-		if sameCanonicalModelKey(observedModel, checkModel) {
-			return false
-		}
-		return isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, auth, observedModel, now, clientHeaders...)
-	}
-	requestedModel := antigravityRequestedTargetModel(ctx, auth, routeModel, checkModel, opts, cfg)
-	if requestedModel != "" && !sameCanonicalModelKey(requestedModel, checkModel) {
-		return isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, auth, requestedModel, now, clientHeaders...)
-	}
-	return false
+	return isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, auth, checkModel, now, clientHeaders...)
 }

@@ -1136,7 +1136,7 @@ func syncPreferredUpstreamError(upstreamErr *error, errExec error) {
 	var bootstrap *streamBootstrapError
 	if errors.As(*upstreamErr, &bootstrap) && bootstrap != nil {
 		if upstreamErrorMatchesBootstrap(errExec, bootstrap) {
-			if hint := trustedRetryAfterHint(errExec); hint != nil && *hint > 0 {
+			if hint := trustedRetryAfterHint(errExec); hint != nil && *hint > 0 && !isAntigravityProviderName(upstreamAttemptProviderFromError(errExec)) {
 				bootstrap.cause = withTrustedRetryAfter(bootstrap.cause, hint)
 			}
 			if IsRequestScopedContinueError(errExec) {
@@ -1338,7 +1338,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			action, okAction := matchRequestScopedErrorAction(auth, errPrepare, m.requestScopedErrorConfig(execCtx))
 			applyRequestScopedActionToResult(action, okAction, &result)
 			m.MarkResult(execCtx, result)
-			errPrepare = annotateTrustedRetryAfterByHint(errPrepare)
+			errPrepare = annotateTrustedRetryAfterForProvider(provider, errPrepare)
 			syncPreferredUpstreamError(&upstreamErr, errPrepare)
 			if isRequestScopedStop(action, okAction) {
 				return cliproxyexecutor.Response{}, wrapRequestStopError(errPrepare)
@@ -1468,11 +1468,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if okAction && !isRequestStopError(errExec) && !isRequestScopedStop(action, okAction) {
 					errExec = wrapRequestScopedContinueError(errExec)
 				}
-				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
+				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) || (isExecutorAvailabilityNeutralError(errExec) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown)) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					m.MarkResult(execCtx, result)
-					errExec = annotateTrustedRetryAfterByHint(errExec)
+					errExec = annotateTrustedRetryAfterForProvider(provider, errExec)
 				}
 				if hasUpstreamExecutionAttempt(errExec) {
 					syncPreferredUpstreamError(&upstreamErr, errExec)
@@ -1615,7 +1615,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			syncPublishedSelectedAuthMetadata(pickOpts.Metadata, opts.Metadata)
 		}
-		preparedAuth, errPrepare := m.prepareRequestAuth(execCtx, executor, auth)
+		var preparedAuth *Auth
+		var errPrepare error
+		if skipper, okSkip := executor.(interface{ SkipPrepareRequestAuthForCountTokens() bool }); !okSkip || !skipper.SkipPrepareRequestAuthForCountTokens() {
+			preparedAuth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+		}
 		if errPrepare != nil {
 			if preparedAuth != nil {
 				auth = preparedAuth
@@ -1641,7 +1645,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			action, okAction := matchRequestScopedErrorAction(auth, errPrepare, m.requestScopedErrorConfig(execCtx))
 			applyRequestScopedActionToResult(action, okAction, &result)
 			m.MarkResult(execCtx, result)
-			errPrepare = annotateTrustedRetryAfterByHint(errPrepare)
+			errPrepare = annotateTrustedRetryAfterForProvider(provider, errPrepare)
 			syncPreferredUpstreamError(&upstreamErr, errPrepare)
 			if isRequestScopedStop(action, okAction) {
 				return cliproxyexecutor.Response{}, wrapRequestStopError(errPrepare)
@@ -1773,14 +1777,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if okAction && !isRequestStopError(errExec) && !isRequestScopedStop(action, okAction) {
 					errExec = wrapRequestScopedContinueError(errExec)
 				}
-				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
+				if (isCountTokensEndpointNotFoundError(errExec, execReq.Model) || isExecutorAvailabilityNeutralError(errExec)) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					if isCredentialScopedError(errExec) {
 						result.CredentialScope = true
 					}
 					m.MarkResult(execCtx, result)
-					errExec = annotateTrustedRetryAfterByHint(errExec)
+					errExec = annotateTrustedRetryAfterForProvider(provider, errExec)
 				}
 				if hasUpstreamExecutionAttempt(errExec) {
 					syncPreferredUpstreamError(&upstreamErr, errExec)
@@ -2130,7 +2134,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			} else {
 				m.MarkResult(execCtx, result)
 			}
-			errPrepare = annotateTrustedRetryAfterByHint(errPrepare)
+			errPrepare = annotateTrustedRetryAfterForProvider(provider, errPrepare)
 			if okAction && !isRequestStopError(errPrepare) && !isRequestScopedStop(action, okAction) {
 				errPrepare = wrapRequestScopedContinueError(errPrepare)
 			}

@@ -13,6 +13,7 @@ import (
 	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -642,7 +643,7 @@ func normalizeAntigravityThoughtSignatureReplayItem(itemResult ojson.Result) ([]
 	if sig == "" {
 		sig = strings.TrimSpace(itemResult.Get("thought_signature").String())
 	}
-	if sig == "" || sig == "skip_thought_signature_validator" || len(sig) < minAntigravityThoughtSignatureReplayLen {
+	if sig == "" || internalsignature.IsAntigravityThoughtSignatureBypass(sig) || len(sig) < minAntigravityThoughtSignatureReplayLen {
 		return nil, false
 	}
 	doc := ojson.NewDocString(`{"type":"thought_signature"}`)
@@ -703,7 +704,7 @@ func normalizeAntigravityFunctionCallPartReplayItem(itemResult ojson.Result) ([]
 		_ = doc.SetRaw("args", args.Raw)
 	}
 	sig := strings.TrimSpace(itemResult.Get("thoughtSignature").String())
-	if sig != "" && sig != "skip_thought_signature_validator" {
+	if sig != "" && !internalsignature.IsAntigravityThoughtSignatureBypass(sig) {
 		_ = doc.Set("thoughtSignature", sig)
 	}
 	if contentIndex := itemResult.Get("contentIndex"); contentIndex.Type == ojson.Number {

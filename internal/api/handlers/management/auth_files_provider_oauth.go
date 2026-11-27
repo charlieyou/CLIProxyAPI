@@ -39,10 +39,12 @@ type codexOAuthService interface {
 }
 
 type antigravityOAuthService interface {
-	BuildAuthURL(state, redirectURI string) string
-	ExchangeCodeForTokens(ctx context.Context, code, redirectURI string) (*antigravity.TokenResponse, error)
+	BuildAuthURLWithPKCE(state, redirectURI, codeChallenge string) string
+	ExchangeCodeForTokensWithPKCE(ctx context.Context, code, redirectURI, codeVerifier string) (*antigravity.TokenResponse, error)
 	FetchUserInfo(ctx context.Context, accessToken string) (string, error)
 	FetchProjectID(ctx context.Context, accessToken string) (string, error)
+	WarmupSession(ctx context.Context, accessToken, projectID string)
+	Close()
 }
 
 type claudeOAuthService interface {
@@ -727,6 +729,7 @@ func authGrantFingerprint(auth *coreauth.Auth) string {
 	return oauthGrantFingerprint(accessToken, refreshToken, email, accountID)
 }
 
+// RequestAntigravityToken starts a direct Antigravity PKCE OAuth flow matching agy.
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
@@ -737,38 +740,49 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	cfg := h.oauthConfigWithProxy(sessionProxyURL)
 	authSvc := newAntigravityOAuthService(cfg)
 
-	state, errState := misc.GenerateRandomState()
+	state, errState := antigravity.GenerateState()
 	if errState != nil {
+		authSvc.Close()
 		log.Errorf("Failed to generate state parameter: %v", errState)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
 		return
 	}
-
-	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravity.CallbackPort)
-	authURL := authSvc.BuildAuthURL(state, redirectURI)
-
-	RegisterOAuthSessionWithProxy(state, "antigravity", sessionProxyURL)
-	respPayload := gin.H{"status": "ok", "url": authURL, "state": state}
-	bindOAuthSessionTarget(c, state, respPayload)
+	codeVerifier, codeChallenge, errPKCE := antigravity.GeneratePKCE()
+	if errPKCE != nil {
+		authSvc.Close()
+		log.Errorf("Failed to generate PKCE parameters: %v", errPKCE)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE parameters"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
+	redirectURI := antigravity.OOBRedirectURI
 	var forwarder *callbackForwarder
 	if isWebUI {
+		redirectURI = fmt.Sprintf("http://localhost:%d%s", antigravity.CallbackPort, antigravity.LoopbackCallbackPath)
 		targetURL, errTarget := h.managementCallbackURL("/antigravity/callback")
 		if errTarget != nil {
+			authSvc.Close()
 			log.WithError(errTarget).Error("failed to compute antigravity callback target")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(antigravity.CallbackPort, "antigravity", targetURL); errStart != nil {
+			authSvc.Close()
 			log.WithError(errStart).Error("failed to start antigravity callback forwarder")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
 	}
 
+	authURL := authSvc.BuildAuthURLWithPKCE(state, redirectURI, codeChallenge)
+	RegisterOAuthSessionWithProxy(state, "antigravity", sessionProxyURL)
+	respPayload := gin.H{"status": "ok", "url": authURL, "state": state}
+	bindOAuthSessionTarget(c, state, respPayload)
+
 	go func() {
+		defer authSvc.Close()
 		if isWebUI {
 			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
@@ -810,7 +824,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		tokenResp, errToken := authSvc.ExchangeCodeForTokens(ctx, authCode, redirectURI)
+		tokenResp, errToken := authSvc.ExchangeCodeForTokensWithPKCE(ctx, authCode, redirectURI, codeVerifier)
 		if errToken != nil {
 			log.Errorf("Failed to exchange token: %s", redactSessionProxyInString(errToken.Error(), sessionProxyURL))
 			SetOAuthSessionError(state, "Failed to exchange token")
@@ -824,13 +838,14 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
-		email, errInfo := authSvc.FetchUserInfo(ctx, accessToken)
-		if errInfo != nil {
+		email := antigravity.EmailFromIDToken(tokenResp.IDToken)
+		if fetchedEmail, errInfo := authSvc.FetchUserInfo(ctx, accessToken); errInfo == nil && strings.TrimSpace(fetchedEmail) != "" {
+			email = strings.TrimSpace(fetchedEmail)
+		} else if email == "" && errInfo != nil {
 			log.Errorf("Failed to fetch user info: %s", redactSessionProxyInString(errInfo.Error(), sessionProxyURL))
 			SetOAuthSessionError(state, "Failed to fetch user info")
 			return
 		}
-		email = strings.TrimSpace(email)
 		if email == "" {
 			log.Error("antigravity: user info returned empty email")
 			SetOAuthSessionError(state, "Failed to fetch user info")
@@ -851,35 +866,14 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 		log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
 
-		now := time.Now()
-		metadata := map[string]any{
-			"type":          "antigravity",
-			"access_token":  tokenResp.AccessToken,
-			"refresh_token": tokenResp.RefreshToken,
-			"expires_in":    tokenResp.ExpiresIn,
-			"timestamp":     now.UnixMilli(),
-			"expired":       now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
-		}
-		if email != "" {
-			metadata["email"] = email
-		}
-		if projectID != "" {
-			metadata["project_id"] = projectID
-		}
+		authSvc.WarmupSession(ctx, accessToken, projectID)
 
-		fileName := antigravity.CredentialFileName(email)
-		label := strings.TrimSpace(email)
-		if label == "" {
-			label = "antigravity"
-		}
-
-		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "antigravity",
-			FileName: fileName,
-			Label:    label,
-			Metadata: metadata,
-		}
+		record := sdkAuth.BuildAntigravityAuth(&sdkAuth.AntigravityTokenResponse{
+			AccessToken:  tokenResp.AccessToken,
+			RefreshToken: tokenResp.RefreshToken,
+			ExpiresIn:    tokenResp.ExpiresIn,
+			TokenType:    tokenResp.TokenType,
+		}, email, projectID)
 		savedPath, okSaved := h.commitAndCompleteBuiltinOAuthSession(ctx, state, "antigravity", sessionProxyURL, record, "Failed to save token to file", false)
 		if !okSaved {
 			return

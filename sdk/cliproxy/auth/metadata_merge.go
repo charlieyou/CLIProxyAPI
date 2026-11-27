@@ -64,15 +64,23 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 	if target.Metadata == nil {
 		target.Metadata = make(map[string]any)
 	}
-	if _, explicitlySet := target.Metadata["disabled"]; !explicitlySet {
-		if disabled, ok := existingMap["disabled"].(bool); ok {
-			target.Disabled = disabled
+	// A fresh login recovers a credential that a 403 auto-quarantined
+	// (Antigravity): the quarantine's disabled flag is not carried over.
+	quarantined, _ := existingMap["quarantined"].(bool)
+	if !quarantined {
+		if _, explicitlySet := target.Metadata["disabled"]; !explicitlySet {
+			if disabled, ok := existingMap["disabled"].(bool); ok {
+				target.Disabled = disabled
+			}
 		}
 	}
 	_, targetHadOAuthProvider := target.Metadata["oauth_provider"]
 	_, targetHadPortal := target.Metadata["portal"]
 	for k, v := range existingMap {
 		if IsAuthTokenPayloadKey(k) {
+			continue
+		}
+		if quarantined && (k == "disabled" || k == "quarantined") {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(target.Provider), "meta") {

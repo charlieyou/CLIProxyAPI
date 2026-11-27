@@ -546,6 +546,21 @@ func annotateTrustedRetryAfterByHint(err error) error {
 	return withTrustedRetryAfter(err, trustedRetryAfterHint(err))
 }
 
+// annotateTrustedRetryAfterForProvider is annotateTrustedRetryAfterByHint for
+// every provider except Antigravity. The fork's agy build (main e29156a5e) has
+// no trusted retry deadline, so an Antigravity failure reaches the client with
+// only the headers it carried itself and no Retry-After derived from the hint.
+func annotateTrustedRetryAfterForProvider(provider string, err error) error {
+	if isAntigravityProviderName(provider) {
+		return err
+	}
+	return annotateTrustedRetryAfterByHint(err)
+}
+
+func isAntigravityProviderName(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "antigravity")
+}
+
 func (e *trustedRetryAfterError) Error() string {
 	if e == nil || e.cause == nil {
 		return ""

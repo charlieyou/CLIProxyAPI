@@ -3,24 +3,19 @@
 package chat_completions
 
 import (
-	"context"
-	"fmt"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/agythinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util/agyutil"
 	log "github.com/sirupsen/logrus"
 )
 
 const antigravityFunctionThoughtSignature = "skip_thought_signature_validator"
-
-const antigravityOpenAIWebSearchSystemInstruction = "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
 
 // ConvertOpenAIRequestToAntigravity converts an OpenAI Chat Completions request (raw JSON)
 // into a complete Antigravity request JSON. All JSON construction uses sjson and lookups use ojson.
@@ -32,239 +27,80 @@ const antigravityOpenAIWebSearchSystemInstruction = "You are a search engine bot
 //
 // Returns:
 //   - []byte: The transformed request data in Antigravity API format
-func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
-	req := ConvertOpenAIRequestEnvelopeToAntigravity(context.Background(), sdktranslator.RequestEnvelope{
-		Model:  modelName,
-		Body:   inputRawJSON,
-		Stream: stream,
-	})
-	return req.Body, req.Err
-}
-
-// ConvertOpenAIRequestEnvelopeToAntigravity preserves request-scoped model capabilities.
-func ConvertOpenAIRequestEnvelopeToAntigravity(_ context.Context, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
-	req.Body, req.Err = convertOpenAIRequestToAntigravityWithModelInfo(req.Model, req.Body, req.Stream, req.ModelInfo)
-	return req
-}
-
-// convertOpenAIRequestToAntigravity also reports a file part Antigravity cannot
-// receive when it leaves a user turn with nothing to send.
-func convertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
-	return convertOpenAIRequestToAntigravityWithModelInfo(modelName, inputRawJSON, stream, nil)
-}
-
-func convertOpenAIRequestToAntigravityWithModelInfo(modelName string, inputRawJSON []byte, _ bool, modelInfo *registry.ModelInfo) ([]byte, error) {
-	if searchTool, ok := selectAntigravityOpenAIWebSearchTool(inputRawJSON); ok &&
-		antigravitySupportsNativeOpenAIWebSearch(modelName, modelInfo) &&
-		allowsAntigravityOpenAIWebSearch(inputRawJSON) {
-		return buildAntigravityOpenAIWebSearchRequest(modelName, inputRawJSON, searchTool)
-	}
-	return convertOpenAIRequestToAntigravityChat(modelName, inputRawJSON)
-}
-
-func antigravitySupportsNativeOpenAIWebSearch(model string, modelInfo *registry.ModelInfo) bool {
-	if modelInfo != nil && modelInfo.NativeCapabilities != nil && modelInfo.NativeCapabilities.WebSearch != nil {
-		return *modelInfo.NativeCapabilities.WebSearch
-	}
-	model = strings.TrimSpace(thinking.ParseSuffix(strings.TrimSpace(model)).ModelName)
-	if model == "" {
-		return false
-	}
-	for _, localInfo := range registry.GetGlobalRegistry().GetAvailableModelsByProvider("antigravity") {
-		if localInfo == nil || !strings.EqualFold(strings.TrimSpace(thinking.ParseSuffix(strings.TrimSpace(localInfo.ID)).ModelName), model) {
-			continue
-		}
-		if capabilities := localInfo.NativeCapabilities; capabilities != nil && capabilities.WebSearch != nil && !*capabilities.WebSearch {
-			return false
-		}
-		return localInfo.SupportsWebSearch || modelInfo != nil && modelInfo.SupportsWebSearch
-	}
-	return modelInfo != nil && modelInfo.SupportsWebSearch
-}
-
-func selectAntigravityOpenAIWebSearchTool(payload []byte) (ojson.Result, bool) {
-	tools := ojson.GetBytesNoCopy(payload, "tools")
-	if !tools.IsArray() {
-		return ojson.Result{}, false
-	}
-	allowed := parseAntigravityOpenAIAllowedTools(payload)
-	var searchTool ojson.Result
-	searchCount := 0
-	for _, tool := range tools.Array() {
-		hasFunction := tool.Get("type").String() == "function"
-		if hasFunction && allowed.enabled {
-			_, hasFunction = allowed.functionNames[tool.Get("function.name").String()]
-		}
-		hasCodeExec := tool.Get("code_execution").Exists()
-		if hasCodeExec && allowed.enabled {
-			_, hasCodeExec = allowed.nativeTools["code_execution"]
-		}
-		hasURLContext := tool.Get("url_context").Exists()
-		if hasURLContext && allowed.enabled {
-			_, hasURLContext = allowed.nativeTools["url_context"]
-		}
-		hasSearch := tool.Get("google_search").Exists()
-		if hasSearch && allowed.enabled {
-			_, hasSearch = allowed.nativeTools["google_search"]
-		}
-		if hasFunction || hasCodeExec || hasURLContext {
-			return ojson.Result{}, false
-		}
-		if hasSearch {
-			searchTool = tool.Get("google_search")
-			searchCount++
-			if searchCount > 1 {
-				return ojson.Result{}, false
-			}
-		}
-	}
-	if searchCount != 1 {
-		return ojson.Result{}, false
-	}
-	return searchTool, true
-}
-
-func allowsAntigravityOpenAIWebSearch(payload []byte) bool {
-	toolChoice := ojson.GetBytesNoCopy(payload, "tool_choice")
-	if !toolChoice.Exists() || toolChoice.Type == ojson.Null {
-		return true
-	}
-	if toolChoice.Type == ojson.String {
-		switch strings.ToLower(strings.TrimSpace(toolChoice.String())) {
-		case "", "auto", "required", "any":
-			return true
-		default:
-			return false
-		}
-	}
-	if !toolChoice.IsObject() {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String())) {
-	case "", "auto", "required", "any", "google_search":
-		return true
-	case "allowed_tools":
-		allowed := parseAntigravityOpenAIAllowedTools(payload)
-		if allowed.mode != "auto" && allowed.mode != "required" && allowed.mode != "any" {
-			return false
-		}
-		_, ok := allowed.nativeTools["google_search"]
-		return ok
-	default:
-		return false
-	}
-}
-
-func buildAntigravityOpenAIWebSearchRequest(model string, payload []byte, sourceTool ojson.Result) ([]byte, error) {
-	chatBody, errConvert := convertOpenAIRequestToAntigravityChat(model, payload)
-	outDoc := ojson.NewDoc(chatBody)
-	_ = outDoc.Set("requestType", "web_search")
-	_ = outDoc.Set("request.generationConfig.candidateCount", 1)
-	searchPartDoc := ojson.NewDocString(`{"text":""}`)
-	_ = searchPartDoc.Set("text", antigravityOpenAIWebSearchSystemInstruction)
-	systemInstruction := outDoc.Get("request.systemInstruction")
-	systemParts := make([][]byte, 0, len(systemInstruction.Get("parts").Array())+1)
-	for _, part := range systemInstruction.Get("parts").Array() {
-		systemParts = append(systemParts, []byte(part.Raw))
-	}
-	systemParts = append(systemParts, searchPartDoc.Bytes())
-	_ = outDoc.SetRawBytes("request.systemInstruction", antigravityOpenAIContent("user", systemParts))
-	googleToolDoc := ojson.NewDocString(`{"googleSearch":{"enhancedContent":{"imageSearch":{"maxResultCount":5}}}}`)
-	if sourceTool.Exists() && sourceTool.IsObject() {
-		for key, value := range sourceTool.Map() {
-			_ = googleToolDoc.SetRaw("googleSearch."+key, value.Raw)
-		}
-	}
-	_ = outDoc.SetRawBytes("request.tools", translatorcommon.JoinRawArray([][]byte{googleToolDoc.Bytes()}))
-	_ = outDoc.Delete("request.toolConfig.functionCallingConfig")
-	if toolConfig := outDoc.Get("request.toolConfig"); toolConfig.IsObject() && len(toolConfig.Map()) == 0 {
-		_ = outDoc.Delete("request.toolConfig")
-	}
-	gemini.NormalizeAntigravityRequestDoc(outDoc)
-	return outDoc.Bytes(), errConvert
-}
-
-func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte) ([]byte, error) {
+func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
-	var drops translatorcommon.UserTurnDrops
 	functionNameMap := util.SanitizedFunctionNameMap(rawJSON)
 	// Base envelope (no default thinkingConfig)
-	outDoc := ojson.NewDoc([]byte(`{"project":"","request":{"contents":[]},"model":"gemini-2.5-pro"}`))
+	out := []byte(`{"project":"","request":{"contents":[]},"model":"gemini-2.5-pro"}`)
 
 	// Model
-	_ = outDoc.Set("model", modelName)
+	out, _ = ojson.SetBytes(out, "model", modelName)
 
 	// Let user-provided generationConfig pass through
-	if genConfig := ojson.GetBytesNoCopy(rawJSON, "generationConfig"); genConfig.Exists() {
-		_ = outDoc.SetRaw("request.generationConfig", genConfig.Raw)
-	} else if genConfig := ojson.GetBytesNoCopy(rawJSON, "generation_config"); genConfig.Exists() {
-		_ = outDoc.SetRaw("request.generationConfig", genConfig.Raw)
+	if genConfig := ojson.GetBytes(rawJSON, "generationConfig"); genConfig.Exists() {
+		out, _ = ojson.SetRawBytes(out, "request.generationConfig", []byte(genConfig.Raw))
+	} else if genConfig := ojson.GetBytes(rawJSON, "generation_config"); genConfig.Exists() {
+		out, _ = ojson.SetRawBytes(out, "request.generationConfig", []byte(genConfig.Raw))
 	}
 
 	// Apply thinking configuration: convert OpenAI reasoning_effort to Antigravity thinkingConfig.
 	// Inline translation-only mapping; capability checks happen later in ApplyThinking.
-	re := ojson.GetBytesNoCopy(rawJSON, "reasoning_effort")
+	re := ojson.GetBytes(rawJSON, "reasoning_effort")
 	if re.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(re.String()))
 		if effort != "" {
 			thinkingPath := "request.generationConfig.thinkingConfig"
 			if effort == "auto" {
-				_ = outDoc.Set(thinkingPath+".thinkingBudget", -1)
+				out, _ = ojson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
 			} else {
-				_ = outDoc.Set(thinkingPath+".thinkingLevel", effort)
+				out, _ = ojson.SetBytes(out, thinkingPath+".thinkingLevel", effort)
 			}
 		}
 	}
-	normalizeAntigravityOpenAIThinkingConfigDoc(outDoc)
-	if thinkingPath := "request.generationConfig.thinkingConfig"; !outDoc.Get(thinkingPath+".thinkingLevel").Exists() && !outDoc.Get(thinkingPath+".thinkingBudget").Exists() {
-		thinking.ApplyOpenAIGoogleThinkingConfigDoc(outDoc, rawJSON, thinkingPath)
-	}
+	out = applyOpenAIThinkingCompatibilityToAntigravity(out, rawJSON)
 
 	// Temperature/top_p/top_k/max_tokens/max_completion_tokens
-	if tr := ojson.GetBytesNoCopy(rawJSON, "temperature"); tr.Exists() && tr.Type == ojson.Number {
-		_ = outDoc.Set("request.generationConfig.temperature", tr.Num)
+	if tr := ojson.GetBytes(rawJSON, "temperature"); tr.Exists() && tr.Type == ojson.Number {
+		out, _ = ojson.SetBytes(out, "request.generationConfig.temperature", tr.Num)
 	}
-	if tpr := ojson.GetBytesNoCopy(rawJSON, "top_p"); tpr.Exists() && tpr.Type == ojson.Number {
-		_ = outDoc.Set("request.generationConfig.topP", tpr.Num)
+	if tpr := ojson.GetBytes(rawJSON, "top_p"); tpr.Exists() && tpr.Type == ojson.Number {
+		out, _ = ojson.SetBytes(out, "request.generationConfig.topP", tpr.Num)
 	}
-	if tkr := ojson.GetBytesNoCopy(rawJSON, "top_k"); tkr.Exists() && tkr.Type == ojson.Number {
-		_ = outDoc.Set("request.generationConfig.topK", tkr.Num)
+	if tkr := ojson.GetBytes(rawJSON, "top_k"); tkr.Exists() && tkr.Type == ojson.Number {
+		out, _ = ojson.SetBytes(out, "request.generationConfig.topK", tkr.Num)
 	}
-	if maxTok := ojson.GetBytesNoCopy(rawJSON, "max_tokens"); maxTok.Exists() && maxTok.Type == ojson.Number {
-		_ = outDoc.Set("request.generationConfig.maxOutputTokens", maxTok.Num)
-	} else if mct := ojson.GetBytesNoCopy(rawJSON, "max_completion_tokens"); mct.Exists() && mct.Type == ojson.Number {
-		_ = outDoc.Set("request.generationConfig.maxOutputTokens", mct.Num)
-	}
-	if stopSequences := translatorcommon.OpenAIStopSequences(ojson.GetBytesNoCopy(rawJSON, "stop")); len(stopSequences) > 0 {
-		_ = outDoc.Set("request.generationConfig.stopSequences", stopSequences)
+	if maxTok := ojson.GetBytes(rawJSON, "max_tokens"); maxTok.Exists() && maxTok.Type == ojson.Number {
+		out, _ = ojson.SetBytes(out, "request.generationConfig.maxOutputTokens", maxTok.Num)
+	} else if mct := ojson.GetBytes(rawJSON, "max_completion_tokens"); mct.Exists() && mct.Type == ojson.Number {
+		out, _ = ojson.SetBytes(out, "request.generationConfig.maxOutputTokens", mct.Num)
 	}
 
 	// Map OpenAI response_format to Antigravity structured output settings.
-	if responseFormat := ojson.GetBytesNoCopy(rawJSON, "response_format"); responseFormat.Exists() {
+	if responseFormat := ojson.GetBytes(rawJSON, "response_format"); responseFormat.Exists() {
 		switch responseFormatType := strings.ToLower(strings.TrimSpace(responseFormat.Get("type").String())); responseFormatType {
 		case "json_object", "json_schema":
 			for _, schemaKey := range []string{"responseSchema", "responseJsonSchema", "response_schema", "response_json_schema"} {
-				_ = util.DeleteJSONDocIfExists(outDoc, "request.generationConfig."+schemaKey)
+				out, _ = ojson.DeleteBytes(out, "request.generationConfig."+schemaKey)
 			}
-			_ = outDoc.Set("request.generationConfig.responseMimeType", "application/json")
+			out, _ = ojson.SetBytes(out, "request.generationConfig.responseMimeType", "application/json")
 			if responseFormatType == "json_schema" {
 				if schema := responseFormat.Get("json_schema.schema"); schema.Exists() {
-					_ = outDoc.SetRaw("request.generationConfig.responseSchema", schema.Raw)
+					out, _ = ojson.SetRawBytes(out, "request.generationConfig.responseSchema", []byte(schema.Raw))
 				}
 			}
 		}
 	}
 
 	// Candidate count (OpenAI 'n' parameter)
-	if n := ojson.GetBytesNoCopy(rawJSON, "n"); n.Exists() && n.Type == ojson.Number {
+	if n := ojson.GetBytes(rawJSON, "n"); n.Exists() && n.Type == ojson.Number {
 		if val := n.Int(); val > 1 {
-			_ = outDoc.Set("request.generationConfig.candidateCount", val)
+			out, _ = ojson.SetBytes(out, "request.generationConfig.candidateCount", val)
 		}
 	}
 
 	// Map OpenAI modalities -> Antigravity request.generationConfig.responseModalities
 	// e.g. "modalities": ["image", "text"] -> ["IMAGE", "TEXT"]
-	if mods := ojson.GetBytesNoCopy(rawJSON, "modalities"); mods.Exists() && mods.IsArray() {
+	if mods := ojson.GetBytes(rawJSON, "modalities"); mods.Exists() && mods.IsArray() {
 		var responseMods []string
 		for _, m := range mods.Array() {
 			switch strings.ToLower(m.String()) {
@@ -275,32 +111,27 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 			}
 		}
 		if len(responseMods) > 0 {
-			_ = outDoc.Set("request.generationConfig.responseModalities", responseMods)
+			out, _ = ojson.SetBytes(out, "request.generationConfig.responseModalities", responseMods)
 		}
 	}
 
 	// OpenRouter-style image_config support
 	// If the input uses top-level image_config.aspect_ratio, map it into request.generationConfig.imageConfig.aspectRatio.
-	if imgCfg := ojson.GetBytesNoCopy(rawJSON, "image_config"); imgCfg.Exists() && imgCfg.IsObject() {
+	if imgCfg := ojson.GetBytes(rawJSON, "image_config"); imgCfg.Exists() && imgCfg.IsObject() {
 		if ar := imgCfg.Get("aspect_ratio"); ar.Exists() && ar.Type == ojson.String {
-			_ = outDoc.Set("request.generationConfig.imageConfig.aspectRatio", ar.Str)
+			out, _ = ojson.SetBytes(out, "request.generationConfig.imageConfig.aspectRatio", ar.Str)
 		}
 		if size := imgCfg.Get("image_size"); size.Exists() && size.Type == ojson.String {
-			_ = outDoc.Set("request.generationConfig.imageConfig.imageSize", size.Str)
+			out, _ = ojson.SetBytes(out, "request.generationConfig.imageConfig.imageSize", size.Str)
 		}
 	}
 
 	// messages -> systemInstruction + contents
-	messages := ojson.GetBytesNoCopy(rawJSON, "messages")
+	messages := ojson.GetBytes(rawJSON, "messages")
 	if messages.IsArray() {
 		arr := messages.Array()
 		systemParts := make([][]byte, 0, 2)
 		contentItems := make([][]byte, 0, len(arr))
-		contentCanMergeWithToolResponse := make([]bool, 0, len(arr))
-		appendContent := func(content []byte, canMerge bool) {
-			contentItems = append(contentItems, content)
-			contentCanMergeWithToolResponse = append(contentCanMergeWithToolResponse, canMerge)
-		}
 
 		hasEncounteredConversation := false
 		for i := 0; i < len(arr); i++ {
@@ -335,42 +166,41 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 								partItems = append(partItems, antigravityOpenAITextPart(antigravityDemotedSystemText(text, isDemotedSystem)))
 							}
 						case "image_url":
-							// Only a base64 data URL can be inlined; a remote URL has no equivalent here.
-							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData("", "", item.Get("image_url.url").String()); ok {
-								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data))
-							} else {
-								drops.Drop("image_url")
+							imageURL := item.Get("image_url.url").String()
+							if len(imageURL) > 5 {
+								pieces := strings.SplitN(imageURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									part := antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false)
+									partItems = append(partItems, part)
+								}
 							}
 						case "video_url":
-							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData("", "", item.Get("video_url.url").String()); ok {
-								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data))
-							} else {
-								drops.Drop("video_url")
+							videoURL := item.Get("video_url.url").String()
+							if len(videoURL) > 5 {
+								pieces := strings.SplitN(videoURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									partItems = append(partItems, antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false))
+								}
 							}
 						case "file":
 							filename := item.Get("file.filename").String()
 							fileData := item.Get("file.file_data").String()
 							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData(filename, "", fileData); ok {
-								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data))
+								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data, false))
 							} else {
 								log.Warn("Invalid file data or unknown file name extension in user message, skip")
-								drops.Drop("file")
 							}
 						case "input_audio":
 							audioData := item.Get("input_audio.data").String()
 							if audioData != "" {
 								mimeType := antigravityOpenAIAudioMIMEType(item.Get("input_audio.format").String())
-								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, audioData))
-							} else {
-								drops.Drop("input_audio")
+								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, audioData, true))
 							}
 						}
 					}
 				}
-				// Whitespace-only text is forwarded but never keeps an emptied turn alive.
-				drops.EndTurn(translatorcommon.CountSendableGeminiParts(partItems))
 				if len(partItems) > 0 {
-					appendContent(antigravityOpenAIContent("user", partItems), role == "user")
+					contentItems = append(contentItems, antigravityOpenAIContent("user", partItems))
 				}
 			} else if role == "assistant" {
 				hasEncounteredConversation = true
@@ -378,6 +208,7 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == ojson.String && reasoningContent.String() != "" {
 					part := antigravityOpenAITextPart(reasoningContent.String())
 					part, _ = ojson.SetBytes(part, "thought", true)
+					part, _ = ojson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
 					partItems = append(partItems, part)
 				}
 				if content.Type == ojson.String && content.String() != "" {
@@ -390,8 +221,14 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 								partItems = append(partItems, antigravityOpenAITextPart(text))
 							}
 						case "image_url":
-							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData("", "", item.Get("image_url.url").String()); ok {
-								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data))
+							imageURL := item.Get("image_url.url").String()
+							if len(imageURL) > 5 {
+								pieces := strings.SplitN(imageURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									part := antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false)
+									part, _ = ojson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
+									partItems = append(partItems, part)
+								}
 							}
 						}
 					}
@@ -400,54 +237,37 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 				tcs := m.Get("tool_calls")
 				if tcs.IsArray() {
 					type assistantToolCall struct {
-						rawID string
-						id    string
-						name  string
+						id   string
+						name string
 					}
 					toolCalls := make([]assistantToolCall, 0)
-					usedToolCallIDs := make(map[string]struct{})
 					for _, tc := range tcs.Array() {
 						if tc.Get("type").String() != "function" {
 							continue
 						}
-						rawID := tc.Get("id").String()
-						baseID := util.SanitizeClaudeToolID(rawID)
-						functionID := baseID
-						suffix := 1
-						for {
-							if _, exists := usedToolCallIDs[functionID]; !exists {
-								usedToolCallIDs[functionID] = struct{}{}
-								break
-							}
-							functionID = fmt.Sprintf("%s_%d", baseID, suffix)
-							suffix++
-						}
+						functionID := tc.Get("id").String()
 						functionName := util.MapSanitizedFunctionName(functionNameMap, tc.Get("function.name").String())
 						if functionName == "" {
 							continue
 						}
 						functionArgs := tc.Get("function.arguments").String()
-						trimmedArgs := strings.TrimSpace(functionArgs)
-						partDoc := ojson.NewDocString(`{"functionCall":{"id":"","name":"","args":{}}}`)
-						_ = partDoc.Set("functionCall.id", functionID)
-						_ = partDoc.Set("functionCall.name", functionName)
-						if trimmedArgs != "" && trimmedArgs != "null" {
-							if ojson.Valid(trimmedArgs) && ojson.Parse(trimmedArgs).IsObject() {
-								_ = partDoc.SetRaw("functionCall.args", trimmedArgs)
-							} else {
-								_ = partDoc.Set("functionCall.args.params", functionArgs)
-							}
+						part := []byte(`{"functionCall":{"id":"","name":""}}`)
+						part, _ = ojson.SetBytes(part, "functionCall.id", functionID)
+						part, _ = ojson.SetBytes(part, "functionCall.name", functionName)
+						if ojson.Valid(functionArgs) {
+							part, _ = ojson.SetRawBytes(part, "functionCall.args", []byte(functionArgs))
+						} else {
+							part, _ = ojson.SetBytes(part, "functionCall.args.params", []byte(functionArgs))
 						}
-						_ = partDoc.Set("thoughtSignature", antigravityFunctionThoughtSignature)
-						partItems = append(partItems, partDoc.Bytes())
+						part, _ = ojson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
+						partItems = append(partItems, part)
 						toolCalls = append(toolCalls, assistantToolCall{
-							rawID: rawID,
-							id:    functionID,
-							name:  functionName,
+							id:   functionID,
+							name: functionName,
 						})
 					}
 					if len(partItems) > 0 {
-						appendContent(antigravityOpenAIContent("model", partItems), false)
+						contentItems = append(contentItems, antigravityOpenAIContent("model", partItems))
 					}
 
 					// Collect tool responses scoped to this assistant turn.
@@ -467,148 +287,145 @@ func convertOpenAIRequestToAntigravityChat(modelName string, inputRawJSON []byte
 
 					responseParts := make([][]byte, 0, len(toolCalls))
 					for _, call := range toolCalls {
-						partDoc := ojson.NewDoc([]byte(`{"functionResponse":{"id":"","name":""}}`))
-						_ = partDoc.Set("functionResponse.id", call.id)
-						_ = partDoc.Set("functionResponse.name", call.name)
-						response := turnToolResponses[call.rawID]
+						part := []byte(`{"functionResponse":{"id":"","name":""}}`)
+						part, _ = ojson.SetBytes(part, "functionResponse.id", call.id)
+						part, _ = ojson.SetBytes(part, "functionResponse.name", call.name)
+						response := turnToolResponses[call.id]
 						if response == "" {
 							response = "{}"
 						}
 						// Keep it as a string instead of parsing it into JSON.
 						// Parsing it as JSON, similar to reading a JSON file with readFile, may trigger an upstream 400 error.
-						_ = partDoc.Set("functionResponse.response.result", response)
-						responseParts = append(responseParts, partDoc.Bytes())
+						part, _ = ojson.SetBytes(part, "functionResponse.response.output", response)
+						responseParts = append(responseParts, part)
 					}
 					if len(responseParts) > 0 {
-						appendContent(antigravityOpenAIContent("user", responseParts), false)
+						contentItems = append(contentItems, antigravityOpenAIContent("model", responseParts))
 					}
 				} else if len(partItems) > 0 {
-					appendContent(antigravityOpenAIContent("model", partItems), false)
+					contentItems = append(contentItems, antigravityOpenAIContent("model", partItems))
 				}
 			}
 		}
 		if len(systemParts) > 0 {
-			_ = outDoc.SetRawBytes("request.systemInstruction", antigravityOpenAIContent("user", systemParts))
+			out, _ = ojson.SetRawBytes(out, "request.systemInstruction", antigravityOpenAIContent("user", systemParts))
 		}
-		contentItems = mergeAntigravityOpenAIToolResponseUserContents(contentItems, contentCanMergeWithToolResponse)
-		translatorcommon.SetRawArrayItemsDoc(outDoc, "request.contents", contentItems)
+		out = translatorcommon.SetRawArrayItems(out, "request.contents", contentItems)
 	}
 
 	// tools -> request.tools[].functionDeclarations + request.tools[].googleSearch/codeExecution/urlContext passthrough
-	allowed := parseAntigravityOpenAIAllowedTools(rawJSON)
-	var declaredAllowedNames []string
-	seenDeclaredAllowed := make(map[string]struct{})
-	hasAllowedNativeTools := false
-	tools := ojson.GetBytesNoCopy(rawJSON, "tools")
+	tools := ojson.GetBytes(rawJSON, "tools")
 	toolResults := tools.Array()
 	if tools.IsArray() && len(toolResults) > 0 {
 		functionDeclarations := make([][]byte, 0, len(toolResults))
+		googleSearchNodes := make([][]byte, 0)
 		codeExecutionNodes := make([][]byte, 0)
 		urlContextNodes := make([][]byte, 0)
 		for _, t := range toolResults {
 			if t.Get("type").String() == "function" {
 				fn := t.Get("function")
 				if fn.Exists() && fn.IsObject() {
-					nameResult := fn.Get("name")
-					originalName := nameResult.String()
-					if allowed.enabled {
-						if _, ok := allowed.functionNames[originalName]; !ok {
-							continue
-						}
-					}
 					fnRaw := fn.Raw
-					needDefaultSchema := false
 					if fn.Get("parameters").Exists() {
-						renamed, errRename := util.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
+						renamed, errRename := agyutil.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
 						if errRename != nil {
-							log.Warnf("Failed to rename parameters for tool '%s': %v", originalName, errRename)
-							needDefaultSchema = true
+							log.Warnf("Failed to rename parameters for tool '%s': %v", fn.Get("name").String(), errRename)
+							var errSet error
+							fnRawBytes, errSet := ojson.SetBytes([]byte(fnRaw), "parametersJsonSchema.type", "object")
+							if errSet != nil {
+								log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
+								continue
+							}
+							fnRaw = string(fnRawBytes)
+							fnRawBytes, errSet = ojson.SetRawBytes([]byte(fnRaw), "parametersJsonSchema.properties", []byte(`{}`))
+							if errSet != nil {
+								log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
+								continue
+							}
+							fnRaw = string(fnRawBytes)
 						} else {
 							fnRaw = renamed
 						}
 					} else {
-						needDefaultSchema = true
-					}
-					fnDoc := ojson.NewDocString(fnRaw)
-					if needDefaultSchema {
-						if errSet := fnDoc.Set("parametersJsonSchema.type", "object"); errSet != nil {
-							log.Warnf("Failed to set default schema type for tool '%s': %v", originalName, errSet)
+						var errSet error
+						fnRawBytes, errSet := ojson.SetBytes([]byte(fnRaw), "parametersJsonSchema.type", "object")
+						if errSet != nil {
+							log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
 						}
-						if errSet := fnDoc.SetRaw("parametersJsonSchema.properties", `{}`); errSet != nil {
-							log.Warnf("Failed to set default schema properties for tool '%s': %v", originalName, errSet)
+						fnRaw = string(fnRawBytes)
+						fnRawBytes, errSet = ojson.SetRawBytes([]byte(fnRaw), "parametersJsonSchema.properties", []byte(`{}`))
+						if errSet != nil {
+							log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
 						}
+						fnRaw = string(fnRawBytes)
 					}
+					fnRawBytes := []byte(fnRaw)
+					nameResult := fn.Get("name")
+					originalName := nameResult.String()
 					mappedName := util.MapSanitizedFunctionName(functionNameMap, originalName)
 					if nameResult.Type != ojson.String || mappedName != originalName {
-						_ = fnDoc.Set("name", mappedName)
+						fnRawBytes, _ = ojson.SetBytes(fnRawBytes, "name", mappedName)
 					}
-					if fn.Get("strict").Exists() {
-						_ = fnDoc.Delete("strict")
+					if ojson.GetBytes(fnRawBytes, "strict").Exists() {
+						fnRawBytes, _ = ojson.DeleteBytes(fnRawBytes, "strict")
 					}
-					functionDeclarations = append(functionDeclarations, fnDoc.Bytes())
-					if allowed.enabled {
-						if _, exists := seenDeclaredAllowed[mappedName]; !exists {
-							seenDeclaredAllowed[mappedName] = struct{}{}
-							declaredAllowedNames = append(declaredAllowedNames, mappedName)
-						}
-					}
+					functionDeclarations = append(functionDeclarations, fnRawBytes)
 				}
+			}
+			if gs := t.Get("google_search"); gs.Exists() {
+				googleToolNode := []byte(`{}`)
+				var errSet error
+				googleToolNode, errSet = ojson.SetRawBytes(googleToolNode, "googleSearch", []byte(gs.Raw))
+				if errSet != nil {
+					log.Warnf("Failed to set googleSearch tool: %v", errSet)
+					continue
+				}
+				googleSearchNodes = append(googleSearchNodes, googleToolNode)
 			}
 			if ce := t.Get("code_execution"); ce.Exists() {
-				_, allowedCodeExec := allowed.nativeTools["code_execution"]
-				if !allowed.enabled || allowedCodeExec {
-					codeToolNode := []byte(`{}`)
-					var errSet error
-					codeToolNode, errSet = ojson.SetRawBytes(codeToolNode, "codeExecution", []byte(ce.Raw))
-					if errSet != nil {
-						log.Warnf("Failed to set codeExecution tool: %v", errSet)
-						continue
-					}
-					codeExecutionNodes = append(codeExecutionNodes, codeToolNode)
+				codeToolNode := []byte(`{}`)
+				var errSet error
+				codeToolNode, errSet = ojson.SetRawBytes(codeToolNode, "codeExecution", []byte(ce.Raw))
+				if errSet != nil {
+					log.Warnf("Failed to set codeExecution tool: %v", errSet)
+					continue
 				}
+				codeExecutionNodes = append(codeExecutionNodes, codeToolNode)
 			}
 			if uc := t.Get("url_context"); uc.Exists() {
-				_, allowedURLContext := allowed.nativeTools["url_context"]
-				if !allowed.enabled || allowedURLContext {
-					urlToolNode := []byte(`{}`)
-					var errSet error
-					urlToolNode, errSet = ojson.SetRawBytes(urlToolNode, "urlContext", []byte(uc.Raw))
-					if errSet != nil {
-						log.Warnf("Failed to set urlContext tool: %v", errSet)
-						continue
-					}
-					urlContextNodes = append(urlContextNodes, urlToolNode)
+				urlToolNode := []byte(`{}`)
+				var errSet error
+				urlToolNode, errSet = ojson.SetRawBytes(urlToolNode, "urlContext", []byte(uc.Raw))
+				if errSet != nil {
+					log.Warnf("Failed to set urlContext tool: %v", errSet)
+					continue
 				}
+				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
 		deduplicated := util.DeduplicateFunctionDeclarations(translatorcommon.JoinRawArray(functionDeclarations))
 		hasFunction := len(deduplicated) > 2
-		hasAllowedNativeTools = len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0
-		toolItems := make([][]byte, 0, 1+len(codeExecutionNodes)+len(urlContextNodes))
-		if hasFunction {
-			functionToolNode := []byte(`{"functionDeclarations":[]}`)
-			functionToolNode, _ = ojson.SetRawBytes(functionToolNode, "functionDeclarations", deduplicated)
-			toolItems = append(toolItems, functionToolNode)
-		}
-		toolItems = append(toolItems, codeExecutionNodes...)
-		toolItems = append(toolItems, urlContextNodes...)
-		if len(toolItems) > 0 {
-			_ = outDoc.SetRawBytes("request.tools", translatorcommon.JoinRawArray(toolItems))
+		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
+			toolItems := make([][]byte, 0, 1+len(googleSearchNodes)+len(codeExecutionNodes)+len(urlContextNodes))
+			if hasFunction {
+				functionToolNode := []byte(`{"functionDeclarations":[]}`)
+				functionToolNode, _ = ojson.SetRawBytes(functionToolNode, "functionDeclarations", deduplicated)
+				toolItems = append(toolItems, functionToolNode)
+			}
+			toolItems = append(toolItems, googleSearchNodes...)
+			toolItems = append(toolItems, codeExecutionNodes...)
+			toolItems = append(toolItems, urlContextNodes...)
+			out, _ = ojson.SetRawBytes(out, "request.tools", translatorcommon.JoinRawArray(toolItems))
 		}
 	}
 
-	applyOpenAIToolChoiceToAntigravityDoc(outDoc, rawJSON, functionNameMap, allowed, declaredAllowedNames, hasAllowedNativeTools)
-	common.AttachDefaultSafetySettingsDoc(outDoc, "request.safetySettings")
-	summaryCfg := thinking.ExtractSummaryConfig(rawJSON, "openai")
-	out := thinking.ApplySummaryConfig(outDoc.Bytes(), "antigravity", summaryCfg)
+	out = applyOpenAIToolChoiceToAntigravity(out, rawJSON, functionNameMap)
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		out = gemini.SanitizeAntigravityClaudeGeminiRequestSignatures(modelName, out)
 	}
-	finalDoc := ojson.NewDoc(out)
-	gemini.NormalizeAntigravityRequestDoc(finalDoc)
-	return finalDoc.Bytes(), drops.Err()
+	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
 }
 
 func antigravityOpenAITextPart(text string) []byte {
@@ -617,60 +434,18 @@ func antigravityOpenAITextPart(text string) []byte {
 	return part
 }
 
-func antigravityOpenAIInlineDataPart(mimeType, data string) []byte {
-	partDoc := ojson.NewDoc([]byte(`{"inlineData":{"mimeType":"","data":""}}`))
-	_ = partDoc.Set("inlineData.mimeType", mimeType)
-	_ = partDoc.Set("inlineData.data", data)
-	return partDoc.Bytes()
-}
-
-func mergeAntigravityOpenAIToolResponseUserContents(contents [][]byte, canMerge []bool) [][]byte {
-	if len(contents) <= 1 {
-		return contents
-	}
-	merged := make([][]byte, 0, len(contents))
-	for i := 0; i < len(contents); i++ {
-		content := contents[i]
-		if ojson.GetBytesNoCopy(content, "role").String() != "user" ||
-			!translatorcommon.ContentHasGeminiFunctionResponse(content) {
-			merged = append(merged, content)
-			continue
-		}
-
-		j := i + 1
-		partCount := len(ojson.GetBytesNoCopy(content, "parts").Array())
-		for j < len(contents) && j < len(canMerge) && canMerge[j] {
-			partCount += len(ojson.GetBytesNoCopy(contents[j], "parts").Array())
-			j++
-		}
-		if j == i+1 {
-			merged = append(merged, content)
-			continue
-		}
-
-		parts := make([][]byte, 0, partCount)
-		for _, current := range contents[i:j] {
-			for _, part := range ojson.GetBytesNoCopy(current, "parts").Array() {
-				parts = append(parts, []byte(part.Raw))
-			}
-		}
-		contentDoc := ojson.NewDoc(content)
-		if errSet := contentDoc.SetRawBytes("parts", translatorcommon.JoinRawArray(parts)); errSet != nil {
-			merged = append(merged, contents[i:j]...)
-			i = j - 1
-			continue
-		}
-		merged = append(merged, contentDoc.Bytes())
-		i = j - 1
-	}
-	return merged
+func antigravityOpenAIInlineDataPart(mimeType, data string, _ bool) []byte {
+	part := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+	part, _ = ojson.SetBytes(part, "inlineData.mimeType", mimeType)
+	part, _ = ojson.SetBytes(part, "inlineData.data", data)
+	return part
 }
 
 func antigravityOpenAIContent(role string, parts [][]byte) []byte {
-	contentDoc := ojson.NewDoc([]byte(`{"role":"","parts":[]}`))
-	_ = contentDoc.Set("role", role)
-	_ = contentDoc.SetRawBytes("parts", translatorcommon.JoinRawArray(parts))
-	return contentDoc.Bytes()
+	content := []byte(`{"role":"","parts":[]}`)
+	content, _ = ojson.SetBytes(content, "role", role)
+	content, _ = ojson.SetRawBytes(content, "parts", translatorcommon.JoinRawArray(parts))
+	return content
 }
 
 func antigravityOpenAIAudioMIMEType(format string) string {
@@ -696,86 +471,10 @@ func antigravityOpenAIAudioMIMEType(format string) string {
 	}
 }
 
-type antigravityOpenAIAllowedTools struct {
-	enabled       bool
-	mode          string
-	functionNames map[string]struct{}
-	nativeTools   map[string]struct{}
-}
-
-func parseAntigravityOpenAIAllowedTools(rawJSON []byte) antigravityOpenAIAllowedTools {
-	res := antigravityOpenAIAllowedTools{
-		mode: "auto",
-	}
-	toolChoice := ojson.GetBytesNoCopy(rawJSON, "tool_choice")
-	if toolChoice.Exists() && toolChoice.IsObject() && strings.EqualFold(strings.TrimSpace(toolChoice.Get("type").String()), "allowed_tools") {
-		res.enabled = true
-		res.functionNames = make(map[string]struct{})
-		res.nativeTools = make(map[string]struct{})
-		toolList := toolChoice.Get("allowed_tools.tools").Array()
-		if len(toolList) == 0 {
-			toolList = toolChoice.Get("tools").Array()
-		}
-		for _, t := range toolList {
-			toolType := strings.ToLower(strings.TrimSpace(t.Get("type").String()))
-			if toolType == "google_search" || t.Get("google_search").Exists() {
-				res.nativeTools["google_search"] = struct{}{}
-			}
-			if toolType == "code_execution" || t.Get("code_execution").Exists() {
-				res.nativeTools["code_execution"] = struct{}{}
-			}
-			if toolType == "url_context" || t.Get("url_context").Exists() {
-				res.nativeTools["url_context"] = struct{}{}
-			}
-			if toolType != "google_search" && toolType != "code_execution" && toolType != "url_context" {
-				fnName := strings.TrimSpace(t.Get("function.name").String())
-				if fnName == "" {
-					fnName = strings.TrimSpace(t.Get("name").String())
-				}
-				if fnName != "" {
-					res.functionNames[fnName] = struct{}{}
-				}
-			}
-		}
-		modeVal := strings.ToLower(strings.TrimSpace(toolChoice.Get("allowed_tools.mode").String()))
-		if modeVal == "" {
-			modeVal = strings.ToLower(strings.TrimSpace(toolChoice.Get("mode").String()))
-		}
-		if modeVal != "" {
-			res.mode = modeVal
-		}
-	}
-	return res
-}
-
-func applyOpenAIToolChoiceToAntigravityDoc(outDoc *ojson.Doc, rawJSON []byte, functionNameMap map[string]string, allowed antigravityOpenAIAllowedTools, declaredAllowedNames []string, hasAllowedNativeTools bool) {
-	if allowed.enabled {
-		switch allowed.mode {
-		case "none":
-			_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "NONE")
-		case "required", "any":
-			if len(declaredAllowedNames) > 0 {
-				_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "ANY")
-				_ = outDoc.Set("request.toolConfig.functionCallingConfig.allowedFunctionNames", declaredAllowedNames)
-			} else if !hasAllowedNativeTools {
-				_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "NONE")
-			}
-		case "auto":
-			if len(declaredAllowedNames) > 0 {
-				// Mode AUTO: functionDeclarations already contains only allowed tools.
-				_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "AUTO")
-			} else if !hasAllowedNativeTools {
-				_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "NONE")
-			}
-		default:
-			_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", "NONE")
-		}
-		return
-	}
-
-	toolChoice := ojson.GetBytesNoCopy(rawJSON, "tool_choice")
-	if !toolChoice.Exists() || toolChoice.Type == ojson.Null {
-		return
+func applyOpenAIToolChoiceToAntigravity(out, rawJSON []byte, functionNameMap map[string]string) []byte {
+	toolChoice := ojson.GetBytes(rawJSON, "tool_choice")
+	if !toolChoice.Exists() {
+		return out
 	}
 
 	mode := ""
@@ -793,86 +492,62 @@ func applyOpenAIToolChoiceToAntigravityDoc(outDoc *ojson.Doc, rawJSON []byte, fu
 		switch strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String())) {
 		case "none":
 			mode = "NONE"
-		case "auto":
-			mode = "AUTO"
-		case "required", "any":
+		case "function":
 			mode = "ANY"
-		case "function", "tool":
-			allowedName = strings.TrimSpace(toolChoice.Get("function.name").String())
-			if allowedName == "" {
-				allowedName = strings.TrimSpace(toolChoice.Get("name").String())
-			}
-			if allowedName == "" {
-				mode = "NONE"
-			} else {
-				mode = "ANY"
-			}
+			allowedName = toolChoice.Get("function.name").String()
 		}
 	}
 	if mode == "" {
-		return
+		return out
 	}
 
-	_ = outDoc.Set("request.toolConfig.functionCallingConfig.mode", mode)
-	if allowedName != "" {
+	out, _ = ojson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", mode)
+	if mode == "NONE" {
+		out, _ = ojson.DeleteBytes(out, "request.tools")
+	}
+	if strings.TrimSpace(allowedName) != "" {
 		mappedName := util.MapSanitizedFunctionName(functionNameMap, allowedName)
-		_ = outDoc.Set("request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{mappedName})
-	}
-}
-
-func normalizeAntigravityOpenAIThinkingConfig(out []byte) []byte {
-	outDoc := ojson.NewDoc(out)
-	if normalizeAntigravityOpenAIThinkingConfigDoc(outDoc) {
-		return outDoc.Bytes()
+		out, _ = ojson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{mappedName})
 	}
 	return out
 }
 
-func normalizeAntigravityOpenAIThinkingConfigDoc(outDoc *ojson.Doc) bool {
-	changed := false
+func applyOpenAIThinkingCompatibilityToAntigravity(out []byte, rawJSON []byte) []byte {
+	out = normalizeAntigravityOpenAIThinkingConfig(out)
+	config := agythinking.ExtractSummaryConfig(rawJSON, "openai")
+	return agythinking.ApplySummaryConfig(out, "antigravity", config)
+}
+
+func normalizeAntigravityOpenAIThinkingConfig(out []byte) []byte {
 	for _, prefix := range []string{
 		"request.generationConfig.thinking_config",
 		"request.generationConfig.thinkingConfig",
 	} {
-		if sourcePath := prefix + ".includeThoughts"; outDoc.Get(sourcePath).Exists() {
-			includeThoughts := outDoc.Get(sourcePath)
-			if setAntigravityOpenAIBoolResultIfValidDoc(outDoc, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts) {
-				changed = true
-			}
+		if sourcePath := prefix + ".includeThoughts"; ojson.GetBytes(out, sourcePath).Exists() {
+			includeThoughts := ojson.GetBytes(out, sourcePath)
+			out = setAntigravityOpenAIBoolResultIfValid(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
 			if includeThoughts.Type != ojson.True && includeThoughts.Type != ojson.False {
-				_ = outDoc.Delete(sourcePath)
-				changed = true
+				out, _ = ojson.DeleteBytes(out, sourcePath)
 			}
 		}
-		if sourcePath := prefix + ".include_thoughts"; outDoc.Get(sourcePath).Exists() {
-			includeThoughts := outDoc.Get(sourcePath)
-			if setAntigravityOpenAIBoolResultIfValidDoc(outDoc, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts) {
-				changed = true
-			}
+		if sourcePath := prefix + ".include_thoughts"; ojson.GetBytes(out, sourcePath).Exists() {
+			includeThoughts := ojson.GetBytes(out, sourcePath)
+			out = setAntigravityOpenAIBoolResultIfValid(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
 			if includeThoughts.Type != ojson.True && includeThoughts.Type != ojson.False {
-				_ = outDoc.Delete(sourcePath)
-				changed = true
+				out, _ = ojson.DeleteBytes(out, sourcePath)
 			}
 		}
-		if thinkingLevel := outDoc.Get(prefix + ".thinkingLevel"); thinkingLevel.Exists() {
-			if setAntigravityOpenAIRawIfDifferentDoc(outDoc, "request.generationConfig.thinkingConfig.thinkingLevel", thinkingLevel) {
-				changed = true
-			}
+		if thinkingLevel := ojson.GetBytes(out, prefix+".thinkingLevel"); thinkingLevel.Exists() {
+			out = setAntigravityOpenAIRawIfDifferent(out, "request.generationConfig.thinkingConfig.thinkingLevel", thinkingLevel)
 		}
-		if thinkingLevel := outDoc.Get(prefix + ".thinking_level"); thinkingLevel.Exists() {
-			if setAntigravityOpenAIRawIfDifferentDoc(outDoc, "request.generationConfig.thinkingConfig.thinkingLevel", thinkingLevel) {
-				changed = true
-			}
+		if thinkingLevel := ojson.GetBytes(out, prefix+".thinking_level"); thinkingLevel.Exists() {
+			out = setAntigravityOpenAIRawIfDifferent(out, "request.generationConfig.thinkingConfig.thinkingLevel", thinkingLevel)
 		}
-		if thinkingBudget := outDoc.Get(prefix + ".thinkingBudget"); thinkingBudget.Exists() {
-			if setAntigravityOpenAIRawIfDifferentDoc(outDoc, "request.generationConfig.thinkingConfig.thinkingBudget", thinkingBudget) {
-				changed = true
-			}
+		if thinkingBudget := ojson.GetBytes(out, prefix+".thinkingBudget"); thinkingBudget.Exists() {
+			out = setAntigravityOpenAIRawIfDifferent(out, "request.generationConfig.thinkingConfig.thinkingBudget", thinkingBudget)
 		}
-		if thinkingBudget := outDoc.Get(prefix + ".thinking_budget"); thinkingBudget.Exists() {
-			if setAntigravityOpenAIRawIfDifferentDoc(outDoc, "request.generationConfig.thinkingConfig.thinkingBudget", thinkingBudget) {
-				changed = true
-			}
+		if thinkingBudget := ojson.GetBytes(out, prefix+".thinking_budget"); thinkingBudget.Exists() {
+			out = setAntigravityOpenAIRawIfDifferent(out, "request.generationConfig.thinkingConfig.thinkingBudget", thinkingBudget)
 		}
 	}
 
@@ -880,10 +555,8 @@ func normalizeAntigravityOpenAIThinkingConfigDoc(outDoc *ojson.Doc) bool {
 		"request.generationConfig.includeThoughts",
 		"request.generationConfig.include_thoughts",
 	} {
-		if includeThoughts := outDoc.Get(path); includeThoughts.Exists() {
-			if setAntigravityOpenAIBoolResultIfValidDoc(outDoc, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts) {
-				changed = true
-			}
+		if includeThoughts := ojson.GetBytes(out, path); includeThoughts.Exists() {
+			out = setAntigravityOpenAIBoolResultIfValid(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
 		}
 	}
 
@@ -895,40 +568,47 @@ func normalizeAntigravityOpenAIThinkingConfigDoc(outDoc *ojson.Doc) bool {
 		"request.generationConfig.includeThoughts",
 		"request.generationConfig.include_thoughts",
 	} {
-		if outDoc.Get(path).Exists() {
-			_ = outDoc.Delete(path)
-			changed = true
+		if ojson.GetBytes(out, path).Exists() {
+			out, _ = ojson.DeleteBytes(out, path)
 		}
 	}
 
-	return changed
+	return out
 }
 
-func setAntigravityOpenAIBoolResultIfValidDoc(outDoc *ojson.Doc, path string, value ojson.Result) bool {
+func setAntigravityOpenAIBoolResultIfValid(out []byte, path string, value ojson.Result) []byte {
 	switch value.Type {
 	case ojson.True:
-		return setAntigravityOpenAIBoolIfDifferentDoc(outDoc, path, true)
+		return setAntigravityOpenAIBoolIfDifferent(out, path, true)
 	case ojson.False:
-		return setAntigravityOpenAIBoolIfDifferentDoc(outDoc, path, false)
+		return setAntigravityOpenAIBoolIfDifferent(out, path, false)
 	default:
-		return false
+		return out
 	}
 }
 
-func setAntigravityOpenAIBoolIfDifferentDoc(outDoc *ojson.Doc, path string, value bool) bool {
-	current := outDoc.Get(path)
+func setAntigravityOpenAIBoolIfDifferent(out []byte, path string, value bool) []byte {
+	current := ojson.GetBytes(out, path)
 	if value && current.Type == ojson.True || !value && current.Type == ojson.False {
-		return false
+		return out
 	}
-	return outDoc.Set(path, value) == nil
+	updated, errSet := ojson.SetBytes(out, path, value)
+	if errSet != nil {
+		return out
+	}
+	return updated
 }
 
-func setAntigravityOpenAIRawIfDifferentDoc(outDoc *ojson.Doc, path string, value ojson.Result) bool {
-	current := outDoc.Get(path)
+func setAntigravityOpenAIRawIfDifferent(out []byte, path string, value ojson.Result) []byte {
+	current := ojson.GetBytes(out, path)
 	if current.Exists() && current.Raw == value.Raw {
-		return false
+		return out
 	}
-	return outDoc.SetRaw(path, value.Raw) == nil
+	updated, errSet := ojson.SetRawBytes(out, path, []byte(value.Raw))
+	if errSet != nil {
+		return out
+	}
+	return updated
 }
 
 // antigravityDemotedSystemText wraps a demoted mid-session system or developer

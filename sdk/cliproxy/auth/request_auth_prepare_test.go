@@ -519,8 +519,14 @@ func TestManagerExecute_PrepareAuth403TriggersCooldown(t *testing.T) {
 	if !current.Unavailable {
 		t.Fatal("expected auth to be marked unavailable after 403 prepare failure")
 	}
-	if current.Quota.NextRecoverAt.IsZero() && current.NextRetryAfter.IsZero() {
-		t.Fatal("expected auth cooldown to be scheduled after 403 prepare failure")
+	if !current.Disabled || current.Status != StatusDisabled {
+		t.Fatalf("expected Antigravity auth to be quarantined (Disabled=%v, Status=%q), want disabled", current.Disabled, current.Status)
+	}
+	if !current.NextRetryAfter.IsZero() {
+		t.Fatalf("expected quarantined Antigravity 403 auth not to schedule automatic retry, got %v", current.NextRetryAfter)
+	}
+	if disabled, _ := current.Metadata["disabled"].(bool); !disabled {
+		t.Fatalf("expected auth.Metadata[disabled]=true for persistence, got %#v", current.Metadata["disabled"])
 	}
 }
 

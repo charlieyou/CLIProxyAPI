@@ -11,7 +11,7 @@ func init() {
 	translator.Register(
 		OpenaiResponse,
 		Antigravity,
-		nil,
+		translateRequest(ConvertOpenAIResponsesRequestToAntigravity),
 		interfaces.TranslateResponse{
 			Stream:    ConvertAntigravityResponseToOpenAIResponses,
 			NonStream: ConvertAntigravityResponseToOpenAIResponsesNonStream,
@@ -22,4 +22,12 @@ func init() {
 		sdktranslator.FormatAntigravity,
 		ConvertOpenAIResponsesRequestEnvelopeToAntigravity,
 	)
+}
+
+// translateRequest adapts a body-only request converter to the registry's
+// RequestTransform, which also carries a request-scoped refusal error.
+func translateRequest(convert func(string, []byte, bool) []byte) interfaces.TranslateRequestFunc {
+	return func(modelName string, rawJSON []byte, stream bool) ([]byte, error) {
+		return convert(modelName, rawJSON, stream), nil
+	}
 }

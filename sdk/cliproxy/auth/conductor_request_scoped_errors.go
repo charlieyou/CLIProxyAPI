@@ -62,6 +62,17 @@ func IsRequestStopError(err error) bool {
 	return isRequestStopError(err)
 }
 
+func isExecutorAvailabilityNeutralError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type availabilityNeutralChecker interface {
+		IsAvailabilityNeutral() bool
+	}
+	var checker availabilityNeutralChecker
+	return errors.As(err, &checker) && checker != nil && checker.IsAvailabilityNeutral()
+}
+
 func isRequestStopError(err error) bool {
 	if err == nil {
 		return false

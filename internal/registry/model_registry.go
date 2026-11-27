@@ -478,6 +478,29 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	r.registerClientLocked(clientID, clientProvider, models, false)
 }
 
+// ReplaceClientIfEpoch atomically replaces (or unregisters when models is empty)
+// a client's registered models only if the client is currently registered and
+// its registration epoch still matches expectedEpoch. Returns true if applied.
+func (r *ModelRegistry) ReplaceClientIfEpoch(clientID, clientProvider string, expectedEpoch uint64, models []*ModelInfo) bool {
+	if r == nil || expectedEpoch == 0 {
+		return false
+	}
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		return false
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.clientEpochs == nil || r.clientEpochs[clientID] != expectedEpoch {
+		return false
+	}
+	if _, exists := r.clientModels[clientID]; !exists {
+		return false
+	}
+	r.registerClientLocked(clientID, clientProvider, models, false)
+	return true
+}
+
 // RegisterClientIfEpochCurrent registers a client's models only if its
 // registration epoch still equals expectedEpoch and publish is non-nil. The
 // fence evaluation and the registration runs atomically under the registry

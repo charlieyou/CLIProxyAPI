@@ -25,10 +25,10 @@ func (*antigravityHomeModelCapabilityDispatcher) HeartbeatOK() bool { return tru
 
 func (d *antigravityHomeModelCapabilityDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
 	return json.Marshal(map[string]any{
-		"model":    "gemini-3.8-flash-high",
+		"model":    "gemini-9-preview",
 		"provider": "antigravity",
 		"model_info": map[string]any{
-			"id":             "gemini-3.8-flash-high",
+			"id":             "gemini-9-preview",
 			"type":           "gemini",
 			"context_length": 1048576,
 			"thinking": map[string]any{
@@ -76,9 +76,9 @@ func TestAntigravityHomeModelThinkingLevelRemainsLevel(t *testing.T) {
 	manager.RegisterExecutor(NewAntigravityExecutor(cfg))
 	manager.PublishHomeDispatch(&antigravityHomeModelCapabilityDispatcher{baseURL: server.URL}, executionregistry.New(), 1)
 
-	payload := []byte(`{"model":"gemini-3.8-flash-high","reasoning_effort":"medium","messages":[{"role":"user","content":"hello"}]}`)
+	payload := []byte(`{"model":"gemini-9-preview","reasoning_effort":"medium","messages":[{"role":"user","content":"hello"}]}`)
 	_, errExecute := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{
-		Model:   "gemini-3.8-flash-high",
+		Model:   "gemini-9-preview",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FormatOpenAI,

@@ -14,13 +14,47 @@ import (
 func TestDefaultAntigravityFetchBaseURLs(t *testing.T) {
 	want := []string{
 		antigravityBaseURLDaily,
-		antigravityBaseURLProd,
-		antigravitySandboxBaseURLDaily,
 	}
 
 	got := defaultAntigravityFetchBaseURLs()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaultAntigravityFetchBaseURLs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestFetchModelsSkipsExpiredAndDoesNotRetry401(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	expiredAuth := &coreauth.Auth{
+		Metadata: map[string]any{
+			"access_token": "tok-expired",
+			"project_id":   "aicode-consumers",
+			"expired":      "2020-01-01T00:00:00Z",
+		},
+	}
+	if got := fetchModelsFromBaseURLs(context.Background(), expiredAuth, []string{srv.URL}, srv.Client()); got != nil {
+		t.Fatalf("expected nil for expired auth, got %v", got)
+	}
+	if hits != 0 {
+		t.Fatalf("expired auth hit server %d times, want 0", hits)
+	}
+
+	validAuth := &coreauth.Auth{
+		Metadata: map[string]any{
+			"access_token": "tok-401",
+			"project_id":   "aicode-consumers",
+		},
+	}
+	if got := fetchModelsFromBaseURLs(context.Background(), validAuth, []string{srv.URL}, srv.Client()); got != nil {
+		t.Fatalf("expected nil on 401, got %v", got)
+	}
+	if hits != 1 {
+		t.Fatalf("401 auth hit server %d times, want 1 (no retry on 401)", hits)
 	}
 }
 

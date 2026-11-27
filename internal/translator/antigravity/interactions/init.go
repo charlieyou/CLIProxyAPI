@@ -10,10 +10,18 @@ func init() {
 	translator.Register(
 		Interactions,
 		Antigravity,
-		ConvertInteractionsRequestToAntigravity,
+		translateRequest(ConvertInteractionsRequestToAntigravity),
 		interfaces.TranslateResponse{
 			Stream:    ConvertAntigravityResponseToInteractions,
 			NonStream: ConvertAntigravityResponseToInteractionsNonStream,
 		},
 	)
+}
+
+// translateRequest adapts a body-only request converter to the registry's
+// RequestTransform, which also carries a request-scoped refusal error.
+func translateRequest(convert func(string, []byte, bool) []byte) interfaces.TranslateRequestFunc {
+	return func(modelName string, rawJSON []byte, stream bool) ([]byte, error) {
+		return convert(modelName, rawJSON, stream), nil
+	}
 }

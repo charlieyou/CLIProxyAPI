@@ -170,6 +170,14 @@ func TestIssue6258ExecutorResponsesSplitUsage(t *testing.T) {
 				defer server.Close()
 				ctx, executor, auth := issue6258Executor(t, provider, server.URL)
 				response := issue6258ExecutorTerminal(t, issue6258StartStream(t, ctx, executor, auth, `{"input":"hello","stream":true}`))
+				if provider == "antigravity" {
+					// The agy build (main e29156a5e) completes the Responses
+					// stream at finishReason, before the split usage chunk.
+					if usage := response.Get("usage"); usage.Exists() {
+						t.Errorf("terminal usage=%s, want none as on main", usage.Raw)
+					}
+					return
+				}
 				for path, want := range map[string]int64{"input_tokens": 100, "output_tokens": 60, "total_tokens": 160, "output_tokens_details.reasoning_tokens": 50} {
 					got := response.Get("usage." + path)
 					if !got.Exists() || got.Int() != want {

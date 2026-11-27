@@ -23,11 +23,15 @@ type stubAntigravityProjectOAuthService struct {
 	projectErr error
 }
 
-func (s *stubAntigravityProjectOAuthService) BuildAuthURL(state, _ string) string {
+func (s *stubAntigravityProjectOAuthService) WarmupSession(context.Context, string, string) {}
+
+func (s *stubAntigravityProjectOAuthService) Close() {}
+
+func (s *stubAntigravityProjectOAuthService) BuildAuthURLWithPKCE(state, _, _ string) string {
 	return "https://accounts.google.com/o/oauth2/v2/auth?state=" + state
 }
 
-func (s *stubAntigravityProjectOAuthService) ExchangeCodeForTokens(_ context.Context, code, _ string) (*antigravity.TokenResponse, error) {
+func (s *stubAntigravityProjectOAuthService) ExchangeCodeForTokensWithPKCE(_ context.Context, code, _, _ string) (*antigravity.TokenResponse, error) {
 	return &antigravity.TokenResponse{
 		AccessToken:  "ag-access-" + code,
 		RefreshToken: "ag-refresh-" + code,

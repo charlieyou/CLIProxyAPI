@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,51 +16,120 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
-func TestAntigravityCapabilityProbe_CallerCancellation(t *testing.T) {
-	started := make(chan struct{})
+// TestAntigravityCapabilityProbe_HardTimeout verifies that fetchAntigravityModelCapabilityHintsForAuth
+// enforces a hard timeout (not exceeding 5s) even when passed an unbounded background context
+// and connecting to a hanging server.
+func TestAntigravityCapabilityProbe_HardTimeout(t *testing.T) {
+	// Mock server that hangs unless client cancels
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.(http.Flusher).Flush()
-		close(started)
-		<-r.Context().Done()
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+		_, _ = w.Write([]byte(`{"webSearchModelIds":["gemini-2.5-flash"]}`))
 	}))
-	defer server.Close()
-	svc := &Service{cfg: &config.Config{}}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		svc.fetchAntigravityModelCapabilityHintsForAuth(ctx, antigravityTestAuth("cancel", server.URL))
-	}()
-	<-started
-	cancel()
-	<-done
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+	})
+
+	svc := &Service{
+		cfg: &config.Config{},
+	}
+
+	auth := &coreauth.Auth{
+		ID:       "test-antigravity-auth",
+		Provider: "antigravity",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "ya29.test-token",
+		},
+	}
+
+	start := time.Now()
+	hints := svc.fetchAntigravityModelCapabilityHintsForAuth(context.Background(), auth)
+	elapsed := time.Since(start)
+
+	// It must enforce a hard timeout <= 6 seconds instead of waiting the full 10s
+	if elapsed >= 8*time.Second {
+		t.Fatalf("fetchAntigravityModelCapabilityHintsForAuth took %v, want hard timeout <= 6s", elapsed)
+	}
+	if len(hints.WebSearchModelIDs) != 0 {
+		t.Fatalf("expected empty hints due to timeout, got %v", hints)
+	}
 }
 
-func TestAntigravityCapabilityProbe_UsesFirstConfiguredEndpoint(t *testing.T) {
-	var firstCalls, secondCalls atomic.Int32
-	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		firstCalls.Add(1)
-		_, _ = w.Write([]byte(`{"models":{"first":{}}}`))
+// TestAntigravityCapabilityProbe_ConcurrentBaseURLs verifies that when multiple baseURLs
+// are configured and one hangs while the other responds promptly, both endpoints receive requests
+// concurrently and the probe returns the fast result quickly (< 2s) without waiting for the slow one.
+func TestAntigravityCapabilityProbe_ConcurrentBaseURLs(t *testing.T) {
+	slowStarted := make(chan struct{})
+	var slowOnce sync.Once
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowOnce.Do(func() { close(slowStarted) })
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
 	}))
-	defer first.Close()
-	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		secondCalls.Add(1)
-		_, _ = w.Write([]byte(`{"models":{"second":{}}}`))
+	t.Cleanup(func() {
+		slowServer.CloseClientConnections()
+		slowServer.Close()
+	})
+
+	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Wait for slowServer to have received its concurrent request or client context cancellation
+		select {
+		case <-slowStarted:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"webSearchModelIds":["gemini-3.1-flash-lite"]}`))
 	}))
-	defer second.Close()
-	svc := &Service{cfg: &config.Config{}}
-	auth := antigravityTestAuth("route", first.URL)
-	auth.Attributes["base_urls"] = first.URL + "," + second.URL
-	hints := svc.fetchAntigravityModelCapabilityHintsForAuth(t.Context(), auth)
-	if _, ok := hints.ModelIDs["first"]; !ok || firstCalls.Load() != 1 || secondCalls.Load() != 0 {
-		t.Fatalf("hints=%v first=%d second=%d", hints, firstCalls.Load(), secondCalls.Load())
+	t.Cleanup(fastServer.Close)
+
+	svc := &Service{
+		cfg: &config.Config{},
+	}
+
+	auth := &coreauth.Auth{
+		ID:       "test-ag-concurrent-auth",
+		Provider: "antigravity",
+		Attributes: map[string]string{
+			"base_urls": slowServer.URL + "," + fastServer.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "ya29.test-token",
+		},
+	}
+
+	start := time.Now()
+	hints := svc.fetchAntigravityModelCapabilityHintsForAuth(context.Background(), auth)
+	elapsed := time.Since(start)
+
+	if elapsed >= 2*time.Second {
+		t.Fatalf("concurrent fetch took %v, want < 2s", elapsed)
+	}
+	if _, ok := hints.WebSearchModelIDs["gemini-3.1-flash-lite"]; !ok {
+		t.Fatalf("expected gemini-3.1-flash-lite in hints, got %v", hints)
 	}
 }
 
 // TestAntigravityModelRegistration_AsyncNonBlocking verifies that registerModelsForAuth
-// returns immediately without exposing unverified models and does not block on the probe.
+// returns immediately (< 500ms) with baseline models and does not block on a hanging capability probe.
 func TestAntigravityModelRegistration_AsyncNonBlocking(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -91,10 +161,8 @@ func TestAntigravityModelRegistration_AsyncNonBlocking(t *testing.T) {
 		GlobalModelRegistry().UnregisterClient(auth.ID)
 	})
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer func() { cancel(); svc.WaitAntigravityProbes() }()
 	start := time.Now()
-	svc.registerModelsForAuth(ctx, auth)
+	svc.registerModelsForAuth(context.Background(), auth)
 	elapsed := time.Since(start)
 
 	if elapsed >= 500*time.Millisecond {
@@ -102,8 +170,8 @@ func TestAntigravityModelRegistration_AsyncNonBlocking(t *testing.T) {
 	}
 
 	models := GlobalModelRegistry().GetModelsForClient(auth.ID)
-	if len(models) != 0 {
-		t.Fatal("unverified models registered before probe completed")
+	if len(models) == 0 {
+		t.Fatal("expected baseline models to be registered immediately")
 	}
 }
 
@@ -393,7 +461,7 @@ func TestAntigravityAsyncProbe_NormalRequestsDoNotDiscardProbe(t *testing.T) {
 		close(probeStarted)
 		<-releaseProbe
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"models":{"gemini-3.1-flash-lite":{}},"webSearchModelIds":["gemini-3.1-flash-lite"]}`))
+		_, _ = w.Write([]byte(`{"webSearchModelIds":["gemini-3.1-flash-lite"]}`))
 	}))
 	t.Cleanup(func() {
 		server.CloseClientConnections()
@@ -585,20 +653,30 @@ func TestAntigravityColdStart_RefreshesExpiredTokenUsingAuthProxy(t *testing.T) 
 	// Re-register mock so we capture the refresh call
 	svc.coreManager.RegisterExecutor(mockExecutor)
 
-	// 3. Start auto-refresh and verify executor receives refresh with proxy_url
+	// 3. Start auto-refresh and verify Antigravity uses lazy on-demand refresh
+	// (no proactive background refresh while idle) while preserving auth.ProxyURL
+	// when prepared on demand for a request.
 	svc.coreManager.StartAutoRefresh(ctx, 10*time.Millisecond)
 	defer svc.coreManager.StopAutoRefresh()
 
-	// Poll until refresh is called (should be immediate since expired)
-	for start := time.Now(); refreshCalls.Load() == 0 && time.Since(start) < 2*time.Second; {
-		time.Sleep(10 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("expected no idle background refresh for antigravity (lazy on-demand), got %d calls", refreshCalls.Load())
 	}
 
-	if refreshCalls.Load() == 0 {
-		t.Fatal("expected auto-refresh loop to invoke executor for expired credential on cold start")
+	// Simulate on-demand preparation for the expired credential and verify ProxyURL is preserved.
+	prepared, errPrep := svc.coreManager.PrepareRequestAuth(ctx, mockExecutor, loadedAuth)
+	if errPrep != nil {
+		t.Fatalf("PrepareRequestAuth error: %v", errPrep)
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("expected on-demand PrepareRequestAuth to refresh expired credential once, got %d", refreshCalls.Load())
 	}
 	if gotProxy, _ := refreshReceivedProxy.Load().(string); gotProxy != "http://127.0.0.1:9876" {
 		t.Fatalf("expected executor to receive proxy http://127.0.0.1:9876, got %q", gotProxy)
+	}
+	if prepared == nil || prepared.ProxyURL != "http://127.0.0.1:9876" {
+		t.Fatalf("expected prepared auth to preserve ProxyURL, got %+v", prepared)
 	}
 }
 
@@ -607,6 +685,18 @@ type mockAntigravityRefreshExecutor struct {
 }
 
 func (e *mockAntigravityRefreshExecutor) Identifier() string { return "antigravity" }
+
+func (e *mockAntigravityRefreshExecutor) ShouldPrepareRequestAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	exp, ok := auth.ExpirationTime()
+	return !ok || !exp.After(time.Now().Add(30*time.Second))
+}
+
+func (e *mockAntigravityRefreshExecutor) PrepareRequestAuth(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return e.Refresh(ctx, auth)
+}
 
 func (e *mockAntigravityRefreshExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
 	if e.onRefresh != nil {

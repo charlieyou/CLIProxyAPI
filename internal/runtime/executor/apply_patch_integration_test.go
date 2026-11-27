@@ -159,7 +159,7 @@ func assertTask6ZeroOutputStream(t *testing.T, chunks <-chan cliproxyexecutor.St
 }
 
 func TestApplyPatchActualProviderErrorAndEOF(t *testing.T) {
-	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "antigravity", "kimi-chat"} {
+	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "kimi-chat"} {
 		for _, mode := range []string{"nonstream", "stream", "eof", "empty", "scanner"} {
 			t.Run(provider+"/"+mode, func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +464,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"function_call"
 }
 
 func TestApplyPatchHTTPGatewayErrorMatrix(t *testing.T) {
-	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "antigravity", "devin", "xai", "meta", "kimi"} {
+	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "devin", "xai", "meta", "kimi"} {
 		for _, mode := range []string{"nonstream", "stream", "eof"} {
 			t.Run(provider+"/"+mode, func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

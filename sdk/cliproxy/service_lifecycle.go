@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
@@ -39,9 +40,6 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	ctx, runCancel := context.WithCancel(ctx)
-	s.cfgMu.Lock()
-	s.antigravityContext = ctx
-	s.cfgMu.Unlock()
 	s.homeMu.Lock()
 	s.runCancel = runCancel
 	s.homeMu.Unlock()
@@ -81,6 +79,7 @@ func (s *Service) Run(ctx context.Context) error {
 			return errEnsureAuthDir
 		}
 		s.applyKVStoreConfig(cfg)
+		helps.ConfigureAntigravitySessionStore(cfg.AuthDir)
 	}
 
 	s.applyRetryConfig(cfg)
@@ -235,9 +234,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
-	if !homeEnabled {
-		go s.runAntigravityModelRefresh(ctx)
-	}
+	go s.refreshAntigravityModelsPeriodically(ctx)
 
 	select {
 	case <-ctx.Done():
@@ -283,6 +280,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	var shutdownErr error
 	s.shutdownOnce.Do(func() {
 		s.shutdownCleanupStarted.Store(true)
+		helps.FlushAntigravitySessionStore()
 
 		s.homeMu.Lock()
 		runCancel := s.runCancel
@@ -465,13 +463,6 @@ func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 		proxyURL = cfg.ProxyURL
 	}
 	executor.StartXAIVersionUpdater(ctx, proxyURL)
-	sdkAuth.StartAntigravityVersionUpdaterWithProxyProvider(ctx, s.antigravityVersionProxyURL)
-}
-
-func (s *Service) antigravityVersionProxyURL() string {
-	cfg := s.currentConfig()
-	if cfg == nil {
-		return ""
-	}
-	return cfg.ProxyURL
+	misc.SetAntigravityVersionProxyURL(proxyURL)
+	misc.StartAntigravityVersionUpdater(ctx)
 }

@@ -15,11 +15,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,6 +172,9 @@ func main() {
 	// Fetch models from the upstream Antigravity API using available auths.
 	var models []modelEntry
 	for _, chosen := range agAuths {
+		if strings.TrimSpace(chosen.ProxyURL) == "" && strings.TrimSpace(cfg.ProxyURL) != "" {
+			chosen.ProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 		fmt.Printf("Using auth: id=%s label=%s\n", chosen.ID, chosen.Label)
 		fmt.Println("Fetching Antigravity model list from upstream...")
 
@@ -213,55 +218,91 @@ func main() {
 }
 
 func defaultAntigravityFetchBaseURLs() []string {
-	return []string{antigravityBaseURLDaily, antigravityBaseURLProd, antigravitySandboxBaseURLDaily}
+	return []string{antigravityBaseURLDaily}
+}
+
+func newAntigravityFetchHTTP11Transport(proxyURL string) *http.Transport {
+	var base *http.Transport
+	if proxyURL != "" {
+		if transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyURL); errProxy == nil && transport != nil {
+			base = transport
+		}
+	}
+	return misc.ConfigureAntigravityHTTP11Transport(base, proxyURL)
 }
 
 func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 	return fetchModelsFromBaseURLs(ctx, auth, defaultAntigravityFetchBaseURLs(), nil)
 }
 
+func isGoogleCloudCodeFetchURL(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "daily-cloudcode-pa.googleapis.com" ||
+		host == "cloudcode-pa.googleapis.com" ||
+		strings.HasSuffix(host, ".googleapis.com")
+}
+
 func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs []string, client *http.Client) []modelEntry {
 	var accessToken string
 	if auth != nil {
-		accessToken = metaStringValue(auth.Metadata, "access_token")
+		accessToken = strings.TrimSpace(metaStringValue(auth.Metadata, "access_token"))
 	}
 	if accessToken == "" {
 		fmt.Fprintln(os.Stderr, "error: no access token found in auth")
 		return nil
 	}
+	if auth != nil {
+		if exp, ok := auth.ExpirationTime(); ok && !exp.IsZero() && !exp.After(time.Now().Add(30*time.Second)) {
+			fmt.Fprintln(os.Stderr, "error: antigravity access token is expired; refresh before fetching models")
+			return nil
+		}
+	}
+
+	projectID := ""
+	if auth != nil && auth.Metadata != nil {
+		if pid, ok := auth.Metadata["project_id"].(string); ok {
+			projectID = strings.TrimSpace(pid)
+		}
+	}
+
+	httpClient := client
+	if httpClient == nil {
+		proxyURL := ""
+		if auth != nil {
+			proxyURL = strings.TrimSpace(auth.ProxyURL)
+		}
+		transport := newAntigravityFetchHTTP11Transport(proxyURL)
+		defer transport.CloseIdleConnections()
+		httpClient = &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	}
 
 	for _, baseURL := range baseURLs {
+		if projectID == "" && isGoogleCloudCodeFetchURL(baseURL) {
+			fmt.Fprintln(os.Stderr, "error: antigravity auth missing project_id")
+			continue
+		}
 		modelsURL := baseURL + antigravityModelsPath
 
-		var payload []byte
-		if auth != nil && auth.Metadata != nil {
-			if pid, ok := auth.Metadata["project_id"].(string); ok && strings.TrimSpace(pid) != "" {
-				payload = []byte(fmt.Sprintf(`{"project": "%s"}`, strings.TrimSpace(pid)))
+		payload := []byte(`{}`)
+		if projectID != "" {
+			if encoded, errMarshal := json.Marshal(map[string]string{"project": projectID}); errMarshal == nil {
+				payload = encoded
 			}
-		}
-		if len(payload) == 0 {
-			payload = []byte(`{}`)
 		}
 
 		for attempt := 1; attempt <= maxFetchAttemptsPerEndpoint; attempt++ {
-			httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, modelsURL, strings.NewReader(string(payload)))
+			httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, modelsURL, bytes.NewReader(payload))
 			if errReq != nil {
 				continue
 			}
-			httpReq.Close = true
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set("Authorization", "Bearer "+accessToken)
 			httpReq.Header.Set("User-Agent", misc.AntigravityUserAgent())
 
-			httpClient := client
-			if httpClient == nil {
-				httpClient = &http.Client{Timeout: 30 * time.Second}
-				if auth != nil {
-					if transport, _, errProxy := proxyutil.BuildHTTPTransport(auth.ProxyURL); errProxy == nil && transport != nil {
-						httpClient.Transport = transport
-					}
-				}
-			}
 			httpResp, errDo := httpClient.Do(httpReq)
 			if errDo != nil {
 				continue
@@ -275,11 +316,14 @@ func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs 
 				continue
 			}
 
+			if httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {
+				break
+			}
 			if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 				continue
 			}
 
-			result := ojson.GetBytesNoCopy(bodyBytes, "models")
+			result := ojson.GetBytes(bodyBytes, "models")
 			if !result.Exists() {
 				continue
 			}
@@ -287,7 +331,7 @@ func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs 
 			var models []modelEntry
 
 			for originalName, modelData := range result.Map() {
-				modelID := strings.Clone(strings.TrimSpace(originalName))
+				modelID := strings.TrimSpace(originalName)
 				if modelID == "" {
 					continue
 				}
@@ -297,7 +341,7 @@ func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs 
 					continue
 				}
 
-				displayName := strings.Clone(modelData.Get("displayName").String())
+				displayName := modelData.Get("displayName").String()
 				if displayName == "" {
 					displayName = modelID
 				}

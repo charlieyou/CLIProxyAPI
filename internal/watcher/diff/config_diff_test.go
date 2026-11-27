@@ -415,6 +415,8 @@ func TestBuildConfigChangeDetails_RedactsEndpointURLs(t *testing.T) {
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	oldPoolEnabled := false
 	newPoolEnabled := true
+	oldStopOnBare429 := false
+	newStopOnBare429 := true
 	oldCfg := &config.Config{
 		Port:                          1000,
 		AuthDir:                       "/old",
@@ -432,6 +434,9 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		Antigravity: config.AntigravityConfig{
 			SensitiveWords:              []string{"old-word"},
 			ToolDescriptionReplacements: map[string]string{"OldTool": "NewTool"},
+			StopOnBare429:               &oldStopOnBare429,
+			MaxConcurrentRequests:       1,
+			MaxRPM:                      10,
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled:         &oldPoolEnabled,
 				IdleConnTimeout: "30s",
@@ -465,9 +470,9 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		Antigravity: config.AntigravityConfig{
 			SensitiveWords:              []string{"new-word-1", "new-word-2"},
 			ToolDescriptionReplacements: map[string]string{"T1": "R1", "T2": "R2"},
-			StopOnBare429:               true,
-			MaxConcurrentRequests:       2,
-			MaxRPM:                      30,
+			StopOnBare429:               &newStopOnBare429,
+			MaxConcurrentRequests:       4,
+			MaxRPM:                      60,
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled:         &newPoolEnabled,
 				IdleConnTimeout: "10s",
@@ -525,8 +530,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
 	expectContains(t, details, "antigravity.tool-description-replacements: 1 -> 2")
 	expectContains(t, details, "antigravity.stop-on-bare-429: false -> true")
-	expectContains(t, details, "antigravity.max-concurrent-requests: 0 -> 2")
-	expectContains(t, details, "antigravity.max-rpm: 0 -> 30")
+	expectContains(t, details, "antigravity.max-concurrent-requests: 1 -> 4")
+	expectContains(t, details, "antigravity.max-rpm: 10 -> 60")
 	expectContains(t, details, "antigravity.connection-pool.enabled: false -> true")
 	expectContains(t, details, `antigravity.connection-pool.idle-conn-timeout: "30s" -> "10s"`)
 	expectContains(t, details, "xai.inject-x-search: false -> true")

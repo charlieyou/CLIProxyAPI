@@ -55,68 +55,45 @@ func HashAntigravitySessionID(input []byte) string {
 }
 
 // DerivedAntigravitySessionID maps a derived session identity to Antigravity's
-// signed 64-bit decimal sessionId format.
+// signed 64-bit FNV-1a decimal format (matching agy's ccpa.HashSessionID).
 func DerivedAntigravitySessionID(metadataSets ...map[string]any) string {
 	derivedID := DerivedSessionID(metadataSets...)
 	if derivedID == "" {
 		return ""
 	}
-	// Place the variable identity before the fixed domain suffix so trailing-byte
-	// variations (e.g. sequential session or subagent IDs) still avalanche into the sign bit of FNV-1a.
-	return HashAntigravitySessionID([]byte(derivedID + "\x00cli-proxy-api:antigravity:derived-session"))
+	return AntigravityHashSessionID("cli-proxy-api:antigravity:derived-session\x00" + derivedID)
 }
 
-// AntigravitySessionIDForAuth deterministically maps the request's canonical
-// (or execution/derived) session identity scoped to a specific credential into
-// Antigravity's signed 64-bit decimal sessionId format.
-func AntigravitySessionIDForAuth(authID string, metadataSets ...map[string]any) string {
-	kind, identityValue := antigravitySessionIdentity(metadataSets...)
-	return formatAntigravitySessionIDForAuth(kind, authID, identityValue)
-}
-
-// ScopeAntigravitySessionIDForAuth deterministically scopes an explicit
-// incoming request.sessionId to a specific credential in Antigravity's signed
-// 64-bit decimal sessionId format. When authID is empty, the trimmed incoming
-// sessionId is returned unchanged.
-func ScopeAntigravitySessionIDForAuth(authID, sessionID string) string {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return ""
-	}
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return sessionID
-	}
-	return formatAntigravitySessionIDForAuth("explicit-session", authID, sessionID)
-}
-
-func formatAntigravitySessionIDForAuth(kind, authID, identityValue string) string {
-	identityValue = strings.TrimSpace(identityValue)
-	if identityValue == "" {
-		return ""
-	}
-	authID = strings.TrimSpace(authID)
-	// Place variable identity and authID before the fixed domain suffix so
-	// sequential trailing bytes avalanche cleanly into the high sign bit of FNV-1a.
-	input := strings.Join([]string{identityValue, authID, kind, "antigravity", "cli-proxy-api"}, "\x00")
-	return HashAntigravitySessionID([]byte(input))
-}
-
-func antigravitySessionIdentity(metadataSets ...map[string]any) (string, string) {
-	for _, metadata := range metadataSets {
-		if canonicalID := metadataString(metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey); canonicalID != "" {
-			return "canonical-session", canonicalID
+// ExplicitAntigravitySessionID returns an explicit client-supplied conversation
+// identity (from CanonicalSessionIDMetadataKey or ExecutionSessionMetadataKey),
+// ignoring prompt-derived (lcp:/ctx:/derived:), per-request (clientreq:), and
+// per-user (user:) identities so unrelated conversations and turns do not collide
+// or bust prompt caches.
+func ExplicitAntigravitySessionID(metadataSets ...map[string]any) string {
+	for _, key := range []string{
+		cliproxyexecutor.CanonicalSessionIDMetadataKey,
+		cliproxyexecutor.ExecutionSessionMetadataKey,
+	} {
+		for _, metadata := range metadataSets {
+			if metadata == nil {
+				continue
+			}
+			raw := metadataString(metadata, key)
+			if raw == "" {
+				continue
+			}
+			lower := strings.ToLower(raw)
+			if strings.HasPrefix(lower, "lcp:") ||
+				strings.HasPrefix(lower, "ctx:") ||
+				strings.HasPrefix(lower, "derived:") ||
+				strings.HasPrefix(lower, "clientreq:") ||
+				strings.HasPrefix(lower, "user:") {
+				continue
+			}
+			return AntigravityHashSessionID("cli-proxy-api:antigravity:explicit-session\x00" + raw)
 		}
 	}
-	for _, metadata := range metadataSets {
-		if executionID := metadataString(metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionID != "" {
-			return "execution-session", executionID
-		}
-	}
-	if derivedID := DerivedSessionID(metadataSets...); derivedID != "" {
-		return "derived-session", derivedID
-	}
-	return "", ""
+	return ""
 }
 
 func metadataString(metadata map[string]any, key string) string {

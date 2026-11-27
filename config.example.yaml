@@ -1322,30 +1322,21 @@ oauth:
 
     # Antigravity provider behavior.
     antigravity:
-      # sensitive-words:              # optional: words to obfuscate with combining grapheme joiners (U+034F) in system instructions
+      # sensitive-words:              # optional: words to obfuscate with zero-width characters (U+200B) in system instructions
       #   - "API"
       #   - "proxy"
-      # sensitive-words-replace:      # optional: literal sensitive-word replacements ("target": "replacement") in system instructions
-      #   "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
-      # sensitive-patterns-replace:   # optional: ordered Go RE2 regex replacements in system instructions (deleting flagged text with "" is recommended over obfuscation for Antigravity)
-      #   - pattern: '(?m)^RFC 2119[^\n]*\n?'
-      #     replacement: ""
-      #   - pattern: '(?s)<system[-_](conventions|directive)>.*?</system[-_](conventions|directive)>\n?'
-      #     replacement: ""
       # tool-description-replacements: # optional: deterministic plain-ASCII replacements in tool and schema description strings only (preserves tool/property names)
       #   "an Amp thread": "a session thread"
-      # stop-on-bare-429: false       # optional: on a bare 429 (no ErrorInfo reason, RetryInfo, or Retry-After) return it to the client
-                                    # without cooling the credential or rotating to other credentials (default: false = cool down and rotate)
-      # max-concurrent-requests: 0    # optional: per-credential cap on concurrent in-flight Antigravity requests; extra requests wait (<= 0 disables, default)
-      # max-rpm: 0                    # optional: per-credential sliding 60s window cap on Antigravity requests; extra requests wait (<= 0 disables, default)
+      # stop-on-bare-429: true        # optional: stop retrying/rotating on bare/signal-less 429 responses without cooling the credential (default: true when omitted)
+      # max-concurrent-requests: 0    # optional: per-credential maximum concurrent in-flight Antigravity requests (<= 0 disables the cap)
+      # max-rpm: 0                    # optional: per-credential sliding-window maximum Antigravity requests per minute (<= 0 disables the cap)
       # connection-pool:              # optional: upstream HTTP connection pool settings
-      #   enabled: false             # whether to enable connection pooling (default: false)
-      #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)
-      #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2; <= 0 disables idle pooling)
-      # tos-pause-window: "0"         # optional: pool-wide protective pause after the first 403 TOS_VIOLATION
-                                    # (default "0" = disabled; set a positive duration such as "6h" to enable pool-wide pause)
-      # Use credits as a last resort after free-tier Claude quota is exhausted.
-      antigravity-credits: true
+      #   enabled: true               # whether to enable connection pooling (default: true; set to false to close connections after each request)
+      #   idle-conn-timeout: "90s"    # idle keep-alive timeout (default: 90s, capped at 210s)
+      #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2)
+      # sensitive-words-replace, sensitive-patterns-replace and tos-pause-window are not applied to Antigravity.
+      # Whether to use credits as last-resort fallback when all free-tier auths are exhausted for Claude models (disabled by default for agy wire parity).
+      antigravity-credits: false
 
       # Signature cache validation for thinking blocks (Antigravity/Claude).
       # When true (default), cached signatures are preferred and validated.

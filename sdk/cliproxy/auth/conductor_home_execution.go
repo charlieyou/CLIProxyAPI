@@ -300,7 +300,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			applyRequestScopedActionToResult(action, okAction, &result)
 			m.reportHomeResult(execCtx, result, auth)
 			releaseAttempt()
-			errPrepare = annotateTrustedRetryAfterByHint(errPrepare)
+			errPrepare = annotateTrustedRetryAfterForProvider(selection.Provider, errPrepare)
 			if okAction && !isRequestStopError(errPrepare) && !isRequestScopedStop(action, okAction) {
 				errPrepare = wrapRequestScopedContinueError(errPrepare)
 			}
@@ -459,7 +459,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			m.reportHomeResult(execCtx, result, preparedAuth)
 			roundTiming.Observe(errExecute)
 			if isRequestStopError(errExecute) {
-				errExecute = annotateTrustedRetryAfterByHint(errExecute)
+				errExecute = annotateTrustedRetryAfterForProvider(selection.Provider, errExecute)
 				syncPreferredUpstreamError(&upstreamErr, errExecute)
 				lastErr = errExecute
 				releaseAttempt()
@@ -468,7 +468,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			}
 			if okAction {
 				if isRequestScopedStop(action, okAction) {
-					errExecute = annotateTrustedRetryAfterByHint(errExecute)
+					errExecute = annotateTrustedRetryAfterForProvider(selection.Provider, errExecute)
 					syncPreferredUpstreamError(&upstreamErr, errExecute)
 					lastErr = errExecute
 					releaseAttempt()

@@ -127,9 +127,10 @@ func TestAntigravityExecuteStreamReusesUpstreamConnection(t *testing.T) {
 	}
 }
 
-// TestAntigravityCountTokensReusesUpstreamConnection covers the second upstream
-// request builder, which shares the same connection pool.
-func TestAntigravityCountTokensReusesUpstreamConnection(t *testing.T) {
+// TestAntigravityExecuteReusesUpstreamConnection covers the non-streaming
+// Execute path (which streams SSE from streamGenerateContent), verifying it
+// shares the same HTTP/1.1 connection pool without Connection: close.
+func TestAntigravityExecuteReusesUpstreamConnection(t *testing.T) {
 	var mu sync.Mutex
 	remotes := map[string]int{}
 	var connectionHeaders []string
@@ -138,22 +139,22 @@ func TestAntigravityCountTokensReusesUpstreamConnection(t *testing.T) {
 		remotes[r.RemoteAddr]++
 		connectionHeaders = append(connectionHeaders, r.Header.Get("Connection"))
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"totalTokens":7}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}}\n\n"))
 	}))
 	defer server.Close()
 
-	enabledCountPool := true
+	enabledPool := true
 	exec := NewAntigravityExecutor(&config.Config{
 		RequestRetry: 1,
 		Antigravity: config.AntigravityConfig{
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
-				Enabled: &enabledCountPool,
+				Enabled: &enabledPool,
 			},
 		},
 	})
 	auth := &cliproxyauth.Auth{
-		ID:         "antigravity-counttokens-auth",
+		ID:         "antigravity-execute-keepalive-auth",
 		Provider:   "antigravity",
 		Attributes: map[string]string{"base_url": server.URL},
 		Metadata: map[string]any{
@@ -166,19 +167,15 @@ func TestAntigravityCountTokensReusesUpstreamConnection(t *testing.T) {
 	const requests = 4
 	payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
 	for i := 0; i < requests; i++ {
-		ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
-		if _, errCount := exec.CountTokens(ctx, auth, cliproxyexecutor.Request{
+		if _, errExec := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "gemini-3.6-flash-high",
 			Payload: payload,
 		}, cliproxyexecutor.Options{
 			SourceFormat:    sdktranslator.FormatGemini,
 			ResponseFormat:  sdktranslator.FormatGemini,
 			OriginalRequest: payload,
-		}); errCount != nil {
-			t.Fatalf("request %d: CountTokens() error = %v", i, errCount)
-		}
-		if !cliproxyexecutor.UpstreamAttempted(ctx) {
-			t.Fatalf("request %d: CountTokens() did not mark the upstream attempt", i)
+		}); errExec != nil {
+			t.Fatalf("request %d: Execute() error = %v", i, errExec)
 		}
 	}
 
@@ -188,11 +185,11 @@ func TestAntigravityCountTokensReusesUpstreamConnection(t *testing.T) {
 	mu.Unlock()
 	for i, h := range headers {
 		if h != "" {
-			t.Fatalf("countTokens request %d advertised Connection: %q", i, h)
+			t.Fatalf("execute request %d advertised Connection: %q", i, h)
 		}
 	}
 	if distinct != 1 {
-		t.Fatalf("expected %d countTokens requests to reuse one upstream connection, got %d connections", requests, distinct)
+		t.Fatalf("expected %d execute requests to reuse one upstream connection, got %d connections", requests, distinct)
 	}
 }
 
@@ -366,9 +363,9 @@ func TestAntigravityHTTPRequestConcurrentSessionsStayIsolated(t *testing.T) {
 	}
 }
 
-// TestAntigravityDefaultConfigDisablesPoolingAndClosesConnections verifies that by default
-// (no connection-pool configuration, or enabled: false), connection pooling is disabled.
-// Every request uses a new connection, and the wire request never emits Connection: close.
+// TestAntigravityExplicitDisabledPoolClosesConnections verifies that when
+// connection-pool.enabled is explicitly false, pooling is disabled: every
+// request uses a new connection without emitting Connection: close.
 func TestAntigravityDefaultConfigDisablesPoolingAndClosesConnections(t *testing.T) {
 	var mu sync.Mutex
 	remotes := map[string]int{}
@@ -383,8 +380,15 @@ func TestAntigravityDefaultConfigDisablesPoolingAndClosesConnections(t *testing.
 	}))
 	defer server.Close()
 
-	// Default config has ConnectionPool.Enabled = nil, which defaults to false (disabled)
-	exec := NewAntigravityExecutor(&config.Config{})
+	// Default config enables pooling like agy; explicit enabled: false disables it.
+	disabled := false
+	exec := NewAntigravityExecutor(&config.Config{
+		Antigravity: config.AntigravityConfig{
+			ConnectionPool: config.AntigravityConnectionPoolConfig{
+				Enabled: &disabled,
+			},
+		},
+	})
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-default-short-auth",
 		Provider: "antigravity",
@@ -413,9 +417,9 @@ func TestAntigravityDefaultConfigDisablesPoolingAndClosesConnections(t *testing.
 	headers := append([]string(nil), connectionHeaders...)
 	mu.Unlock()
 
-	// With pooling disabled by default, every request opens a fresh connection
+	// With pooling explicitly disabled, every request opens a fresh connection
 	if distinct != requests {
-		t.Fatalf("default disabled pool: expected %d distinct connections, got %d", requests, distinct)
+		t.Fatalf("disabled pool: expected %d distinct connections, got %d", requests, distinct)
 	}
 
 	// Must never leak Connection: close header to upstream

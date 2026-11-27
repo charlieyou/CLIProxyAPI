@@ -1,10 +1,12 @@
 package management
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +122,10 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 				quotaResp, handledProbe, errProbe := h.executeQuotaProbe(c, auth, probeMap)
 				if handledProbe {
 					if errProbe != nil {
+						if errors.Is(errProbe, errAntigravityDeprecatedRetrieveUserQuota) {
+							c.JSON(http.StatusGone, gin.H{"error": errProbe.Error()})
+							return
+						}
 						c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("quota probe failed: %v", errProbe)})
 						return
 					}
@@ -410,6 +416,20 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 		}
 	}
 
+	if parsedProbeURL, errParse := url.Parse(urlStr); errParse == nil {
+		probeUA := ""
+		for k, v := range headers {
+			if strings.EqualFold(k, "user-agent") {
+				if strVal, okVal := v.(string); okVal {
+					probeUA = strVal
+				}
+			}
+		}
+		if isDeprecatedAntigravityRetrieveUserQuotaRequest(parsedProbeURL, auth, probeUA) {
+			return pluginapi.QuotaFetchResponse{}, true, errAntigravityDeprecatedRetrieveUserQuota
+		}
+	}
+
 	var token string
 	if needsToken {
 		var errToken error
@@ -422,6 +442,11 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 		}
 		urlStr = strings.ReplaceAll(urlStr, "$TOKEN$", token)
 		rawData = strings.ReplaceAll(rawData, "$TOKEN$", token)
+		if auth != nil && auth.ID != "" && h.authManager != nil {
+			if latest, okLatest := h.authManager.GetByID(auth.ID); okLatest && latest != nil {
+				auth = latest
+			}
+		}
 	}
 
 	var reqBody io.Reader
@@ -443,8 +468,15 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 		}
 	}
 
-	client := &http.Client{
-		Transport: h.apiCallTransport(auth, ""),
+	client := &http.Client{}
+	agTransport, errNormalize := h.applyAntigravityManagementNormalization(req, auth, "")
+	if errNormalize != nil {
+		return pluginapi.QuotaFetchResponse{}, true, errNormalize
+	}
+	if agTransport != nil {
+		client.Transport = agTransport
+	} else {
+		client.Transport = h.apiCallTransport(auth, "")
 	}
 
 	resp, errDo := client.Do(req)

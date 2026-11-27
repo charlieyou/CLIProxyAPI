@@ -6,237 +6,192 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
+	"github.com/MoeForge/moego/json"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v3"
 )
 
 const (
-	// antigravityFallbackVersion is the client version reported when the hub
-	// manifest has not been fetched yet or cannot be reached. Cloud Code rejects
-	// newer models for clients below 2.23.0, so this floor must stay at or above
-	// that version.
-	antigravityFallbackVersion = "2.35.2"
-	antigravityHubPlatform     = "os_type=darwin; arch=arm64"
+	// antigravityFallbackVersion is the Antigravity CLI version reported when
+	// the updater manifest has not been fetched yet or cannot be reached.
+	antigravityFallbackVersion = "1.5.16"
+	// antigravityBuildCL is the changelist reported by agy 1.5.16 in its
+	// aidev_client User-Agent comment. It is only attached when reporting
+	// antigravityFallbackVersion so newer manifest versions never pair with a
+	// stale changelist.
+	antigravityBuildCL         = "1028571191"
 	antigravityVersionCacheTTL = 6 * time.Hour
 	antigravityFetchTimeout    = 10 * time.Second
-	AntigravityNodeAPIClientUA = "google-api-nodejs-client/10.3.0"
-	AntigravityGoogAPIClientUA = "gl-node/22.21.1"
 )
 
 var (
-	antigravityHubLatestManifestURL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
+	antigravityCLILatestManifestURL = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/" + antigravityManifestPlatform(runtime.GOOS, runtime.GOARCH) + ".json"
 )
 
-// Changelists belong to specific Hub releases, not to the latest manifest in
-// general. Update the fallback release and its entry together. Newer entries
-// are verified from official language_server --stamp build metadata. Unmapped
-// releases fall back to the highest mapped (version, cl) pair so User-Agent
-// never omits cl= or pairs a newer version with an older build's CL.
-var antigravityHubChangelists = map[string]string{
-	"2.23.0": "998057262",
-	"2.24.0": "1000335682",
-	"2.29.0": "1013060670",
-	"2.32.1": "1021296516",
-	"2.32.2": "1022991777",
-	"2.33.0": "1023160026",
-	"2.34.0": "1026637980",
-	"2.35.0": "1028447422",
-	"2.35.1": "1029194470",
-	"2.35.2": "1029311855",
-}
-
-type antigravityHubUpdaterManifest struct {
-	Version string `yaml:"version"`
+type antigravityCLIUpdaterManifest struct {
+	Version string `json:"version"`
 }
 
 var (
-	cachedAntigravityVersion        = antigravityFallbackVersion
-	antigravityVersionProxyURL      string
-	antigravityVersionProxyProvider func() string
-	antigravityVersionMu            sync.RWMutex
-	antigravityVersionExpiry        time.Time
-	antigravityUpdaterCtx           context.Context
-	antigravityUpdaterCancel        context.CancelFunc
-	antigravityVersionRefreshed     chan struct{}
-	antigravityVersionTrigger       <-chan struct{}
+	cachedAntigravityVersion = antigravityFallbackVersion
+	antigravityVersionProxy  string
+	antigravityVersionMu     sync.RWMutex
+	antigravityVersionExpiry time.Time
+	antigravityUpdaterOnce   sync.Once
 )
 
-// StartAntigravityVersionUpdater starts a background goroutine that periodically refreshes the cached antigravity version
-// using the inherited process environment proxy settings. If an updater is already active, this call is a no-op so it
-// preserves the active updater and its proxy configuration.
-// This is intentionally decoupled from request execution to avoid blocking executors on version lookups.
-func StartAntigravityVersionUpdater(ctx context.Context) {
-	startAntigravityVersionUpdater(ctx, "", nil, false)
+// AntigravityProtoJSONCommaSep returns the compact protojson element separator
+// emitted by the pinned agy release based on protobuf/v2 detrand.init.0 parity
+// of antigravityBuildCL (odd CL -> ", ", even CL -> ",").
+func AntigravityProtoJSONCommaSep() string {
+	return AntigravityProtoJSONCommaSepForCL(antigravityBuildCL)
 }
 
-// StartAntigravityVersionUpdaterWithProxy starts a background goroutine that periodically refreshes the cached
-// antigravity version using proxyURL (empty inherits process environment proxies, "direct"/"none" bypasses them).
-// A later call cancels any previous updater goroutine and binds the new context and proxy URL.
-func StartAntigravityVersionUpdaterWithProxy(ctx context.Context, proxyURL string) {
-	startAntigravityVersionUpdater(ctx, proxyURL, nil, true)
+// AntigravityProtoJSONCommaSepForCL computes protobuf/v2 detrand's compact
+// protojson comma separator for the given build changelist string.
+func AntigravityProtoJSONCommaSepForCL(buildCL string) string {
+	n, err := strconv.ParseInt(strings.TrimSpace(buildCL), 10, 64)
+	if err != nil || n&1 == 1 {
+		return ", "
+	}
+	return ","
 }
 
-// StartAntigravityVersionUpdaterWithProxyProvider starts a background goroutine that periodically refreshes the cached
-// antigravity version, resolving the current proxy setting dynamically on each fetch via proxyProvider.
-// A later call cancels any previous updater goroutine and binds the new context and proxy provider.
-func StartAntigravityVersionUpdaterWithProxyProvider(ctx context.Context, proxyProvider func() string) {
-	startAntigravityVersionUpdater(ctx, "", proxyProvider, true)
+// SetAntigravityVersionProxyURL configures the proxy URL used by the
+// Antigravity CLI auto-updater manifest fetcher.
+func SetAntigravityVersionProxyURL(proxyURL string) {
+	antigravityVersionMu.Lock()
+	antigravityVersionProxy = strings.TrimSpace(proxyURL)
+	antigravityVersionMu.Unlock()
 }
 
-func startAntigravityVersionUpdater(ctx context.Context, proxyURL string, proxyProvider func() string, replaceActive bool) {
+func antigravityVersionProxyURL() string {
+	antigravityVersionMu.RLock()
+	defer antigravityVersionMu.RUnlock()
+	return antigravityVersionProxy
+}
+
+func antigravityManifestPlatform(goos, goarch string) string {
+	switch goos {
+	case "darwin":
+		if goarch == "amd64" {
+			return "darwin_amd64"
+		}
+		return "darwin_arm64"
+	case "windows":
+		return "windows_amd64"
+	default:
+		if goarch == "arm64" {
+			return "linux_arm64"
+		}
+		return "linux_amd64"
+	}
+}
+
+func antigravityPlatformOSArch() (string, string) {
+	osType := runtime.GOOS
+	if osType == "" {
+		osType = "linux"
+	}
+	arch := runtime.GOARCH
+	if arch == "" {
+		arch = "amd64"
+	}
+	return osType, arch
+}
+
+// StartAntigravityVersionUpdater logs the pinned Antigravity CLI version and
+// build changelist. Auto-bumping from the updater manifest is intentionally
+// disabled so the User-Agent never drops cl= or shifts versions mid-trajectory
+// when a newer agy release ships.
+func StartAntigravityVersionUpdater(_ context.Context) {
+	antigravityUpdaterOnce.Do(func() {
+		log.Infof("antigravity CLI version pinned to %s (cl=%s)", antigravityFallbackVersion, antigravityBuildCL)
+	})
+}
+
+func antigravityJitteredDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	// +/- 20% jitter so refresh cadence is not robotic clockwork.
+	span := int64(base / 5)
+	if span <= 0 {
+		return base
+	}
+	offset := rand.Int63n(2*span+1) - span
+	return base + time.Duration(offset)
+}
+
+func runAntigravityVersionUpdater(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	runCtx, cancel := context.WithCancel(ctx)
 
-	antigravityVersionMu.Lock()
-	if !replaceActive && antigravityUpdaterCtx != nil && antigravityUpdaterCtx.Err() == nil {
-		antigravityVersionMu.Unlock()
-		cancel()
-		return
-	}
-	if antigravityUpdaterCancel != nil {
-		antigravityUpdaterCancel()
-	}
-	antigravityUpdaterCtx = runCtx
-	antigravityUpdaterCancel = cancel
-	antigravityVersionProxyURL = strings.TrimSpace(proxyURL)
-	antigravityVersionProxyProvider = proxyProvider
-	trigger := antigravityVersionTrigger
-	antigravityVersionMu.Unlock()
-
-	go runAntigravityVersionUpdater(runCtx, cancel, trigger)
-}
-
-func runAntigravityVersionUpdater(ctx context.Context, cancel context.CancelFunc, trigger <-chan struct{}) {
-	defer cancel()
-
-	ticker := time.NewTicker(antigravityVersionCacheTTL / 2)
-	defer ticker.Stop()
-
-	log.Infof("periodic antigravity version refresh started (interval=%s)", antigravityVersionCacheTTL/2)
+	baseInterval := antigravityVersionCacheTTL / 2
+	log.Infof("periodic antigravity version refresh started (base_interval=%s)", baseInterval)
 
 	refreshAntigravityVersion(ctx)
 
 	for {
+		timer := time.NewTimer(antigravityJitteredDuration(baseInterval))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			refreshAntigravityVersion(ctx)
-		case <-trigger:
+		case <-timer.C:
 			refreshAntigravityVersion(ctx)
 		}
 	}
 }
 
 func refreshAntigravityVersion(ctx context.Context) {
-	if ctx != nil && ctx.Err() != nil {
-		return
-	}
-
 	version, errFetch := fetchAntigravityLatestVersion(ctx)
-	if ctx != nil && ctx.Err() != nil {
-		return
-	}
 
 	antigravityVersionMu.Lock()
-	if ctx != nil && ctx.Err() != nil {
-		antigravityVersionMu.Unlock()
+	defer antigravityVersionMu.Unlock()
+
+	now := time.Now()
+	if errFetch == nil {
+		cachedAntigravityVersion = version
+		antigravityVersionExpiry = now.Add(antigravityVersionCacheTTL)
+		log.WithField("version", version).Info("fetched latest antigravity version")
 		return
 	}
 
-	now := time.Now()
-
-	switch {
-	case errFetch == nil:
-		cachedAntigravityVersion = version
-		antigravityVersionExpiry = now.Add(antigravityVersionCacheTTL)
-		antigravityVersionMu.Unlock()
-		log.WithField("version", version).Info("fetched latest antigravity version")
-	case cachedAntigravityVersion == "" || now.After(antigravityVersionExpiry):
+	if cachedAntigravityVersion == "" || now.After(antigravityVersionExpiry) {
 		cachedAntigravityVersion = antigravityFallbackVersion
 		antigravityVersionExpiry = now.Add(antigravityVersionCacheTTL)
-		antigravityVersionMu.Unlock()
 		log.WithError(errFetch).Warn("failed to refresh antigravity version, using fallback version")
-	default:
-		antigravityVersionMu.Unlock()
-		log.WithError(errFetch).Debug("failed to refresh antigravity version, keeping cached value")
+		return
 	}
 
-	notifyAntigravityVersionRefreshed()
+	log.WithError(errFetch).Debug("failed to refresh antigravity version, keeping cached value")
 }
 
-// AntigravityLatestVersion returns the cached antigravity version refreshed by StartAntigravityVersionUpdater.
-// It falls back to antigravityFallbackVersion if the cache is empty or stale.
+// AntigravityLatestVersion returns the pinned Antigravity CLI version matching
+// antigravityBuildCL so User-Agent never drifts or drops its cl= tag.
 func AntigravityLatestVersion() string {
-	antigravityVersionMu.RLock()
-	if cachedAntigravityVersion != "" && time.Now().Before(antigravityVersionExpiry) {
-		v := cachedAntigravityVersion
-		antigravityVersionMu.RUnlock()
-		return v
-	}
-	antigravityVersionMu.RUnlock()
-
 	return antigravityFallbackVersion
 }
 
-func resolveAntigravityHubVersionAndChangelist(version string) (string, string) {
-	if changelist := antigravityHubChangelists[version]; changelist != "" {
-		return version, changelist
-	}
-
-	var (
-		bestVersion string
-		bestCL      string
-		bestSemver  [3]int
-		hasBest     bool
-	)
-	for candidateVersion, candidateCL := range antigravityHubChangelists {
-		if candidateCL == "" {
-			continue
-		}
-		parsed, ok := parseAntigravitySemVersion(candidateVersion)
-		if !ok {
-			continue
-		}
-		if !hasBest || compareAntigravitySemVersion(parsed, bestSemver) > 0 {
-			bestVersion = candidateVersion
-			bestCL = candidateCL
-			bestSemver = parsed
-			hasBest = true
-		}
-	}
-	if hasBest {
-		return bestVersion, bestCL
-	}
-	return antigravityFallbackVersion, antigravityHubChangelists[antigravityFallbackVersion]
-}
-
-func antigravityEffectiveVersion() string {
-	version, _ := resolveAntigravityHubVersionAndChangelist(AntigravityLatestVersion())
-	return version
-}
-
-// AntigravityUserAgent returns the User-Agent string used by the Antigravity Hub family.
+// AntigravityUserAgent returns the User-Agent string sent by the official
+// Antigravity CLI (agy) when telemetry data collection is opted out.
 func AntigravityUserAgent() string {
-	version, changelist := resolveAntigravityHubVersionAndChangelist(AntigravityLatestVersion())
-	metadata := "aidev_client; " + antigravityHubPlatform
-	if changelist != "" {
-		metadata += "; cl=" + changelist
-	}
-	return fmt.Sprintf("antigravity/hub/%s (%s)", version, metadata)
+	osType, arch := antigravityPlatformOSArch()
+	return fmt.Sprintf("antigravity/cli/%s (aidev_client; os_type=%s; arch=%s; cl=%s; auth_method=consumer; datacollection_opt_in=false)",
+		antigravityFallbackVersion, osType, arch, antigravityBuildCL)
 }
 
 func isAntigravityFamilyUserAgent(lower string) bool {
-	return strings.HasPrefix(lower, "antigravity/hub/") || strings.HasPrefix(lower, "antigravity/")
+	return strings.HasPrefix(lower, "antigravity/cli/") || strings.HasPrefix(lower, "antigravity/hub/") || strings.HasPrefix(lower, "antigravity/")
 }
 
 func antigravityBaseUserAgent(userAgent string) string {
@@ -257,264 +212,171 @@ func antigravityBaseUserAgent(userAgent string) string {
 }
 
 // AntigravityRequestUserAgent returns the Antigravity runtime UA used by
-// generate/stream/model-list requests.
+// generate/stream/control-plane requests. Legacy Hub/IDE UAs as well as stale
+// or cl=-missing antigravity/cli/... UAs stored in older credential files are
+// upgraded to the pinned agy CLI UA with datacollection_opt_in=false.
 func AntigravityRequestUserAgent(userAgent string) string {
-	return antigravityBaseUserAgent(userAgent)
+	base := antigravityBaseUserAgent(userAgent)
+	lower := strings.ToLower(base)
+	if !strings.HasPrefix(lower, "antigravity/cli/") {
+		return AntigravityUserAgent()
+	}
+	if AntigravityVersionFromUserAgent(base) != antigravityFallbackVersion {
+		return AntigravityUserAgent()
+	}
+	openIdx := strings.IndexByte(base, '(')
+	closeIdx := strings.LastIndexByte(base, ')')
+	if openIdx < 0 || closeIdx <= openIdx || closeIdx != len(base)-1 {
+		return AntigravityUserAgent()
+	}
+	tokens := strings.Split(base[openIdx+1:closeIdx], ";")
+	hasAidevClient := false
+	hasBuildCL := false
+	hasOptIn := false
+	optInFalse := false
+	rebuilt := make([]string, 0, len(tokens)+1)
+	for _, rawTok := range tokens {
+		tok := strings.TrimSpace(rawTok)
+		if tok == "" {
+			continue
+		}
+		tokLower := strings.ToLower(tok)
+		if tokLower == "aidev_client" {
+			hasAidevClient = true
+		}
+		if tokLower == "cl="+antigravityBuildCL {
+			hasBuildCL = true
+		}
+		if strings.HasPrefix(tokLower, "datacollection_opt_in=") {
+			if hasOptIn {
+				optInFalse = false
+				continue
+			}
+			hasOptIn = true
+			if tok == "datacollection_opt_in=false" {
+				optInFalse = true
+			}
+			rebuilt = append(rebuilt, "datacollection_opt_in=false")
+			continue
+		}
+		rebuilt = append(rebuilt, tok)
+	}
+	if !hasAidevClient || !hasBuildCL {
+		return AntigravityUserAgent()
+	}
+	if !hasOptIn {
+		rebuilt = append(rebuilt, "datacollection_opt_in=false")
+	} else if optInFalse {
+		return base
+	}
+	return base[:openIdx+1] + strings.Join(rebuilt, "; ") + ")"
 }
 
-// AntigravityLoadCodeAssistUserAgent returns the Antigravity runtime UA used by
+// AntigravityLoadCodeAssistUserAgent returns the Antigravity UA used by
 // loadCodeAssist requests.
 func AntigravityLoadCodeAssistUserAgent(userAgent string) string {
 	return AntigravityRequestUserAgent(userAgent)
 }
 
-// AntigravityOnboardUserUserAgent returns the long Antigravity control-plane UA
-// used by onboardUser requests.
+// AntigravityOnboardUserUserAgent returns the Antigravity UA used by
+// onboardUser requests. The official agy CLI uses the same CLI UA for all
+// Cloud Code control-plane RPCs.
 func AntigravityOnboardUserUserAgent(userAgent string) string {
-	userAgent = strings.TrimSpace(userAgent)
-	if userAgent == "" {
-		return AntigravityUserAgent() + " " + AntigravityNodeAPIClientUA
-	}
-	lower := strings.ToLower(userAgent)
-	if !isAntigravityFamilyUserAgent(lower) {
-		return userAgent
-	}
-	if strings.Contains(lower, "google-api-nodejs-client/") {
-		return userAgent
-	}
-	return antigravityBaseUserAgent(userAgent) + " " + AntigravityNodeAPIClientUA
+	return AntigravityRequestUserAgent(userAgent)
 }
 
 // AntigravityVersionFromUserAgent extracts the Antigravity version prefix from
-// either the short or long Antigravity UA forms.
+// CLI, Hub, or legacy Antigravity UA forms.
 func AntigravityVersionFromUserAgent(userAgent string) string {
 	base := antigravityBaseUserAgent(userAgent)
 	lower := strings.ToLower(base)
-	if strings.HasPrefix(lower, "antigravity/hub/") {
-		rest := base[len("antigravity/hub/"):]
-		if idx := strings.IndexAny(rest, " 	"); idx >= 0 {
-			rest = rest[:idx]
+	for _, prefix := range []string{"antigravity/cli/", "antigravity/hub/", "antigravity/"} {
+		if strings.HasPrefix(lower, prefix) {
+			rest := base[len(prefix):]
+			if idx := strings.IndexAny(rest, " \t"); idx >= 0 {
+				rest = rest[:idx]
+			}
+			rest = strings.TrimSpace(rest)
+			if rest == "" {
+				return AntigravityLatestVersion()
+			}
+			return rest
 		}
-		rest = strings.TrimSpace(rest)
-		if rest == "" {
-			return antigravityEffectiveVersion()
-		}
-		return rest
 	}
-	const legacyPrefix = "antigravity/"
-	if !strings.HasPrefix(lower, legacyPrefix) {
-		return antigravityEffectiveVersion()
-	}
-	rest := base[len(legacyPrefix):]
-	if idx := strings.IndexAny(rest, " 	"); idx >= 0 {
-		rest = rest[:idx]
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return antigravityEffectiveVersion()
-	}
-	return rest
-}
-
-func resolveAntigravityVersionProxyURL() string {
-	antigravityVersionMu.RLock()
-	provider := antigravityVersionProxyProvider
-	proxyURL := antigravityVersionProxyURL
-	antigravityVersionMu.RUnlock()
-
-	if provider != nil {
-		return strings.TrimSpace(provider())
-	}
-	return strings.TrimSpace(proxyURL)
-}
-
-func antigravityVersionHTTPClient() (*http.Client, func(), error) {
-	proxyURL := resolveAntigravityVersionProxyURL()
-
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-	if errBuild != nil {
-		return nil, nil, fmt.Errorf("build antigravity version proxy transport (%s): %w", proxyutil.Redact(proxyURL), errBuild)
-	}
-
-	client := &http.Client{Timeout: antigravityFetchTimeout}
-	if transport != nil {
-		client.Transport = transport
-		return client, transport.CloseIdleConnections, nil
-	}
-	return client, nil, nil
+	return AntigravityLatestVersion()
 }
 
 func fetchAntigravityLatestVersion(ctx context.Context) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if errCtx := ctx.Err(); errCtx != nil {
-		return "", errCtx
-	}
 
-	client, closeTransport, errClient := antigravityVersionHTTPClient()
-	if errClient != nil {
-		return "", errClient
+	client := &http.Client{
+		Timeout:   antigravityFetchTimeout,
+		Transport: NewAntigravityDualProtoRoundTripper(nil, antigravityVersionProxyURL()),
 	}
-	if closeTransport != nil {
-		defer closeTransport()
+	if rt, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+		defer rt.CloseIdleConnections()
 	}
-	return fetchAntigravityHubLatestManifestVersion(ctx, client)
+	return fetchAntigravityCLILatestManifestVersion(ctx, client)
 }
 
-func fetchAntigravityHubLatestManifestVersion(ctx context.Context, client *http.Client) (string, error) {
-	antigravityVersionMu.RLock()
-	manifestURL := antigravityHubLatestManifestURL
-	antigravityVersionMu.RUnlock()
-
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+func fetchAntigravityCLILatestManifestVersion(ctx context.Context, client *http.Client) (string, error) {
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodGet, antigravityCLILatestManifestURL, nil)
 	if errReq != nil {
-		return "", fmt.Errorf("build antigravity Hub updater manifest request: %w", errReq)
+		return "", fmt.Errorf("build antigravity CLI updater manifest request: %w", errReq)
 	}
-	httpReq.Header.Set("User-Agent", "electron-builder")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 
 	resp, errDo := client.Do(httpReq)
 	if errDo != nil {
-		return "", fmt.Errorf("fetch antigravity Hub updater manifest: %w", errDo)
+		return "", fmt.Errorf("fetch antigravity CLI updater manifest: %w", errDo)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
-			log.WithError(errClose).Warn("antigravity Hub updater manifest response body close error")
+			log.WithError(errClose).Warn("antigravity CLI updater manifest response body close error")
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("antigravity Hub updater manifest returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("antigravity CLI updater manifest returned status %d", resp.StatusCode)
 	}
 
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if errRead != nil {
-		return "", fmt.Errorf("read antigravity Hub updater manifest: %w", errRead)
+		return "", fmt.Errorf("read antigravity CLI updater manifest: %w", errRead)
 	}
 
-	var manifest antigravityHubUpdaterManifest
-	if errDecode := yaml.Unmarshal(raw, &manifest); errDecode != nil {
-		return "", fmt.Errorf("decode antigravity Hub updater manifest: %w", errDecode)
+	var manifest antigravityCLIUpdaterManifest
+	if errDecode := json.Unmarshal(raw, &manifest); errDecode != nil {
+		return "", fmt.Errorf("decode antigravity CLI updater manifest: %w", errDecode)
 	}
 
 	version := strings.TrimSpace(manifest.Version)
 	if version == "" {
-		return "", errors.New("antigravity Hub updater manifest returned empty version")
+		return "", errors.New("antigravity CLI updater manifest returned empty version")
 	}
 	if !isValidAntigravitySemVersion(version) {
-		return "", fmt.Errorf("antigravity Hub updater manifest returned invalid version %q", version)
+		return "", fmt.Errorf("antigravity CLI updater manifest returned invalid version %q", version)
 	}
 	return version, nil
 }
 
-func parseAntigravitySemVersion(version string) ([3]int, bool) {
-	var parsed [3]int
+func isValidAntigravitySemVersion(version string) bool {
 	parts := strings.Split(version, ".")
 	if len(parts) != 3 {
-		return parsed, false
+		return false
 	}
 
-	for i, part := range parts {
+	for _, part := range parts {
 		if part == "" {
-			return parsed, false
+			return false
 		}
 		for _, ch := range part {
 			if ch < '0' || ch > '9' {
-				return parsed, false
+				return false
 			}
 		}
-		value, errParse := strconv.Atoi(part)
-		if errParse != nil {
-			return parsed, false
-		}
-		parsed[i] = value
 	}
 
-	return parsed, true
-}
-
-func compareAntigravitySemVersion(a, b [3]int) int {
-	for i := range a {
-		if a[i] < b[i] {
-			return -1
-		}
-		if a[i] > b[i] {
-			return 1
-		}
-	}
-	return 0
-}
-
-func isValidAntigravitySemVersion(version string) bool {
-	_, ok := parseAntigravitySemVersion(version)
-	return ok
-}
-
-func notifyAntigravityVersionRefreshed() {
-	antigravityVersionMu.RLock()
-	ch := antigravityVersionRefreshed
-	antigravityVersionMu.RUnlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
-}
-
-// OverrideAntigravityHubManifestURLForTest overrides the Antigravity Hub manifest URL for testing purposes.
-func OverrideAntigravityHubManifestURLForTest(url string) func() {
-	antigravityVersionMu.Lock()
-	old := antigravityHubLatestManifestURL
-	antigravityHubLatestManifestURL = url
-	antigravityVersionMu.Unlock()
-	return func() {
-		antigravityVersionMu.Lock()
-		antigravityHubLatestManifestURL = old
-		antigravityVersionMu.Unlock()
-	}
-}
-
-// SetAntigravityVersionCacheForTest overrides the cached Antigravity version and expiry for testing purposes.
-func SetAntigravityVersionCacheForTest(version string, expiry time.Time) func() {
-	antigravityVersionMu.Lock()
-	oldVersion := cachedAntigravityVersion
-	oldExpiry := antigravityVersionExpiry
-	cachedAntigravityVersion = version
-	antigravityVersionExpiry = expiry
-	antigravityVersionMu.Unlock()
-	return func() {
-		antigravityVersionMu.Lock()
-		cachedAntigravityVersion = oldVersion
-		antigravityVersionExpiry = oldExpiry
-		antigravityVersionMu.Unlock()
-	}
-}
-
-// SetAntigravityVersionRefreshedHookForTest receives one signal after each non-cancelled refresh attempt.
-func SetAntigravityVersionRefreshedHookForTest(ch chan struct{}) func() {
-	antigravityVersionMu.Lock()
-	old := antigravityVersionRefreshed
-	antigravityVersionRefreshed = ch
-	antigravityVersionMu.Unlock()
-	return func() {
-		antigravityVersionMu.Lock()
-		antigravityVersionRefreshed = old
-		antigravityVersionMu.Unlock()
-	}
-}
-
-// SetAntigravityVersionTriggerForTest installs a trigger channel that drives periodic refreshes in tests.
-func SetAntigravityVersionTriggerForTest(ch <-chan struct{}) func() {
-	antigravityVersionMu.Lock()
-	old := antigravityVersionTrigger
-	antigravityVersionTrigger = ch
-	antigravityVersionMu.Unlock()
-	return func() {
-		antigravityVersionMu.Lock()
-		antigravityVersionTrigger = old
-		antigravityVersionMu.Unlock()
-	}
+	return true
 }

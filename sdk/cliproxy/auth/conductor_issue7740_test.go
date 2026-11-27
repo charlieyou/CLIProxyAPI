@@ -121,8 +121,10 @@ func TestIssue7740_ExecuteStream_BootstrapStopPreservesUpstreamHeaders(t *testin
 		if got := headerCarrier.Headers().Get("X-Trace-Id"); got != "trace-stop-7740" {
 			t.Fatalf("Headers().Get(X-Trace-Id) = %q, want %q", got, "trace-stop-7740")
 		}
-		if got := SafeResponseHeaders(errStream).Get("Retry-After"); got == "" {
-			t.Fatal("SafeResponseHeaders(errStream).Get(Retry-After) = empty, want trusted Retry-After preserved")
+		// Antigravity keeps the agy build's behavior: no trusted Retry-After is
+		// derived from the hint; only the upstream headers above reach clients.
+		if got := SafeResponseHeaders(errStream).Get("Retry-After"); got != "" {
+			t.Fatalf("SafeResponseHeaders(errStream).Get(Retry-After) = %q, want none for Antigravity", got)
 		}
 	})
 

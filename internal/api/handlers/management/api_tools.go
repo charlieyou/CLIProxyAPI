@@ -1,10 +1,12 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,7 +17,9 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -141,6 +145,20 @@ func (h *Handler) APICall(c *gin.Context) {
 		reqHeaders = map[string]string{}
 	}
 
+	// Reject deprecated Antigravity /v1internal:retrieveUserQuota before
+	// triggering any upstream OAuth refresh via $TOKEN$ resolution.
+	reqUA := ""
+	for key, value := range reqHeaders {
+		if strings.EqualFold(key, "user-agent") {
+			reqUA = value
+			break
+		}
+	}
+	if isDeprecatedAntigravityRetrieveUserQuotaRequest(parsedURL, auth, reqUA) {
+		c.JSON(http.StatusGone, gin.H{"error": errAntigravityDeprecatedRetrieveUserQuota.Error()})
+		return
+	}
+
 	var hostOverride string
 	var token string
 	var tokenResolved bool
@@ -210,10 +228,25 @@ func (h *Handler) APICall(c *gin.Context) {
 		req.Host = hostOverride
 	}
 
+	if tokenResolved && authIndex != "" {
+		if latest := h.authByIndex(authIndex); latest != nil {
+			auth = latest
+		}
+	}
+
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
-	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
+	agTransport, errNormalize := h.applyAntigravityManagementNormalization(req, auth, requestProxyURL)
+	if errNormalize != nil {
+		c.JSON(http.StatusGone, gin.H{"error": errNormalize.Error()})
+		return
+	}
+	if agTransport != nil {
+		httpClient.Transport = agTransport
+	} else {
+		httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
+	}
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
@@ -527,6 +560,78 @@ func xaiOAuthTokenNeedsRefresh(auth *coreauth.Auth) bool {
 	return !temp.HasValidAccessToken(now)
 }
 
+func antigravityTokenValueFromMetadata(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	if v := stringValue(metadata, "access_token"); v != "" {
+		return v
+	}
+	return tokenValueFromMetadata(metadata)
+}
+
+type antigravityManagementTokenPreparer struct {
+	handler         *Handler
+	requestProxyURL string
+}
+
+func (p antigravityManagementTokenPreparer) ShouldPrepareRequestAuth(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	current := strings.TrimSpace(antigravityTokenValueFromMetadata(auth.Metadata))
+	return current == "" || antigravityTokenNeedsRefresh(auth.Metadata)
+}
+
+func (p antigravityManagementTokenPreparer) PrepareRequestAuth(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return p.handler.doAntigravityOAuthRefresh(ctx, auth, p.requestProxyURL)
+}
+
+func (h *Handler) doAntigravityOAuthRefresh(ctx context.Context, auth *coreauth.Auth, requestProxyURL string) (*coreauth.Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if auth == nil {
+		return nil, fmt.Errorf("antigravity auth missing")
+	}
+	if len(auth.Metadata) == 0 {
+		return nil, fmt.Errorf("antigravity oauth metadata missing")
+	}
+	if stringValue(auth.Metadata, "refresh_token") == "" {
+		return nil, fmt.Errorf("antigravity refresh token missing")
+	}
+
+	tokenURL := strings.TrimSpace(antigravityOAuthTokenURL)
+	if tokenURL == "" {
+		tokenURL = "https://oauth2.googleapis.com/token"
+	}
+	parsedTokenURL, _ := url.Parse(tokenURL)
+	oauthProxy := h.resolveAntigravityManagementProxy(auth, requestProxyURL, parsedTokenURL)
+
+	accessToken, newRefreshToken, expiresIn, errRefresh := executor.RefreshAntigravityOAuthToken(ctx, auth, oauthProxy, tokenURL, defaultAPICallTimeout)
+	if errRefresh != nil {
+		return nil, errRefresh
+	}
+
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	now := time.Now()
+	updated.Metadata["access_token"] = accessToken
+	delete(updated.Metadata, "accessToken")
+	if newRefreshToken != "" {
+		updated.Metadata["refresh_token"] = newRefreshToken
+	}
+	if expiresIn > 0 {
+		updated.Metadata["expires_in"] = expiresIn
+		updated.Metadata["timestamp"] = now.UnixMilli()
+		updated.Metadata["expired"] = now.Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
+	}
+	updated.Metadata["type"] = "antigravity"
+	return updated, nil
+}
+
 func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *coreauth.Auth, requestProxyURL string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -540,90 +645,31 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 		return "", fmt.Errorf("antigravity oauth metadata missing")
 	}
 
-	current := strings.TrimSpace(tokenValueFromMetadata(metadata))
+	current := strings.TrimSpace(antigravityTokenValueFromMetadata(metadata))
 	if current != "" && !antigravityTokenNeedsRefresh(metadata) {
 		return current, nil
 	}
 
-	refreshToken := stringValue(metadata, "refresh_token")
-	if refreshToken == "" {
-		return "", fmt.Errorf("antigravity refresh token missing")
+	preparer := antigravityManagementTokenPreparer{
+		handler:         h,
+		requestProxyURL: requestProxyURL,
 	}
-
-	tokenURL := strings.TrimSpace(antigravityOAuthTokenURL)
-	if tokenURL == "" {
-		tokenURL = "https://oauth2.googleapis.com/token"
-	}
-	form := url.Values{}
-	form.Set("client_id", antigravityOAuthClientID)
-	form.Set("client_secret", antigravityOAuthClientSecret)
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
-
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
-	if errReq != nil {
-		return "", errReq
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	httpClient := &http.Client{
-		Timeout:   defaultAPICallTimeout,
-		Transport: h.apiCallTransport(auth, requestProxyURL),
-	}
-	resp, errDo := httpClient.Do(req)
-	if errDo != nil {
-		return "", errDo
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
+	if h != nil && h.authManager != nil && strings.TrimSpace(auth.ID) != "" {
+		updated, errPrepare := h.authManager.PrepareRequestAuth(ctx, preparer, auth)
+		if errPrepare != nil {
+			return "", errPrepare
 		}
-	}()
-
-	bodyBytes, errRead := io.ReadAll(resp.Body)
-	if errRead != nil {
-		return "", errRead
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("antigravity oauth token refresh failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		if updated != nil {
+			return strings.TrimSpace(antigravityTokenValueFromMetadata(updated.Metadata)), nil
+		}
+		return "", fmt.Errorf("antigravity oauth token refresh returned empty auth")
 	}
 
-	var tokenResp struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		TokenType    string `json:"token_type"`
+	updated, errRefresh := h.doAntigravityOAuthRefresh(ctx, auth, requestProxyURL)
+	if errRefresh != nil {
+		return "", errRefresh
 	}
-	if errUnmarshal := json.Unmarshal(bodyBytes, &tokenResp); errUnmarshal != nil {
-		return "", errUnmarshal
-	}
-
-	if strings.TrimSpace(tokenResp.AccessToken) == "" {
-		return "", fmt.Errorf("antigravity oauth token refresh returned empty access_token")
-	}
-
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	now := time.Now()
-	auth.Metadata["access_token"] = strings.TrimSpace(tokenResp.AccessToken)
-	if strings.TrimSpace(tokenResp.RefreshToken) != "" {
-		auth.Metadata["refresh_token"] = strings.TrimSpace(tokenResp.RefreshToken)
-	}
-	if tokenResp.ExpiresIn > 0 {
-		auth.Metadata["expires_in"] = tokenResp.ExpiresIn
-		auth.Metadata["timestamp"] = now.UnixMilli()
-		auth.Metadata["expired"] = now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
-	}
-	auth.Metadata["type"] = "antigravity"
-
-	if h != nil && h.authManager != nil {
-		auth.LastRefreshedAt = now
-		auth.UpdatedAt = now
-		_, _ = h.authManager.Update(ctx, auth)
-	}
-
-	return strings.TrimSpace(tokenResp.AccessToken), nil
+	return strings.TrimSpace(antigravityTokenValueFromMetadata(updated.Metadata)), nil
 }
 
 func metaTokenFromAuth(auth *coreauth.Auth) string {
@@ -834,12 +880,379 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 	return nil
 }
 
-func (h *Handler) apiCallTransport(auth *coreauth.Auth, requestProxyURL string) http.RoundTripper {
-	if proxyStr := strings.TrimSpace(requestProxyURL); proxyStr != "" {
-		if transport := buildProxyTransport(proxyStr); transport != nil {
-			return transport
+const (
+	antigravityLegacyCCPAHost = "cloudcode-pa.googleapis.com"
+	antigravityDailyCCPAHost  = "daily-cloudcode-pa.googleapis.com"
+)
+
+func isAntigravityExclusiveHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == antigravityDailyCCPAHost ||
+		h == "daily-cloudcode-pa.sandbox.googleapis.com" ||
+		h == "aicode.googleapis.com"
+}
+
+func isAntigravityCCPAHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == antigravityDailyCCPAHost ||
+		h == "daily-cloudcode-pa.sandbox.googleapis.com" ||
+		h == antigravityLegacyCCPAHost
+}
+
+func extractBearerTokenForAPICall(authorization string) string {
+	trimmed := strings.TrimSpace(authorization)
+	if len(trimmed) <= len("Bearer ") {
+		return ""
+	}
+	if !strings.EqualFold(trimmed[:len("Bearer ")], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[len("Bearer "):])
+}
+
+func (h *Handler) resolveAuthByBearerToken(bearerToken string) (*coreauth.Auth, bool) {
+	if bearerToken == "" || h == nil || h.authManager == nil {
+		return nil, false
+	}
+	for _, candidate := range h.authManager.List() {
+		if candidate == nil {
+			continue
 		}
-		return directAPICallTransport()
+		if tok := strings.TrimSpace(stringValue(candidate.Metadata, "access_token")); tok != "" && tok == bearerToken {
+			return candidate, true
+		}
+		if tok := strings.TrimSpace(tokenValueFromMetadata(candidate.Metadata)); tok != "" && tok == bearerToken {
+			return candidate, true
+		}
+	}
+	return nil, false
+}
+
+func isDeprecatedAntigravityRetrieveUserQuotaRequest(u *url.URL, auth *coreauth.Auth, userAgent string) bool {
+	if u == nil || u.Path != "/v1internal:retrieveUserQuota" {
+		return false
+	}
+	host := u.Hostname()
+	if !isAntigravityCCPAHost(host) {
+		return false
+	}
+	if auth != nil {
+		return strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity")
+	}
+	if isAntigravityExclusiveHost(host) {
+		return true
+	}
+	return strings.EqualFold(host, antigravityLegacyCCPAHost) &&
+		strings.Contains(strings.ToLower(userAgent), "antigravity")
+}
+
+func isAntigravityCLIUAHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return isAntigravityCCPAHost(h) || h == "aicode.googleapis.com"
+}
+
+func isAntigravityHTTP11Host(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return isAntigravityCLIUAHost(h) || h == "www.googleapis.com"
+}
+
+func antigravityConfiguredUserAgentForAPICall(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if ua := strings.TrimSpace(auth.Attributes["user_agent"]); ua != "" {
+			return ua
+		}
+	}
+	return stringValue(auth.Metadata, "user_agent")
+}
+
+func stripHostPort(hostport string) string {
+	trimmed := strings.TrimSpace(hostport)
+	if trimmed == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(trimmed); err == nil {
+		return host
+	}
+	return strings.Trim(trimmed, "[]")
+}
+
+func antigravityProjectIDForAPICall(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if v := stringValue(auth.Metadata, "project_id"); v != "" {
+		return v
+	}
+	if v := stringValue(auth.Metadata, "project"); v != "" {
+		return v
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["project_id"]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func setRequestBytesBody(req *http.Request, body []byte) {
+	payload := append([]byte(nil), body...)
+	req.Body = io.NopCloser(bytes.NewReader(payload))
+	req.ContentLength = int64(len(payload))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
+}
+
+var errAntigravityDeprecatedRetrieveUserQuota = errors.New("antigravity does not support deprecated /v1internal:retrieveUserQuota (response schema differs); use /v1internal:retrieveUserQuotaSummary")
+
+func normalizeAntigravityManagementRequestBody(req *http.Request, auth *coreauth.Auth) {
+	if req == nil || req.URL == nil || !strings.EqualFold(req.Method, http.MethodPost) {
+		return
+	}
+	if !isAntigravityCCPAHost(req.URL.Hostname()) {
+		return
+	}
+	const prefix = "/v1internal:"
+	if !strings.HasPrefix(req.URL.Path, prefix) {
+		return
+	}
+	action := strings.TrimPrefix(req.URL.Path, prefix)
+
+	var isProjectBodyAction bool
+	var isLoadCodeAssist bool
+	switch action {
+	case "fetchAvailableModels", "retrieveUserQuotaSummary", "fetchAdminControls", "fetchUserInfo", "listExperiments":
+		isProjectBodyAction = true
+	case "loadCodeAssist":
+		isLoadCodeAssist = true
+	}
+
+	var raw []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		var errRead error
+		raw, errRead = io.ReadAll(req.Body)
+		if errClose := req.Body.Close(); errClose != nil {
+			log.Debugf("management APICall: close request body error: %v", errClose)
+		}
+		if errRead != nil {
+			setRequestBytesBody(req, raw)
+			return
+		}
+		// Always restore req.Body even if no rewrite occurs.
+		setRequestBytesBody(req, raw)
+	}
+
+	trimmed := bytes.TrimSpace(raw)
+	if isProjectBodyAction {
+		projectID := antigravityProjectIDForAPICall(auth)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) {
+			if projectID == "" {
+				setRequestBytesBody(req, []byte("{}"))
+				return
+			}
+			if encoded, errMarshal := json.Marshal(map[string]string{"project": projectID}); errMarshal == nil {
+				setRequestBytesBody(req, helps.FormatAntigravityControlPlaneJSON(action, encoded))
+			}
+			return
+		}
+		var obj map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(trimmed, &obj); errUnmarshal != nil || obj == nil {
+			return
+		}
+		existingProj := ""
+		if rawProj, ok := obj["project"]; ok {
+			_ = json.Unmarshal(rawProj, &existingProj)
+		}
+		if strings.TrimSpace(existingProj) == "" && projectID != "" {
+			if projJSON, errMarshal := json.Marshal(projectID); errMarshal == nil {
+				obj["project"] = json.RawMessage(projJSON)
+			}
+		}
+		if encoded, errObj := json.Marshal(obj); errObj == nil {
+			setRequestBytesBody(req, helps.FormatAntigravityControlPlaneJSON(action, encoded))
+		}
+		return
+	}
+
+	if isLoadCodeAssist {
+		// loadCodeAssist: match agy's {"metadata":{"ideType":"ANTIGRAVITY"}} body
+		// while preserving any explicit non-metadata top-level fields in .proto
+		// declaration order with detrand ", " spacing.
+		const agyLoadCodeAssistBody = `{"metadata":{"ideType":"ANTIGRAVITY"}}`
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) {
+			setRequestBytesBody(req, []byte(agyLoadCodeAssistBody))
+			return
+		}
+		var obj map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(trimmed, &obj); errUnmarshal != nil || obj == nil {
+			return
+		}
+		if len(obj) == 0 {
+			setRequestBytesBody(req, []byte(agyLoadCodeAssistBody))
+			return
+		}
+		obj["metadata"] = json.RawMessage(`{"ideType":"ANTIGRAVITY"}`)
+		if encoded, errObj := json.Marshal(obj); errObj == nil {
+			setRequestBytesBody(req, helps.FormatAntigravityControlPlaneJSON(action, encoded))
+		}
+		return
+	}
+
+	// Format any other non-empty JSON object body (e.g. onboardUser, setUserSettings,
+	// streamGenerateContent) with agy 1.5.16's .proto field order and ", " spacing.
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		setRequestBytesBody(req, helps.FormatAntigravityControlPlaneJSON(action, trimmed))
+	}
+}
+
+// applyAntigravityManagementNormalization rewrites legacy Cloud Code endpoints,
+// rejects deprecated Antigravity-incompatible RPCs locally, normalizes
+// control-plane bodies with agy 1.5.16 protojson formatting, enforces agy's
+// minimal header allowlist, and returns the credential's shared HTTP/1.1 uTLS
+// connection pool for management API calls targeting Antigravity Google hosts.
+// Returns (nil, nil) when the request does not target an Antigravity Google host.
+func (h *Handler) applyAntigravityManagementNormalization(req *http.Request, auth *coreauth.Auth, requestProxyURL string) (http.RoundTripper, error) {
+	if req == nil || req.URL == nil {
+		return nil, nil
+	}
+	host := req.URL.Hostname()
+	rawBearer := extractBearerTokenForAPICall(req.Header.Get("Authorization"))
+	if auth == nil && rawBearer != "" {
+		if matched, ok := h.resolveAuthByBearerToken(rawBearer); ok {
+			if !strings.EqualFold(strings.TrimSpace(matched.Provider), "antigravity") {
+				// Matched a registered non-Antigravity credential (e.g. gemini-cli): never hijack.
+				return nil, nil
+			}
+			auth = matched
+		}
+	}
+	if auth != nil {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			return nil, nil
+		}
+		if !isAntigravityHTTP11Host(host) {
+			return nil, nil
+		}
+	} else {
+		// Without a resolved Antigravity auth, normalize only Antigravity-exclusive hosts
+		// (or shared cloudcode-pa.googleapis.com when the caller explicitly declares an
+		// Antigravity User-Agent) so raw-Bearer gemini-cli calls on cloudcode-pa.googleapis.com
+		// and non-Antigravity calls on www.googleapis.com are never hijacked.
+		isExclusive := isAntigravityExclusiveHost(host)
+		isLegacyWithAGUA := strings.EqualFold(host, antigravityLegacyCCPAHost) &&
+			strings.Contains(strings.ToLower(req.Header.Get("User-Agent")), "antigravity")
+		if !isExclusive && !isLegacyWithAGUA {
+			return nil, nil
+		}
+	}
+
+	// Reject deprecated /v1internal:retrieveUserQuota locally for Antigravity
+	// callers instead of leaking it upstream (agy 1.5.16 never calls it) or
+	// silently rewriting to retrieveUserQuotaSummary (whose response schema lacks
+	// buckets[].modelId/tokenType).
+	if isAntigravityCCPAHost(host) && req.URL.Path == "/v1internal:retrieveUserQuota" {
+		return nil, errAntigravityDeprecatedRetrieveUserQuota
+	}
+
+	// Rewrite legacy cloudcode-pa host to daily-cloudcode-pa (matching agy).
+	if strings.EqualFold(req.URL.Hostname(), antigravityLegacyCCPAHost) {
+		newHost := antigravityDailyCCPAHost
+		if port := req.URL.Port(); port != "" {
+			newHost = net.JoinHostPort(antigravityDailyCCPAHost, port)
+		}
+		req.URL.Host = newHost
+		if req.Host == "" || strings.EqualFold(stripHostPort(req.Host), antigravityLegacyCCPAHost) {
+			req.Host = newHost
+		}
+	} else if strings.EqualFold(stripHostPort(req.Host), antigravityLegacyCCPAHost) {
+		newHost := antigravityDailyCCPAHost
+		if _, port, errSplit := net.SplitHostPort(strings.TrimSpace(req.Host)); errSplit == nil && port != "" {
+			newHost = net.JoinHostPort(antigravityDailyCCPAHost, port)
+		}
+		req.Host = newHost
+	}
+
+	// Real agy calls /oauth2/v2/userinfo without ?alt=json.
+	if strings.EqualFold(req.URL.Hostname(), "www.googleapis.com") && req.URL.Path == "/oauth2/v2/userinfo" && req.URL.RawQuery != "" {
+		q := req.URL.Query()
+		if strings.EqualFold(q.Get("alt"), "json") {
+			q.Del("alt")
+			req.URL.RawQuery = q.Encode()
+		}
+	}
+
+	normalizeAntigravityManagementRequestBody(req, auth)
+
+	// Enforce agy's strict header allowlist so non-agy headers (Accept,
+	// Accept-Encoding, X-Goog-Api-Client, Client-Metadata, caller UA, etc.)
+	// never leak to Google.
+	authorization := strings.TrimSpace(req.Header.Get("Authorization"))
+	contentType := strings.TrimSpace(req.Header.Get("Content-Type"))
+
+	req.Header = make(http.Header)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	hasBody := req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0
+	isCLIHost := isAntigravityCLIUAHost(req.URL.Hostname())
+	if hasBody {
+		if isCLIHost {
+			req.Header.Set("Content-Type", "application/json")
+		} else if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+	}
+	if isCLIHost {
+		// Derive UA from the credential's configured user_agent (matching
+		// AntigravityExecutor) and never forward caller-supplied User-Agent values.
+		req.Header.Set("User-Agent", misc.AntigravityRequestUserAgent(antigravityConfiguredUserAgentForAPICall(auth)))
+	}
+
+	var cfg *config.Config
+	if h != nil {
+		cfg = h.cfg
+	}
+	effectiveProxy := h.resolveAntigravityManagementProxy(auth, requestProxyURL, req.URL)
+	transportAuth := auth
+	if transportAuth == nil && rawBearer != "" {
+		// Isolate per-account HTTP/1.1 keep-alive pools by hashed Bearer token so
+		// distinct raw-Bearer accounts never share the single anonymous pool.
+		transportAuth = &coreauth.Auth{Metadata: map[string]any{"access_token": rawBearer}}
+	}
+	return executor.AntigravityHTTP11Transport(cfg, transportAuth, effectiveProxy), nil
+}
+
+func (h *Handler) resolveAntigravityManagementProxy(auth *coreauth.Auth, requestProxyURL string, targetURL *url.URL) string {
+	effectiveProxy := h.resolveAPICallProxyURL(auth, requestProxyURL)
+	if effectiveProxy == "" && targetURL != nil {
+		probeReq := &http.Request{URL: targetURL}
+		if envProxy, errEnv := http.ProxyFromEnvironment(probeReq); errEnv == nil && envProxy != nil {
+			effectiveProxy = "direct"
+		}
+	}
+	return effectiveProxy
+}
+
+// resolveAPICallProxyURL resolves the validated effective proxy string using
+// the exact same fallback precedence as apiCallTransport without allocating a
+// throwaway transport. Returns "" for implicit direct connect or the explicit
+// direct/none directive (preserving case-normalized value to match executor pools).
+func (h *Handler) resolveAPICallProxyURL(auth *coreauth.Auth, requestProxyURL string) string {
+	if proxyStr := strings.TrimSpace(requestProxyURL); proxyStr != "" {
+		setting, errParse := proxyutil.Parse(proxyStr)
+		if errParse != nil {
+			return ""
+		}
+		if setting.Mode == proxyutil.ModeDirect {
+			return strings.ToLower(proxyStr)
+		}
+		if setting.Mode == proxyutil.ModeProxy {
+			return proxyStr
+		}
+		return ""
 	}
 
 	var proxyCandidates []string
@@ -860,11 +1273,26 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth, requestProxyURL string) 
 	}
 
 	for _, proxyStr := range proxyCandidates {
+		setting, errParse := proxyutil.Parse(proxyStr)
+		if errParse != nil {
+			continue
+		}
+		if setting.Mode == proxyutil.ModeDirect {
+			return strings.ToLower(proxyStr)
+		}
+		if setting.Mode == proxyutil.ModeProxy {
+			return proxyStr
+		}
+	}
+	return ""
+}
+
+func (h *Handler) apiCallTransport(auth *coreauth.Auth, requestProxyURL string) http.RoundTripper {
+	if proxyStr := h.resolveAPICallProxyURL(auth, requestProxyURL); proxyStr != "" {
 		if transport := buildProxyTransport(proxyStr); transport != nil {
 			return transport
 		}
 	}
-
 	return directAPICallTransport()
 }
 

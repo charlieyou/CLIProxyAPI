@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoeForge/moego/json"
@@ -20,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // geminiSSEKeepAliveFrame is an empty SSE frame used for Gemini SSE heartbeats.
@@ -214,6 +216,8 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	agy := &geminiStreamAuthProvider{manager: h.AuthManager}
+	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, agy.observe)
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -273,11 +277,11 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 				pendingErrors <- errMsg
 				close(pendingErrors)
-				h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors)
+				h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors, agy.isAntigravity)
 				return
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			h.writeStreamErrorResponse(c, errMsg, agy.isAntigravity())
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -293,10 +297,10 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 						pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 						pendingErrors <- errMsg
 						close(pendingErrors)
-						h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors)
+						h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors, agy.isAntigravity)
 						return
 					}
-					h.WriteErrorResponse(c, errMsg)
+					h.writeStreamErrorResponse(c, errMsg, agy.isAntigravity())
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
 					} else {
@@ -327,7 +331,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			flusher.Flush()
 
 			// Continue
-			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan, agy.isAntigravity)
 			return
 		case <-waitKeepAliveC:
 			if canWriteWaitKeepAlive() && !writeKeepAlive() {
@@ -390,7 +394,7 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 	cliCancel()
 }
 
-func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, isAntigravity func() bool) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
@@ -424,6 +428,18 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			errText := http.StatusText(status)
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
+			}
+			if isAntigravity != nil && isAntigravity() {
+				// The agy Antigravity replication (v7) wrote an OpenAI-style
+				// body from handlers.BuildErrorResponseBody as an SSE
+				// "event: error" frame; keep that for Antigravity requests.
+				body := handlers.BuildAgyErrorResponseBody(status, errText)
+				if alt == "" {
+					_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+				} else {
+					_, _ = c.Writer.Write(body)
+				}
+				return
 			}
 			body := buildGeminiErrorResponseBody(status, errText)
 			if alt == "" {
@@ -500,6 +516,41 @@ func extractGeminiErrorMessage(raw, fallback string) string {
 
 // buildGeminiErrorResponseBody builds a compact single-line Google RPC error
 // JSON body compatible with google.golang.org/genai's APIError struct.
+// geminiStreamAuthProvider records the credential the auth manager last
+// selected for a stream so error writers can tell Antigravity requests apart.
+type geminiStreamAuthProvider struct {
+	manager *coreauth.Manager
+	mu      sync.Mutex
+	authID  string
+}
+
+func (p *geminiStreamAuthProvider) observe(authID string) {
+	p.mu.Lock()
+	p.authID = authID
+	p.mu.Unlock()
+}
+
+func (p *geminiStreamAuthProvider) isAntigravity() bool {
+	p.mu.Lock()
+	authID := p.authID
+	p.mu.Unlock()
+	if authID == "" || p.manager == nil {
+		return false
+	}
+	auth, ok := p.manager.GetByID(authID)
+	return ok && auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity")
+}
+
+// writeStreamErrorResponse writes an error that ends a stream before any
+// payload. Antigravity requests keep the v7 error body of the agy replication.
+func (h *GeminiAPIHandler) writeStreamErrorResponse(c *gin.Context, errMsg *interfaces.ErrorMessage, antigravity bool) {
+	if antigravity {
+		h.WriteAgyErrorResponse(c, errMsg)
+		return
+	}
+	h.WriteErrorResponse(c, errMsg)
+}
+
 func buildGeminiErrorResponseBody(status int, errText string) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError

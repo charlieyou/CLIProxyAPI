@@ -139,8 +139,7 @@ type Auth struct {
 	AdoptedAt time.Time `json:"-"`
 	// AdoptedGrantHash records the fingerprint of the credential grant when it was adopted into runtime state,
 	// preserved across upstream automatic refresh rotations and reset when the credential grant is externally replaced.
-	AdoptedGrantHash            string `json:"-"`
-	antigravityEnumRegistration string
+	AdoptedGrantHash string `json:"-"`
 	// InferenceVerified reports whether the current credential version completed a real inference response.
 	InferenceVerified bool `json:"-"`
 	// LastInferenceVerifiedAt records when the current credential version last completed an inference response.

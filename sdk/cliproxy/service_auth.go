@@ -445,7 +445,6 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 				}
 				return nil
 			}
-			s.cancelStaleAntigravityProbes(registered.ID)
 			return registered
 		}
 	} else {
@@ -463,7 +462,6 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		}
 		auth = current
 	}
-	s.cancelStaleAntigravityProbes(auth.ID)
 	return auth
 }
 
@@ -476,14 +474,6 @@ func (s *Service) updateCoreAuthForModelRegistration(ctx context.Context, existi
 		return existing
 	}
 	auth.CreatedAt = existing.CreatedAt
-	if existing.Metadata != nil {
-		if persistedHints, hasHints := existing.Metadata[antigravityPersistedHintsMetaKey]; hasHints {
-			if auth.Metadata == nil {
-				auth.Metadata = make(map[string]any)
-			}
-			auth.Metadata[antigravityPersistedHintsMetaKey] = persistedHints
-		}
-	}
 	if !auth.HasFileSnapshot() && !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 		if !coreauth.CredentialsChanged(existing, auth) {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
@@ -501,7 +491,6 @@ func (s *Service) updateCoreAuthForModelRegistration(ctx context.Context, existi
 			GlobalModelRegistry().UnregisterClient(auth.ID)
 			return nil
 		}
-		s.cancelStaleAntigravityProbes(current.ID)
 		return current
 	}
 	if updated == nil {
@@ -522,7 +511,6 @@ func (s *Service) updateCoreAuthForModelRegistration(ctx context.Context, existi
 		}
 		return updated
 	}
-	s.cancelStaleAntigravityProbes(updated.ID)
 	return updated
 }
 
@@ -699,7 +687,6 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	// republish its cached models after the registry has been cleared.
 	s.coreManager.Remove(ctx, id)
 	GlobalModelRegistry().UnregisterClient(id)
-	s.cancelStaleAntigravityProbes(id)
 	if strings.EqualFold(provider, "codex") {
 		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
 	}

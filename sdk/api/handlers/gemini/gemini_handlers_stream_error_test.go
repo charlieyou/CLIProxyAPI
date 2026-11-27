@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,9 +14,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -363,75 +360,5 @@ func TestGeminiStreamGenerateContentPostCommitErrorEmitsGoGenAIAPIError(t *testi
 				t.Fatalf("APIError details count = %d, want %d; got=%+v", len(got.Details), tc.wantDetails, got.Details)
 			}
 		})
-	}
-}
-
-func TestGeminiStreamGenerateContentPostThoughtMalformedFunctionCallThroughAntigravity(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"planning tool call..."}]}}],"modelVersion":"gemini-4-neon"}}`+"\n\n")
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		_, _ = io.WriteString(w, `data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"sig-only","text":""}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":10,"totalTokenCount":60},"modelVersion":"gemini-4-neon"}}`+"\n\n")
-	}))
-	defer upstream.Close()
-
-	cfg := &config.Config{}
-	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
-	manager.RegisterExecutor(executor.NewAntigravityExecutor(cfg))
-
-	model := "gemini-4-neon-issue8547"
-	auth := &coreauth.Auth{
-		ID:       "ag-issue8547",
-		Provider: "antigravity",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{
-			"access_token": "token-8547",
-			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-			"project_id":   "project-8547",
-		},
-		Attributes: map[string]string{"base_url": upstream.URL},
-	}
-	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
-		t.Fatalf("Register error = %v", errReg)
-	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
-	})
-
-	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	h := NewGeminiAPIHandler(base)
-	router := gin.New()
-	router.POST("/v1beta/models/*action", h.GeminiHandler)
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"/v1beta/models/"+model+":streamGenerateContent?alt=sse",
-		strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"run tool"}]}]}`),
-	)
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 after thought chunk commits stream; body=%q", rec.Code, rec.Body.String())
-	}
-	if strings.Contains(rec.Body.String(), "event: error") {
-		t.Fatalf("unexpected SSE event: error frame: %q", rec.Body.String())
-	}
-
-	payloads, apiErrors := parseGoGenAIStream(t, rec.Body.Bytes())
-	if len(payloads) != 1 {
-		t.Fatalf("payload count = %d, want 1 (thought chunk); body=%q", len(payloads), rec.Body.String())
-	}
-	if len(apiErrors) != 1 {
-		t.Fatalf("APIError count = %d, want 1; body=%q", len(apiErrors), rec.Body.String())
-	}
-	if apiErrors[0].Code != http.StatusBadGateway || apiErrors[0].Status != "UNAVAILABLE" || !strings.Contains(apiErrors[0].Message, "MALFORMED_FUNCTION_CALL") {
-		t.Fatalf("APIError = %+v, want 502 UNAVAILABLE containing MALFORMED_FUNCTION_CALL", apiErrors[0])
 	}
 }

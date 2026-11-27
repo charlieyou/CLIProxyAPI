@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
-	antigravityclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/claude"
 	geminiclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/claude"
 	interactionsclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/interactions/claude"
 	openaiclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/claude"
@@ -80,17 +79,5 @@ func TestCommentaryMarkerRestoredByInteractionsTranslator(t *testing.T) {
 	assertCommentaryRestoredAsText(t, "interactions compat", out, err)
 	if strings.Contains(string(out), `"type":"thought"`) {
 		t.Fatalf("interactions compat: commentary must not become a thought step: %s", out)
-	}
-}
-
-func TestCommentaryMarkerRestoredByAntigravityTranslator(t *testing.T) {
-	out, err := antigravityclaude.ConvertClaudeRequestToAntigravity("test-model", []byte(crossFormatCommentaryPayload), false)
-	assertCommentaryRestoredAsText(t, "antigravity", out, err)
-	for _, content := range ojson.GetBytesNoCopy(out, "request.contents").Array() {
-		for _, part := range content.Get("parts").Array() {
-			if part.Get("text").String() == "COMMENTARY_SENTINEL" && part.Get("thought").Bool() {
-				t.Fatalf("antigravity: commentary must not become a thought part: %s", out)
-			}
-		}
 	}
 }

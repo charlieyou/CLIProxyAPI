@@ -11,7 +11,6 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -186,31 +185,6 @@ func TestPayloadReplaceCodexCountTokens(t *testing.T) {
 	}
 	if ojson.GetBytes(configured.Payload, "response.usage.input_tokens").Int() <= ojson.GetBytes(baseline.Payload, "response.usage.input_tokens").Int() {
 		t.Fatalf("token count did not include replacement: %s vs %s", configured.Payload, baseline.Payload)
-	}
-}
-
-func TestPayloadReplaceAntigravityRebuiltAttempts(t *testing.T) {
-	cfg := &config.Config{Payload: config.PayloadConfig{Replace: []config.PayloadReplaceRule{{Models: []config.PayloadModelRule{{Name: "*", Protocol: "antigravity"}}, Target: config.PayloadReplaceTarget{Role: "user", Positions: []int{1, 2}}, Replacements: []config.PayloadReplacement{{"hero": "hero!"}}}}}}
-	raw := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hero"}]}]}}`)
-	req := cliproxyexecutor.Request{Model: "gemini-3.1-pro-preview", Payload: raw}
-	ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", req.Model, "antigravity", "request", raw, req, cliproxyexecutor.Options{}))
-	executor := NewAntigravityExecutor(cfg)
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "test"}}
-	for attempt := 0; attempt < 2; attempt++ {
-		request, errBuild := executor.buildRequest(ctx, auth, "token", req.Model, raw, attempt == 1, "", "https://example.invalid", "session")
-		if errBuild != nil {
-			t.Fatal(errBuild)
-		}
-		body, errRead := io.ReadAll(request.Body)
-		if errClose := request.Body.Close(); errClose != nil {
-			t.Error(errClose)
-		}
-		if errRead != nil {
-			t.Fatal(errRead)
-		}
-		if got := ojson.GetBytes(body, "request.contents.0.parts.0.text").String(); got != "hero!" {
-			t.Fatalf("attempt %d replacement missing or accumulated: %s", attempt, body)
-		}
 	}
 }
 

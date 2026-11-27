@@ -1463,45 +1463,19 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	selectionModel := authSelectionModelFromOptions(opts, routeModel)
-	selectionModelKey := canonicalModelKey(selectionModel)
-	routeModelKey := canonicalModelKey(routeModel)
-	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	registryRef := registry.GetGlobalRegistry()
-	now := time.Now()
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
-	if affinity, ok := m.selector.(*SessionAffinitySelector); ok && affinity != nil && affinity.rebindOnNever {
-		if boundAuthID, okBound := affinity.boundAuthForRequest([]string{"antigravity"}, selectionModel, opts); okBound {
-			if pinnedAuthID != "" && pinnedAuthID != boundAuthID {
-				m.mu.RUnlock()
-				return nil, nil
-			}
-			pinnedAuthID = boundAuthID
-		}
-	}
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || auth.RequiresSignIn ||
-			hasUnauthorizedAuthFailure(auth) || auth.credentialRetryAfter.After(now) || auth.nonAuthCredentialRetryAfter.After(now) {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
 			continue
 		}
-		if !eligibility.allows(auth) {
-			continue
-		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
 			continue
 		}
-		if selectionModelKey != "" && !m.authSupportsRouteModel(registryRef, auth, selectionModel) {
-			continue
-		}
-		if routeModelKey != "" && !sameCanonicalModelKey(routeModelKey, selectionModelKey) && !m.authSupportsRouteModel(registryRef, auth, routeModel) {
-			continue
-		}
-		targetModel := m.selectionModelKeyForAuth(auth, routeModel)
-		if !strings.Contains(strings.ToLower(strings.TrimSpace(targetModel)), "claude") {
+		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
@@ -1513,28 +1487,20 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			auth:        auth.Clone(),
 			executor:    executor,
 			provider:    providerKey,
-			targetModel: targetModel,
+			targetModel: m.selectionModelKeyForAuth(auth, routeModel),
 		})
 	}
 	m.mu.RUnlock()
 
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
-		if !antigravityCreditsAllowsCandidateModel(ctx, candidate.auth, routeModel, candidate.targetModel, opts, cfg, now) {
-			continue
-		}
-		hint, okHint, errHint := GetAntigravityCreditsHintForAuthRequired(ctx, candidate.auth)
+		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)
 		if errHint != nil {
 			return nil, antigravityCreditsKVUnavailableError(errHint)
 		}
 		if okHint && hint.Known {
 			if !hint.Available {
-				if IsAntigravityCreditsHintFresh(hint, now) {
-					continue
-				}
-				unknown = append(unknown, candidate)
 				continue
 			}
 			known = append(known, candidate)
@@ -1891,15 +1857,7 @@ func isAntigravityCreditsCapacity503(err error) bool {
 }
 
 func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, providers []string) bool {
-	if isRequestTerminatedError(lastErr) ||
-		isCredentialTerminatedError(lastErr) ||
-		isRequestStopError(lastErr) ||
-		isSchedulerRejectError(lastErr) ||
-		hasRoundEndedBySchedulerReject(lastErr) ||
-		isRequestInvalidError(lastErr) ||
-		IsTerminalAuthError(lastErr) ||
-		isTransientRateLimitError(lastErr) ||
-		isTOSViolationError(lastErr) {
+	if isRequestTerminatedError(lastErr) || isRequestStopError(lastErr) {
 		return false
 	}
 	status := statusCodeFromError(lastErr)
@@ -1916,24 +1874,16 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 		return false
 	}
 	switch status {
-	case http.StatusTooManyRequests:
-		retryAfter := retryAfterFromError(lastErr)
-		var cooldownErr *modelCooldownError
-		if errors.As(lastErr, &cooldownErr) && cooldownErr != nil {
-			// A modelCooldownError wrapped in trustedRetryAfterError exposes the live
-			// remaining cooldown rather than the original upstream retry hint; defer to
-			// any hint carried by the underlying cause so credits admission uses the
-			// stored upstream hint instead of mistaking final countdown minutes for a
-			// short transient rate limit.
-			retryAfter = retryAfterFromError(cooldownErr.Unwrap())
-		}
-		return isAntigravityCreditsQuota429(lastErr, retryAfter)
-	case http.StatusServiceUnavailable:
-		return isAntigravityCreditsCapacity503(lastErr)
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
 	case 0:
 		var authErr *Error
 		if errors.As(lastErr, &authErr) && authErr != nil {
 			return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
+		}
+		var cooldownErr *modelCooldownError
+		if errors.As(lastErr, &cooldownErr) {
+			return true
 		}
 		return false
 	default:
@@ -2128,7 +2078,11 @@ func (m *Manager) tryAntigravityCreditsExecuteCandidates(ctx context.Context, re
 				}
 				action, okAction := matchRequestScopedErrorAction(c.auth, errExec, m.requestScopedErrorConfig(creditsCtx))
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.MarkResult(creditsCtx, result)
+				if isExecutorAvailabilityNeutralError(errExec) {
+					m.recordAvailabilityNeutralResult(creditsCtx, result)
+				} else {
+					m.MarkResult(creditsCtx, result)
+				}
 				if isRequestTerminatedError(errExec) || isRequestStopError(errExec) || isTOSViolationError(errExec) || isTOSViolationResultError(result.Error) {
 					return cliproxyexecutor.Response{}, false, errExec
 				}

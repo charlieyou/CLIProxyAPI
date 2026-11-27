@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -72,6 +73,24 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	return BuildErrorResponseBodyWithError(status, errText, nil)
 }
 
+// BuildStreamErrorResponseBody is BuildErrorResponseBody for a terminal stream
+// error. An error that asks for its body verbatim (only Antigravity errors do,
+// as the fork's agy build forwarded upstream error JSON unchanged) keeps its
+// JSON text byte for byte; every other error is built as before.
+func BuildStreamErrorResponseBody(status int, errText string, err error) []byte {
+	if trimmed := strings.TrimSpace(errText); trimmed != "" && errorBodyIsVerbatim(err) && json.Valid([]byte(trimmed)) {
+		return []byte(trimmed)
+	}
+	return BuildErrorResponseBody(status, errText)
+}
+
+// errorBodyIsVerbatim reports whether err asks for its JSON error text to be
+// written unchanged instead of compacted.
+func errorBodyIsVerbatim(err error) bool {
+	var verbatim interface{ PreservesErrorBody() bool }
+	return err != nil && errors.As(err, &verbatim) && verbatim != nil && verbatim.PreservesErrorBody()
+}
+
 // BuildErrorResponseBodyWithError builds an OpenAI-compatible JSON error response body,
 // preserving structured classifications (such as terminal upstream auth failures and retryable flags)
 // present in err.
@@ -115,6 +134,9 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 	}
 
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
+		if errorBodyIsVerbatim(err) {
+			return []byte(trimmed)
+		}
 		var compact bytes.Buffer
 		if errCompact := json.Compact(&compact, []byte(trimmed)); errCompact == nil {
 			return compact.Bytes()

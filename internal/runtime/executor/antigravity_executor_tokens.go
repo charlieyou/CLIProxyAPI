@@ -1,232 +1,180 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
-	antigravitygemini "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/agythinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	log "github.com/sirupsen/logrus"
+	"github.com/tiktoken-go/tokenizer"
 )
 
-const antigravityCountTokensMaxResponseBytes = 1 << 20
+// SkipPrepareRequestAuthForCountTokens reports that AntigravityExecutor.CountTokens
+// computes token counts locally without making upstream HTTP requests, so expired
+// OAuth credentials are not refreshed just for countTokens.
+func (e *AntigravityExecutor) SkipPrepareRequestAuthForCountTokens() bool {
+	return true
+}
 
-// CountTokens counts tokens for the given request using the Antigravity API.
-func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if antigravityInTOSPause(e.cfg, auth) {
-		return cliproxyexecutor.Response{}, newAntigravityTOSPauseStatusErr()
-	}
+// CountTokens estimates token count locally for Antigravity requests without
+// calling any upstream endpoint, matching agy 1.5.14 which never sends
+// /v1internal:countTokens requests with the user's OAuth token.
+func (e *AntigravityExecutor) CountTokens(ctx context.Context, _ *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	suffix := agythinking.ParseSuffix(req.Model)
+	baseModel := suffix.ModelName
 
+	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("antigravity")
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
-	prepared, errPrepare := e.prepareAntigravityRequest(ctx, auth, req, opts, baseModel, false, true)
-	if errPrepare != nil {
-		return cliproxyexecutor.Response{}, errPrepare
-	}
-	auth = prepared.auth
-	cliproxyauth.NotifyAccessTokenFingerprint(ctx, auth)
-	if strings.TrimSpace(prepared.token) == "" {
-		return cliproxyexecutor.Response{}, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
-	}
 
-	req.Payload = prepared.originalPayload
-	selection := prepared.model
-	doc := ojson.NewDoc(prepared.translated)
-	if errThinking := helps.ApplyAntigravityRequestThinkingDoc(doc, req, opts, selection); errThinking != nil {
-		return cliproxyexecutor.Response{}, errThinking
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
 	}
-	e.obfuscateSensitiveWordsDoc(doc)
-	helps.PrepareAntigravityClaudeStructuredOutputDoc(selection.ID, doc)
-	antigravitygemini.NormalizeAntigravityRequestDoc(doc)
-	sanitizeAntigravityGeminiRequestSignaturesDoc(selection.ID, doc)
-	if _, errReplay := prepareAntigravityGeminiCountTokensReasoningReplayPayloadDoc(ctx, selection.ID, req, opts, doc); errReplay != nil {
-		return cliproxyexecutor.Response{}, errReplay
-	}
-	ensureAntigravityGeminiLeadingUserContentDoc(selection.ID, doc)
-
-	if selection.MaxOutputTokens > 0 {
-		_ = doc.Set("request.model", formatAntigravityCountTokensModel(selection.ID))
-		_, isClaudeModel := antigravitySchemaSanitizationFlags(selection.ID)
-		helps.CapAntigravityMaxOutputTokensDoc(doc, selection.MaxOutputTokens, isClaudeModel)
-	} else {
-		populateAntigravityCountTokensModelDoc(doc, baseModel)
-	}
-
-	_ = doc.Delete("project")
-	_ = doc.Delete("model")
-	_ = doc.Delete("request.safetySettings")
-	_ = doc.Delete("request.toolConfig")
-	_ = doc.Delete("request.labels")
-	_ = doc.Delete("request.sessionId")
-	_ = doc.Delete("request.stream")
-	sanitizeAntigravityRequestSchemasForModelIfNeededDoc(selection.ID, doc)
-	e.applyToolDescriptionReplacementsDoc(doc)
-
-	base := resolveAntigravityRequestBaseURL(auth)
-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-
-	var requestURL strings.Builder
-	requestURL.WriteString(base)
-	requestURL.WriteString(antigravityCountTokensPath)
-	if opts.Alt != "" {
-		requestURL.WriteString("?$alt=")
-		requestURL.WriteString(url.QueryEscape(opts.Alt))
-	}
-
-	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizerWithSourceModels(e.cfg, e.Identifier(), selection.ID, to.String(), "request", prepared.originalTranslated, req, opts, baseModel))
-	helps.FinalizePayloadDoc(ctx, doc)
-	payload := helps.SerializeAntigravityPayload(doc, false)
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(payload))
-	if errReq != nil {
-		return cliproxyexecutor.Response{}, errReq
-	}
-	// No httpReq.Close: keep the shared Antigravity connection pool usable.
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+prepared.token)
-	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
-	if host := resolveHost(base); host != "" {
-		httpReq.Host = host
-	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       requestURL.String(),
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      payload,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	cliproxyexecutor.MarkUpstreamAttempt(ctx)
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "count_tokens").Do(httpReq)
-	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return cliproxyexecutor.Response{}, errDo
-	}
-
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	bodyBytes, errRead := io.ReadAll(io.LimitReader(httpResp.Body, antigravityCountTokensMaxResponseBytes+1))
-	if errClose := httpResp.Body.Close(); errClose != nil {
-		log.Errorf("antigravity executor: close response body error: %v", errClose)
-	}
-	bodyTruncated := len(bodyBytes) > antigravityCountTokensMaxResponseBytes
-	if bodyTruncated {
-		bodyBytes = bodyBytes[:antigravityCountTokensMaxResponseBytes]
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, bodyBytes)
-	if errRead != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-		return cliproxyexecutor.Response{}, errRead
-	}
-
-	statusCode := httpResp.StatusCode
-	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
-		if bodyTruncated {
-			errOversize := statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("antigravity count_tokens response exceeded %d bytes", antigravityCountTokensMaxResponseBytes)}
-			helps.RecordAPIResponseError(ctx, e.cfg, errOversize)
-			return cliproxyexecutor.Response{}, errOversize
-		}
-		trimmedBody := bytes.TrimSpace(bodyBytes)
-		if len(trimmedBody) == 0 || trimmedBody[0] != '{' || !ojson.ValidBytes(bodyBytes) {
-			errInvalid := statusErr{code: http.StatusBadGateway, msg: "antigravity count_tokens response is not a valid JSON object"}
-			helps.RecordAPIResponseError(ctx, e.cfg, errInvalid)
-			return cliproxyexecutor.Response{}, errInvalid
-		}
-		if errorResult := ojson.GetBytesNoCopy(trimmedBody, "error"); errorResult.Exists() && errorResult.Type != ojson.Null {
-			statusCode = antigravityInBandErrorStatusCode(errorResult)
-		} else {
-			totalTokens := ojson.GetBytesNoCopy(trimmedBody, "totalTokens")
-			if !totalTokens.Exists() || totalTokens.Type != ojson.Number {
-				errMissing := statusErr{code: http.StatusBadGateway, msg: "antigravity count_tokens response missing numeric totalTokens"}
-				helps.RecordAPIResponseError(ctx, e.cfg, errMissing)
-				return cliproxyexecutor.Response{}, errMissing
-			}
-			parsedCount, errParse := strconv.ParseUint(totalTokens.Raw, 10, 63)
-			if errParse != nil {
-				errInvalidCount := statusErr{code: http.StatusBadGateway, msg: "antigravity count_tokens response has invalid totalTokens"}
-				helps.RecordAPIResponseError(ctx, e.cfg, errInvalidCount)
-				return cliproxyexecutor.Response{}, errInvalidCount
-			}
-			translated := sdktranslator.TranslateTokenCount(respCtx, to, responseFormat, int64(parsedCount), bodyBytes)
-			return cliproxyexecutor.Response{Payload: translated, Headers: httpResp.Header.Clone()}, nil
+	if from == sdktranslator.FormatGemini && !ojson.GetBytes(originalPayloadSource, "contents").Exists() {
+		if wrapped := ojson.GetBytes(originalPayloadSource, "generateContentRequest"); wrapped.IsObject() {
+			originalPayloadSource = []byte(wrapped.Raw)
 		}
 	}
+	originalPayloadSource, errValidate := validateAntigravityRequestSignatures(ctx, baseModel, from, originalPayloadSource)
+	if errValidate != nil {
+		return cliproxyexecutor.Response{}, errValidate
+	}
 
-	if statusCode == http.StatusTooManyRequests {
-		if err429 := e.applyAntigravity429StateWithEvictAll(ctx, auth, selection.ID, false, httpResp.Header, bodyBytes, true); err429 != nil {
-			return cliproxyexecutor.Response{}, err429
-		}
+	modelInfo, _ := cliproxyauth.ResolvedModelInfo(req)
+	translationReq := sdktranslator.RequestEnvelope{Format: from, Model: baseModel, Body: originalPayloadSource, ModelInfo: modelInfo}
+	payload := helps.TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, translationReq).Body
+
+	payload, err := helps.ApplyAgyRequestThinking(payload, req, opts, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
 	}
-	switch statusCode {
-	case http.StatusForbidden:
-		e.applyAntigravityForbiddenState(e.cfg, auth, bodyBytes)
-	case http.StatusUnauthorized:
-		closeAntigravityAuthIdleTransports(auth)
+
+	enc, err := helps.TokenizerForModel(baseModel)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("antigravity executor: tokenizer init failed: %w", err)
 	}
-	return cliproxyexecutor.Response{}, newAntigravityStatusErrWithHeaders(statusCode, httpResp.Header, bodyBytes)
+	count, err := countAntigravityRequestTokens(enc, payload)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("antigravity executor: token counting failed: %w", err)
+	}
+
+	rawJSON := []byte(fmt.Sprintf(`{"totalTokens":%d}`, count))
+	translated := sdktranslator.TranslateTokenCount(respCtx, to, responseFormat, count, rawJSON)
+	return cliproxyexecutor.Response{Payload: translated}, nil
 }
 
-// populateAntigravityCountTokensModelDoc sets request.model when absent or blank
-// so v1internal:countTokens receives the target tokenizer model after top-level
-// model is removed.
-func populateAntigravityCountTokensModelDoc(doc *ojson.Doc, baseModel string) {
-	if doc == nil {
-		return
+func countAntigravityRequestTokens(enc tokenizer.Codec, payload []byte) (int64, error) {
+	if enc == nil {
+		return 0, fmt.Errorf("encoder is nil")
 	}
-	if existing := doc.Get("request.model"); existing.Exists() && existing.Type == ojson.String && strings.TrimSpace(existing.String()) != "" {
-		return
+	if len(payload) == 0 {
+		return 0, nil
 	}
-	candidate := strings.TrimSpace(baseModel)
-	if candidate == "" {
-		if topModel := doc.Get("model"); topModel.Exists() && topModel.Type == ojson.String {
-			candidate = strings.TrimSpace(thinking.ParseSuffix(topModel.String()).ModelName)
+
+	root := ojson.ParseBytes(payload)
+	reqNode := root.Get("request")
+	if !reqNode.Exists() || !reqNode.IsObject() {
+		reqNode = root
+	}
+
+	segments := make([]string, 0, 32)
+	addText := func(s string) {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			segments = append(segments, trimmed)
 		}
 	}
-	formatted := formatAntigravityCountTokensModel(candidate)
-	if formatted == "" {
-		return
-	}
-	_ = doc.Set("request.model", formatted)
-}
 
-func formatAntigravityCountTokensModel(model string) string {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return ""
+	collectParts := func(parts ojson.Result) {
+		if !parts.IsArray() {
+			return
+		}
+		parts.ForEach(func(_, part ojson.Result) bool {
+			addText(part.Get("text").String())
+			if fc := part.Get("functionCall"); fc.Exists() {
+				addText(fc.Get("name").String())
+				if args := fc.Get("args"); args.Exists() {
+					addText(args.Raw)
+				}
+			} else if fcSnake := part.Get("function_call"); fcSnake.Exists() {
+				addText(fcSnake.Get("name").String())
+				if args := fcSnake.Get("args"); args.Exists() {
+					addText(args.Raw)
+				}
+			}
+			if fr := part.Get("functionResponse"); fr.Exists() {
+				addText(fr.Get("name").String())
+				if resp := fr.Get("response"); resp.Exists() {
+					addText(resp.Raw)
+				}
+			} else if frSnake := part.Get("function_response"); frSnake.Exists() {
+				addText(frSnake.Get("name").String())
+				if resp := frSnake.Get("response"); resp.Exists() {
+					addText(resp.Raw)
+				}
+			}
+			if inline := part.Get("inlineData"); inline.Exists() {
+				addText(inline.Get("mimeType").String())
+			} else if inlineSnake := part.Get("inline_data"); inlineSnake.Exists() {
+				addText(inlineSnake.Get("mime_type").String())
+			}
+			if fd := part.Get("fileData"); fd.Exists() {
+				addText(fd.Get("mimeType").String())
+				addText(fd.Get("fileUri").String())
+			} else if fdSnake := part.Get("file_data"); fdSnake.Exists() {
+				addText(fdSnake.Get("mime_type").String())
+				addText(fdSnake.Get("file_uri").String())
+			}
+			return true
+		})
 	}
-	if strings.HasPrefix(model, "models/") ||
-		strings.HasPrefix(model, "projects/") ||
-		strings.HasPrefix(model, "publishers/") {
-		return model
+
+	collectParts(reqNode.Get("systemInstruction.parts"))
+	collectParts(reqNode.Get("system_instruction.parts"))
+
+	if contents := reqNode.Get("contents"); contents.IsArray() {
+		contents.ForEach(func(_, content ojson.Result) bool {
+			addText(content.Get("role").String())
+			collectParts(content.Get("parts"))
+			return true
+		})
 	}
-	return "models/" + model
+
+	if tools := reqNode.Get("tools"); tools.IsArray() {
+		tools.ForEach(func(_, tool ojson.Result) bool {
+			for _, key := range []string{"functionDeclarations", "function_declarations"} {
+				decls := tool.Get(key)
+				if !decls.IsArray() {
+					continue
+				}
+				decls.ForEach(func(_, decl ojson.Result) bool {
+					addText(decl.Get("name").String())
+					addText(decl.Get("description").String())
+					for _, schemaKey := range []string{"parameters", "parametersJsonSchema", "parameters_json_schema"} {
+						if schema := decl.Get(schemaKey); schema.Exists() {
+							addText(schema.Raw)
+						}
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
+
+	joined := strings.Join(segments, "\n")
+	if joined == "" {
+		return 0, nil
+	}
+	count, err := enc.Count(joined)
+	if err != nil {
+		return 0, err
+	}
+	return int64(count), nil
 }

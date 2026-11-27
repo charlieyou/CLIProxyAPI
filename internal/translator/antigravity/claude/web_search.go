@@ -34,7 +34,7 @@ func isClaudeTypedWebSearchToolType(toolType string) bool {
 }
 
 func hasClaudeTypedWebSearchTool(payload []byte) bool {
-	tools := ojson.GetBytesNoCopy(payload, "tools")
+	tools := ojson.GetBytes(payload, "tools")
 	if !tools.IsArray() {
 		return false
 	}
@@ -47,7 +47,7 @@ func hasClaudeTypedWebSearchTool(payload []byte) bool {
 }
 
 func hasOnlyClaudeTypedWebSearchTools(payload []byte) bool {
-	tools := ojson.GetBytesNoCopy(payload, "tools")
+	tools := ojson.GetBytes(payload, "tools")
 	if !tools.IsArray() {
 		return false
 	}
@@ -63,7 +63,7 @@ func hasOnlyClaudeTypedWebSearchTools(payload []byte) bool {
 }
 
 func allowsClaudeWebSearchToolChoice(payload []byte) bool {
-	toolChoice := ojson.GetBytesNoCopy(payload, "tool_choice")
+	toolChoice := ojson.GetBytes(payload, "tool_choice")
 	if !toolChoice.Exists() {
 		return true
 	}
@@ -90,37 +90,33 @@ func allowsClaudeWebSearchToolChoice(payload []byte) bool {
 	}
 }
 
-func shouldBuildAntigravityWebSearchRequest(model string, payload []byte, supported *bool) bool {
-	if !hasOnlyClaudeTypedWebSearchTools(payload) || !allowsClaudeWebSearchToolChoice(payload) {
-		return false
-	}
-	if supported != nil {
-		return *supported
-	}
-	return antigravitySupportsNativeGoogleSearch(model)
+func shouldBuildAntigravityWebSearchRequest(model string, payload []byte) bool {
+	return antigravitySupportsNativeGoogleSearch(model) &&
+		hasOnlyClaudeTypedWebSearchTools(payload) &&
+		allowsClaudeWebSearchToolChoice(payload)
 }
 
 func buildAntigravityWebSearchRequest(model string, payload []byte) []byte {
 	query := extractClaudeWebSearchQuery(payload)
 	maxResultCount := extractClaudeWebSearchMaxUses(payload)
 	includedDomains := extractClaudeWebSearchAllowedDomains(payload)
-	outDoc := ojson.NewDocString(`{"model":"","requestType":"web_search","request":{"contents":[{"role":"user","parts":[{"text":""}]}],"systemInstruction":{"role":"user","parts":[{"text":""}]},"tools":[{"googleSearch":{"enhancedContent":{"imageSearch":{"maxResultCount":5}}}}],"generationConfig":{"candidateCount":1}}}`)
-	_ = outDoc.Set("model", model)
-	_ = outDoc.Set("request.contents.0.parts.0.text", query)
-	_ = outDoc.Set("request.systemInstruction.parts.0.text", antigravityWebSearchSystemInstruction)
-	_ = outDoc.Set("request.tools.0.googleSearch.enhancedContent.imageSearch.maxResultCount", maxResultCount)
+	out := []byte(`{"model":"","requestType":"web_search","request":{"contents":[{"role":"user","parts":[{"text":""}]}],"systemInstruction":{"role":"user","parts":[{"text":""}]},"tools":[{"googleSearch":{"enhancedContent":{"imageSearch":{"maxResultCount":5}}}}],"generationConfig":{"candidateCount":1}}}`)
+	out, _ = ojson.SetBytes(out, "model", model)
+	out, _ = ojson.SetBytes(out, "request.contents.0.parts.0.text", query)
+	out, _ = ojson.SetBytes(out, "request.systemInstruction.parts.0.text", antigravityWebSearchSystemInstruction)
+	out, _ = ojson.SetBytes(out, "request.tools.0.googleSearch.enhancedContent.imageSearch.maxResultCount", maxResultCount)
 	if len(includedDomains) > 0 {
 		if domainsJSON, err := json.Marshal(includedDomains); err == nil {
-			_ = outDoc.SetRawBytes("request.tools.0.googleSearch.includedDomains", domainsJSON)
+			out, _ = ojson.SetRawBytes(out, "request.tools.0.googleSearch.includedDomains", domainsJSON)
 		}
 	}
-	return outDoc.Bytes()
+	return out
 }
 
 func extractClaudeWebSearchMaxUses(payload []byte) int64 {
 	const defaultMaxResultCount int64 = 5
 
-	tools := ojson.GetBytesNoCopy(payload, "tools")
+	tools := ojson.GetBytes(payload, "tools")
 	if !tools.IsArray() {
 		return defaultMaxResultCount
 	}
@@ -137,7 +133,7 @@ func extractClaudeWebSearchMaxUses(payload []byte) int64 {
 }
 
 func extractClaudeWebSearchAllowedDomains(payload []byte) []string {
-	tools := ojson.GetBytesNoCopy(payload, "tools")
+	tools := ojson.GetBytes(payload, "tools")
 	if !tools.IsArray() {
 		return nil
 	}
@@ -164,7 +160,7 @@ func extractClaudeWebSearchAllowedDomains(payload []byte) []string {
 }
 
 func extractClaudeWebSearchQuery(payload []byte) string {
-	messages := ojson.GetBytesNoCopy(payload, "messages")
+	messages := ojson.GetBytes(payload, "messages")
 	if !messages.IsArray() {
 		return ""
 	}
@@ -201,7 +197,7 @@ func extractClaudeTextContent(content ojson.Result) string {
 }
 
 func hasAntigravityGoogleSearchTool(payload []byte) bool {
-	tools := ojson.GetBytesNoCopy(payload, "request.tools")
+	tools := ojson.GetBytes(payload, "request.tools")
 	if !tools.IsArray() {
 		return false
 	}
@@ -225,27 +221,6 @@ func antigravityGroundingMetadata(root ojson.Result) ojson.Result {
 	return root.Get("candidates.0.groundingMetadata")
 }
 
-func hasValidAntigravityWebGrounding(groundingMetadata ojson.Result) bool {
-	if !groundingMetadata.Exists() || !groundingMetadata.IsObject() {
-		return false
-	}
-	if queries := groundingMetadata.Get("webSearchQueries"); queries.IsArray() {
-		for _, q := range queries.Array() {
-			if q.Type == ojson.String && strings.TrimSpace(q.String()) != "" {
-				return true
-			}
-		}
-	}
-	if chunks := groundingMetadata.Get("groundingChunks"); chunks.IsArray() {
-		for _, c := range chunks.Array() {
-			if uri := c.Get("web.uri"); uri.Type == ojson.String && strings.TrimSpace(uri.String()) != "" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func antigravityTextContent(root ojson.Result) string {
 	var textBuilder strings.Builder
 	parts := root.Get("response.candidates.0.content.parts")
@@ -254,9 +229,6 @@ func antigravityTextContent(root ojson.Result) string {
 	}
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
-			if part.Get("thought").Bool() || part.Get("functionCall").Exists() {
-				continue
-			}
 			if text := part.Get("text"); text.Exists() {
 				textBuilder.WriteString(text.String())
 			}
@@ -285,24 +257,18 @@ func antigravityUsageTokens(root ojson.Result) (int64, int64) {
 }
 
 func webSearchQueryFromGrounding(groundingMetadata ojson.Result) string {
-	if queries := groundingMetadata.Get("webSearchQueries"); queries.IsArray() {
-		for _, q := range queries.Array() {
-			if q.Type == ojson.String {
-				if trimmed := strings.TrimSpace(q.String()); trimmed != "" {
-					return trimmed
-				}
-			}
-		}
+	if queries := groundingMetadata.Get("webSearchQueries"); queries.IsArray() && len(queries.Array()) > 0 {
+		return queries.Array()[0].String()
 	}
 	return ""
 }
 
 func webSearchResultsFromGrounding(groundingMetadata ojson.Result) []byte {
+	results := []byte(`[]`)
 	groundingChunks := groundingMetadata.Get("groundingChunks")
 	if !groundingChunks.IsArray() {
-		return []byte(`[]`)
+		return results
 	}
-	resultsDoc := ojson.NewDocString(`[]`)
 	seenURLs := make(map[string]struct{})
 	for _, chunk := range groundingChunks.Array() {
 		web := chunk.Get("web")
@@ -318,14 +284,14 @@ func webSearchResultsFromGrounding(groundingMetadata ojson.Result) []byte {
 		}
 		seenURLs[uri] = struct{}{}
 
-		resultDoc := ojson.NewDocString(`{"type":"web_search_result","page_age":null}`)
+		result := []byte(`{"type":"web_search_result","page_age":null}`)
 		if title := web.Get("title"); title.Exists() {
-			_ = resultDoc.Set("title", title.String())
+			result, _ = ojson.SetBytes(result, "title", title.String())
 		}
-		_ = resultDoc.Set("url", uri)
-		_ = resultsDoc.SetRawBytes("-1", resultDoc.Bytes())
+		result, _ = ojson.SetBytes(result, "url", uri)
+		results, _ = ojson.SetRawBytes(results, "-1", result)
 	}
-	return resultsDoc.Bytes()
+	return results
 }
 
 func parseWebSearchGroundingSupports(groundingMetadata ojson.Result) []webSearchGroundingSupport {
@@ -424,8 +390,6 @@ func buildWebSearchCitedTextBlocks(textContent string, supports []webSearchGroun
 				Text:      citedText,
 				Citations: []map[string]any{citation},
 			})
-		} else if citedText != "" {
-			blocks = append(blocks, webSearchCitedTextBlock{Text: citedText})
 		}
 		if support.EndIndex > lastEnd {
 			lastEnd = support.EndIndex
@@ -438,34 +402,34 @@ func buildWebSearchCitedTextBlocks(textContent string, supports []webSearchGroun
 }
 
 func buildClaudeWebSearchContent(toolUseID string, textContent string, groundingMetadata ojson.Result) []byte {
-	contentDoc := ojson.NewDocString(`[]`)
+	content := []byte(`[]`)
 
-	serverToolUseDoc := ojson.NewDocString(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
-	_ = serverToolUseDoc.Set("id", toolUseID)
+	serverToolUse := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
+	serverToolUse, _ = ojson.SetBytes(serverToolUse, "id", toolUseID)
 	if query := webSearchQueryFromGrounding(groundingMetadata); query != "" {
-		_ = serverToolUseDoc.Set("input.query", query)
+		serverToolUse, _ = ojson.SetBytes(serverToolUse, "input.query", query)
 	}
-	_ = contentDoc.SetRawBytes("-1", serverToolUseDoc.Bytes())
+	content, _ = ojson.SetRawBytes(content, "-1", serverToolUse)
 
-	webSearchToolResultDoc := ojson.NewDocString(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
-	_ = webSearchToolResultDoc.Set("tool_use_id", toolUseID)
-	_ = webSearchToolResultDoc.SetRawBytes("content", webSearchResultsFromGrounding(groundingMetadata))
-	_ = contentDoc.SetRawBytes("-1", webSearchToolResultDoc.Bytes())
+	webSearchToolResult := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
+	webSearchToolResult, _ = ojson.SetBytes(webSearchToolResult, "tool_use_id", toolUseID)
+	webSearchToolResult, _ = ojson.SetRawBytes(webSearchToolResult, "content", webSearchResultsFromGrounding(groundingMetadata))
+	content, _ = ojson.SetRawBytes(content, "-1", webSearchToolResult)
 
 	for _, block := range buildWebSearchCitedTextBlocks(textContent, parseWebSearchGroundingSupports(groundingMetadata)) {
 		if block.Text == "" {
 			continue
 		}
-		textBlockDoc := ojson.NewDocString(`{"type":"text","text":""}`)
-		_ = textBlockDoc.Set("text", block.Text)
+		textBlock := []byte(`{"type":"text","text":""}`)
+		textBlock, _ = ojson.SetBytes(textBlock, "text", block.Text)
 		if len(block.Citations) > 0 {
 			citationsJSON, _ := json.Marshal(block.Citations)
-			_ = textBlockDoc.SetRawBytes("citations", citationsJSON)
+			textBlock, _ = ojson.SetRawBytes(textBlock, "citations", citationsJSON)
 		}
-		_ = contentDoc.SetRawBytes("-1", textBlockDoc.Bytes())
+		content, _ = ojson.SetRawBytes(content, "-1", textBlock)
 	}
 
-	return contentDoc.Bytes()
+	return content
 }
 
 func appendClaudeWebSearchStreamBlocks(appendEvent func(string, string), startIndex int, toolUseID string, textContent string, groundingMetadata ojson.Result) int {

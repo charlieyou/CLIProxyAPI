@@ -1,34 +1,28 @@
 package claude
 
 import (
-	"context"
-
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/translator"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func init() {
 	translator.Register(
 		Claude,
 		Antigravity,
-		nil,
+		translateRequest(ConvertClaudeRequestToAntigravity),
 		interfaces.TranslateResponse{
 			Stream:     ConvertAntigravityResponseToClaude,
 			NonStream:  ConvertAntigravityResponseToClaudeNonStream,
 			TokenCount: ClaudeTokenCount,
 		},
 	)
-	sdktranslator.RegisterRequestEnvelope(sdktranslator.FormatClaude, sdktranslator.FormatAntigravity, convertClaudeRequestEnvelopeToAntigravity)
 }
 
-func convertClaudeRequestEnvelopeToAntigravity(ctx context.Context, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
-	var webSearch *bool
-	if req.ModelInfo != nil && req.ModelInfo.NativeCapabilities != nil {
-		webSearch = req.ModelInfo.NativeCapabilities.WebSearch
+// translateRequest adapts a body-only request converter to the registry's
+// RequestTransform, which also carries a request-scoped refusal error.
+func translateRequest(convert func(string, []byte, bool) []byte) interfaces.TranslateRequestFunc {
+	return func(modelName string, rawJSON []byte, stream bool) ([]byte, error) {
+		return convert(modelName, rawJSON, stream), nil
 	}
-	req.Body, req.Err = convertClaudeRequestToAntigravityWithWebSearchContext(cache.RequireSignatureCacheScope(ctx), req.Model, req.Body, req.Stream, webSearch)
-	return req
 }

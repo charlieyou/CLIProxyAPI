@@ -6,12 +6,40 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
+
+var (
+	antigravityGroundingMu      sync.Mutex
+	antigravityGroundingClients = make(map[string]http.RoundTripper)
+)
+
+func antigravityGroundingRoundTripper(proxyURL string) http.RoundTripper {
+	proxyURL = strings.TrimSpace(proxyURL)
+	antigravityGroundingMu.Lock()
+	defer antigravityGroundingMu.Unlock()
+	if rt, ok := antigravityGroundingClients[proxyURL]; ok && rt != nil {
+		return rt
+	}
+	if len(antigravityGroundingClients) >= 128 {
+		for _, rt := range antigravityGroundingClients {
+			if closer, ok := rt.(interface{ CloseIdleConnections() }); ok {
+				closer.CloseIdleConnections()
+			}
+		}
+		clear(antigravityGroundingClients)
+	}
+	rt := misc.NewAntigravityDualProtoRoundTripper(nil, proxyURL)
+	antigravityGroundingClients[proxyURL] = rt
+	return rt
+}
 
 func isAntigravityVertexSearchRedirect(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
@@ -28,6 +56,18 @@ func resolveAntigravityGroundingURL(ctx context.Context, cfg *config.Config, aut
 		return rawURL
 	}
 	client := NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	// Keep custom injected test round-trippers; upgrade real *http.Transport (or nil)
+	// to agy's uTLS ClientHello so vertexaisearch.cloud.google.com HEAD calls match.
+	if _, isHTTP := client.Transport.(*http.Transport); client.Transport == nil || isHTTP {
+		proxyURL := strings.TrimSpace(cliproxyexecutor.RequestProxyURL(ctx))
+		if proxyURL == "" && auth != nil {
+			proxyURL = strings.TrimSpace(auth.ProxyURL)
+		}
+		if proxyURL == "" && cfg != nil {
+			proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
+		client.Transport = antigravityGroundingRoundTripper(proxyURL)
+	}
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -66,30 +106,18 @@ func ResolveAntigravityGroundingURLs(ctx context.Context, cfg *config.Config, au
 	if len(payload) == 0 {
 		return payload
 	}
-	doc := ojson.NewDoc(payload)
-	if !ResolveAntigravityGroundingURLsDoc(ctx, cfg, auth, doc) {
-		return payload
-	}
-	return doc.Bytes()
-}
-
-// ResolveAntigravityGroundingURLsDoc replaces Vertex Search redirect URLs in grounding chunks in place on doc.
-func ResolveAntigravityGroundingURLsDoc(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, doc *ojson.Doc) bool {
-	if doc == nil || doc.Len() == 0 {
-		return false
-	}
 
 	basePath := "response.candidates.0.groundingMetadata.groundingChunks"
-	chunks := doc.Get(basePath)
+	chunks := ojson.GetBytes(payload, basePath)
 	if !chunks.IsArray() {
 		basePath = "candidates.0.groundingMetadata.groundingChunks"
-		chunks = doc.Get(basePath)
+		chunks = ojson.GetBytes(payload, basePath)
 	}
 	if !chunks.IsArray() {
-		return false
+		return payload
 	}
 
-	modified := false
+	output := payload
 	resolved := map[string]string{}
 	for i, chunk := range chunks.Array() {
 		uri := strings.TrimSpace(chunk.Get("web.uri").String())
@@ -104,11 +132,12 @@ func ResolveAntigravityGroundingURLsDoc(ctx context.Context, cfg *config.Config,
 		if resolvedURI == uri {
 			continue
 		}
-		if errSet := doc.Set(fmt.Sprintf("%s.%d.web.uri", basePath, i), resolvedURI); errSet != nil {
+		updated, errSet := ojson.SetBytes(output, fmt.Sprintf("%s.%d.web.uri", basePath, i), resolvedURI)
+		if errSet != nil {
 			log.WithError(errSet).Debug("antigravity grounding url: set resolved url failed")
 			continue
 		}
-		modified = true
+		output = updated
 	}
-	return modified
+	return output
 }

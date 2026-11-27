@@ -2,13 +2,10 @@ package executor
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"strconv"
+	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +15,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
@@ -44,21 +40,9 @@ func TestResolveAntigravityRequestBaseURL(t *testing.T) {
 	})
 }
 
-func TestAntigravityLoadCodeAssistBaseURL(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		auth *cliproxyauth.Auth
-		want string
-	}{
-		{"default daily", &cliproxyauth.Auth{}, antigravityBaseURLDaily},
-		{"custom attribute", &cliproxyauth.Auth{Attributes: map[string]string{"base_url": antigravityBaseURLProd + "/"}}, antigravityBaseURLProd},
-		{"custom metadata", &cliproxyauth.Auth{Metadata: map[string]any{"base_url": "https://enterprise.example.com/"}}, "https://enterprise.example.com"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := antigravityLoadCodeAssistBaseURL(tc.auth); got != tc.want {
-				t.Fatalf("loadCodeAssist base URL = %q, want %q", got, tc.want)
-			}
-		})
+func TestAntigravityLoadCodeAssistBaseURLUsesDailyByDefault(t *testing.T) {
+	if got := antigravityLoadCodeAssistBaseURL(&cliproxyauth.Auth{}); got != antigravityBaseURLDaily {
+		t.Fatalf("loadCodeAssist base URL = %q, want %q", got, antigravityBaseURLDaily)
 	}
 }
 
@@ -66,24 +50,44 @@ func TestAntigravityBuildRequest_SanitizesGeminiToolSchema(t *testing.T) {
 	body := buildRequestBodyFromPayload(t, "gemini-2.5-pro")
 
 	decl := extractFirstFunctionDeclaration(t, body)
-	if _, ok := decl["parametersJsonSchema"]; ok {
-		t.Fatalf("parametersJsonSchema should be renamed to parameters")
+	if _, ok := decl["parameters"]; ok {
+		t.Fatalf("Gemini models should emit parametersJsonSchema, not legacy parameters")
 	}
 
-	params, ok := decl["parameters"].(map[string]any)
+	params, ok := decl["parametersJsonSchema"].(map[string]any)
 	if !ok {
-		t.Fatalf("parameters missing or invalid type")
+		t.Fatalf("parametersJsonSchema missing or invalid type")
 	}
-	assertSchemaSanitizedAndPropertyPreserved(t, params)
+	if got, _ := params["type"].(string); got != "object" {
+		t.Fatalf("parametersJsonSchema.type = %q, want lowercase object", got)
+	}
+	// Gemini parametersJsonSchema mirrors agy 1.5.16's draft 2020-12 passthrough:
+	// patternProperties and property named "$id" are preserved verbatim.
+	if _, ok := params["patternProperties"]; !ok {
+		t.Fatalf("patternProperties should be preserved in Gemini parametersJsonSchema")
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing or invalid type")
+	}
+	if _, ok := props["$id"]; !ok {
+		t.Fatalf("property named $id should be preserved")
+	}
 }
 
 func TestAntigravityBuildRequest_SanitizesAntigravityToolSchema(t *testing.T) {
 	body := buildRequestBodyFromPayload(t, "claude-opus-4-6")
 
 	decl := extractFirstFunctionDeclaration(t, body)
+	if _, ok := decl["parametersJsonSchema"]; ok {
+		t.Fatalf("Claude models should rename parametersJsonSchema to legacy parameters")
+	}
 	params, ok := decl["parameters"].(map[string]any)
 	if !ok {
 		t.Fatalf("parameters missing or invalid type")
+	}
+	if got, _ := params["type"].(string); got != "OBJECT" {
+		t.Fatalf("Claude parameters.type = %q, want uppercase OBJECT", got)
 	}
 	assertSchemaSanitizedAndPropertyPreserved(t, params)
 }
@@ -183,7 +187,10 @@ func TestAntigravityBuildRequestUsesDerivedSessionIDAndPreservesExplicit(t *test
 	t.Parallel()
 
 	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
+	auth := &cliproxyauth.Auth{
+		ID:       "derived-session-test-" + time.Now().Format("150405.000000000"),
+		Metadata: map[string]any{"project_id": "project-1"},
+	}
 	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
 	req, err := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", payload, false, "", "https://example.com", "-123456789")
 	if err != nil {
@@ -194,8 +201,11 @@ func TestAntigravityBuildRequestUsesDerivedSessionIDAndPreservesExplicit(t *test
 	if !ok {
 		t.Fatalf("request missing or invalid: %v", body["request"])
 	}
-	if got := request["sessionId"]; got != "-123456789" {
-		t.Fatalf("request.sessionId = %v, want -123456789", got)
+	labels, _ := request["labels"].(map[string]any)
+	cascadeID, _ := labels["cascade_id"].(string)
+	wantSID := helps.AntigravityHashSessionID(cascadeID)
+	if got := request["sessionId"]; got != wantSID {
+		t.Fatalf("request.sessionId = %v, want FNV64a(cascade_id=%q) = %q", got, cascadeID, wantSID)
 	}
 
 	explicitPayload := []byte(`{"request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
@@ -208,8 +218,14 @@ func TestAntigravityBuildRequestUsesDerivedSessionIDAndPreservesExplicit(t *test
 	if !ok {
 		t.Fatalf("explicit request missing or invalid: %v", explicitBody["request"])
 	}
-	if got := explicitRequest["sessionId"]; got != "-987654321" {
-		t.Fatalf("explicit request.sessionId = %v, want -987654321", got)
+	explicitLabels, _ := explicitRequest["labels"].(map[string]any)
+	explicitCascade, _ := explicitLabels["cascade_id"].(string)
+	wantExplicitSID := helps.AntigravityHashSessionID(explicitCascade)
+	if got := explicitRequest["sessionId"]; got != wantExplicitSID {
+		t.Fatalf("explicit request.sessionId = %v, want FNV64a(cascade_id=%q) = %q", got, explicitCascade, wantExplicitSID)
+	}
+	if explicitCascade == cascadeID {
+		t.Fatalf("distinct explicit session keys should isolate distinct conversations: both got cascade_id=%q", cascadeID)
 	}
 }
 
@@ -243,15 +259,15 @@ func TestAntigravityBuildRequest_PreservesIndependentWebSearchRequestType(t *tes
 	if got, ok := body["requestType"].(string); !ok || got != "web_search" {
 		t.Fatalf("requestType should stay web_search, got=%v", body["requestType"])
 	}
-	if _, ok := body["requestId"]; ok {
-		t.Fatalf("web_search request should not add requestId: %v", body["requestId"])
+	if reqID, ok := body["requestId"].(string); !ok || !strings.HasPrefix(reqID, "web_search/") {
+		t.Fatalf("web_search request should carry web_search/ requestId, got=%v", body["requestId"])
 	}
 	request, ok := body["request"].(map[string]any)
 	if !ok {
 		t.Fatalf("request missing or invalid: %v", body["request"])
 	}
-	if _, ok := request["sessionId"]; ok {
-		t.Fatalf("web_search request should not add request.sessionId: %v", request["sessionId"])
+	if sid, ok := request["sessionId"].(string); !ok || sid == "" {
+		t.Fatalf("web_search request should carry sessionId, got=%v", request["sessionId"])
 	}
 	if got, ok := body["project"].(string); !ok || got != "project-1" {
 		t.Fatalf("project should come from auth metadata, got=%v", body["project"])
@@ -363,195 +379,8 @@ func TestAntigravityBuildRequest_RejectsMissingProjectID(t *testing.T) {
 	if !ok {
 		t.Fatalf("error should expose status code, got %T", err)
 	}
-	if got := status.StatusCode(); got != http.StatusServiceUnavailable {
-		t.Fatalf("status code = %d, want %d", got, http.StatusServiceUnavailable)
-	}
-	scoped, okScoped := err.(interface{ IsCredentialScoped() bool })
-	if !okScoped || !scoped.IsCredentialScoped() {
-		t.Fatalf("missing project_id error should be credential-scoped, got %T (%v)", err, err)
-	}
-}
-
-func TestAntigravityExecutor_Claude55ExplicitThinkingLevelPreserved(t *testing.T) {
-	sseResponse := "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"OK\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}}\n\n"
-	for _, model := range []string{"claude-sonnet-5-5-high", "claude-opus-5-5-high"} {
-		for _, tc := range []struct {
-			level string
-			want  string
-		}{
-			{level: "low", want: "LOW"},
-			{level: "medium", want: "MEDIUM"},
-			{level: "high", want: "HIGH"},
-		} {
-			level := tc.level
-			for _, stream := range []bool{false, true} {
-				modeName := "non_stream"
-				if stream {
-					modeName = "stream"
-				}
-				t.Run(model+"/"+level+"/"+modeName, func(t *testing.T) {
-					var capturedBody []byte
-					ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-						raw, errRead := io.ReadAll(req.Body)
-						if errRead != nil {
-							return nil, errRead
-						}
-						if errClose := req.Body.Close(); errClose != nil {
-							return nil, errClose
-						}
-						capturedBody = raw
-						return &http.Response{
-							StatusCode: http.StatusOK,
-							Header:     http.Header{"Content-Type": {"text/event-stream"}},
-							Body:       io.NopCloser(strings.NewReader(sseResponse)),
-							Request:    req,
-						}, nil
-					}))
-
-					executor := NewAntigravityExecutor(&config.Config{})
-					auth := &cliproxyauth.Auth{
-						ID:       "ag-claude-55-test",
-						Provider: "antigravity",
-						Metadata: map[string]any{
-							"access_token": "token",
-							"project_id":   "project-1",
-							"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
-						},
-					}
-					payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":128000,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"` + level + `"}}}`)
-					req := cliproxyexecutor.Request{Model: model, Payload: payload}
-					opts := cliproxyexecutor.Options{
-						SourceFormat:    sdktranslator.FormatGemini,
-						ResponseFormat:  sdktranslator.FormatGemini,
-						OriginalRequest: payload,
-						Stream:          stream,
-					}
-
-					if stream {
-						res, errStream := executor.ExecuteStream(ctx, auth, req, opts)
-						if errStream != nil {
-							t.Fatalf("ExecuteStream() error = %v", errStream)
-						}
-						for chunk := range res.Chunks {
-							if chunk.Err != nil {
-								t.Fatalf("stream chunk error = %v", chunk.Err)
-							}
-						}
-					} else {
-						if _, errExec := executor.Execute(ctx, auth, req, opts); errExec != nil {
-							t.Fatalf("Execute() error = %v", errExec)
-						}
-					}
-
-					if got := ojson.GetBytes(capturedBody, "request.generationConfig.thinkingConfig.thinkingLevel").String(); got != tc.want {
-						t.Fatalf("thinkingLevel = %q, want %q; body=%s", got, tc.want, capturedBody)
-					}
-					if budget := ojson.GetBytes(capturedBody, "request.generationConfig.thinkingConfig.thinkingBudget"); budget.Exists() {
-						t.Fatalf("thinkingBudget should be absent, got %s; body=%s", budget.Raw, capturedBody)
-					}
-					if include := ojson.GetBytes(capturedBody, "request.generationConfig.thinkingConfig.includeThoughts"); !include.Exists() || !include.Bool() {
-						t.Fatalf("includeThoughts = %s, want true; body=%s", include.Raw, capturedBody)
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestAntigravityExecutor_Gemini4EmitsUppercaseThinkingLevelAndRespectsPayloadOverride(t *testing.T) {
-	nonStreamResponse := `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`
-	sseResponse := "data: " + nonStreamResponse + "\n\n"
-
-	cases := []struct {
-		name     string
-		model    string
-		level    string
-		stream   bool
-		override string
-		want     string
-	}{
-		{name: "neon_xhigh_non_stream", model: "gemini-4-neon-xhigh", level: "xhigh", stream: false, want: "XHIGH"},
-		{name: "neon_xhigh_stream", model: "gemini-4-neon-xhigh", level: "xhigh", stream: true, want: "XHIGH"},
-		{name: "argon_high_non_stream", model: "gemini-4-argon-high", level: "high", stream: false, want: "HIGH"},
-		{name: "argon_high_stream", model: "gemini-4-argon-high", level: "high", stream: true, want: "HIGH"},
-		{name: "payload_override_wins_over_uppercase", model: "gemini-4-neon-xhigh", level: "xhigh", stream: false, override: "medium", want: "medium"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var capturedBody []byte
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				raw, errRead := io.ReadAll(req.Body)
-				if errRead != nil {
-					return nil, errRead
-				}
-				if errClose := req.Body.Close(); errClose != nil {
-					return nil, errClose
-				}
-				capturedBody = raw
-				contentType := "application/json"
-				bodyText := nonStreamResponse
-				if tc.stream {
-					contentType = "text/event-stream"
-					bodyText = sseResponse
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {contentType}},
-					Body:       io.NopCloser(strings.NewReader(bodyText)),
-					Request:    req,
-				}, nil
-			}))
-
-			cfg := &config.Config{}
-			if tc.override != "" {
-				cfg.Payload.Override = []config.PayloadRule{{
-					Models: []config.PayloadModelRule{{Name: "*"}},
-					Params: map[string]any{"generationConfig.thinkingConfig.thinkingLevel": tc.override},
-				}}
-			}
-			executor := NewAntigravityExecutor(cfg)
-			auth := &cliproxyauth.Auth{
-				ID:       "ag-gemini4-thinking-level-test",
-				Provider: "antigravity",
-				Metadata: map[string]any{
-					"access_token": "token",
-					"project_id":   "project-1",
-					"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
-				},
-			}
-			payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"` + tc.level + `"}}}`)
-			req := cliproxyexecutor.Request{Model: tc.model, Payload: payload}
-			opts := cliproxyexecutor.Options{
-				SourceFormat:    sdktranslator.FormatGemini,
-				ResponseFormat:  sdktranslator.FormatGemini,
-				OriginalRequest: payload,
-				Stream:          tc.stream,
-			}
-
-			if tc.stream {
-				res, errStream := executor.ExecuteStream(ctx, auth, req, opts)
-				if errStream != nil {
-					t.Fatalf("ExecuteStream() error = %v", errStream)
-				}
-				for chunk := range res.Chunks {
-					if chunk.Err != nil {
-						t.Fatalf("stream chunk error = %v", chunk.Err)
-					}
-				}
-			} else {
-				if _, errExec := executor.Execute(ctx, auth, req, opts); errExec != nil {
-					t.Fatalf("Execute() error = %v", errExec)
-				}
-			}
-
-			if got := ojson.GetBytes(capturedBody, "request.generationConfig.thinkingConfig.thinkingLevel").String(); got != tc.want {
-				t.Fatalf("thinkingLevel = %q, want %q; body=%s", got, tc.want, capturedBody)
-			}
-			if budget := ojson.GetBytes(capturedBody, "request.generationConfig.thinkingConfig.thinkingBudget"); budget.Exists() {
-				t.Fatalf("thinkingBudget should be absent, got %s; body=%s", budget.Raw, capturedBody)
-			}
-		})
+	if got := status.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
 	}
 }
 
@@ -680,9 +509,12 @@ func extractFirstFunctionDeclaration(t *testing.T, body map[string]any) map[stri
 	if !ok {
 		t.Fatalf("first tool invalid type")
 	}
-	decls, ok := tool["function_declarations"].([]any)
+	decls, ok := tool["functionDeclarations"].([]any)
 	if !ok || len(decls) == 0 {
-		t.Fatalf("function_declarations missing or empty")
+		decls, ok = tool["function_declarations"].([]any)
+	}
+	if !ok || len(decls) == 0 {
+		t.Fatalf("functionDeclarations missing or empty")
 	}
 	decl, ok := decls[0].(map[string]any)
 	if !ok {
@@ -742,1238 +574,1143 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	}
 }
 
-func assertSignedInt64RequestSessionID(t *testing.T, sessionID string) int64 {
-	t.Helper()
-	parsed, errParse := strconv.ParseInt(sessionID, 10, 64)
-	if errParse != nil || strconv.FormatInt(parsed, 10) != sessionID {
-		t.Fatalf("request.sessionId = %q, want canonical signed int64 decimal (err=%v)", sessionID, errParse)
+func TestAntigravityBuildRequest_MatchesAgyWireProfile(t *testing.T) {
+	executor := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "aicode-consumers"}}
+	payload := []byte(`{
+		"request": {
+			"systemInstruction": {"parts": [{"text": "You are helpful."}]},
+			"contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+			"generationConfig": {
+				"thinkingConfig": {"thinkingLevel": "xhigh"}
+			}
+		}
+	}`)
+
+	req, err := executor.buildRequest(context.Background(), auth, "tok-123", "gemini-4-neon", payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
 	}
-	return parsed
+	if req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse" {
+		t.Fatalf("URL = %q", req.URL.String())
+	}
+	if ua := req.Header.Get("User-Agent"); !strings.HasPrefix(ua, "antigravity/cli/") || !strings.Contains(ua, "aidev_client;") || !strings.Contains(ua, "datacollection_opt_in=false") {
+		t.Fatalf("User-Agent = %q", ua)
+	}
+	if req.ContentLength <= 0 || req.Body == nil {
+		t.Fatalf("stream request ContentLength = %d (Body=%v), want >0 fixed Content-Length (matching agy 1.5.16)", req.ContentLength, req.Body != nil)
+	}
+
+	rawBody, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		t.Fatalf("read body error: %v", errRead)
+	}
+	if int64(len(rawBody)) != req.ContentLength {
+		t.Fatalf("ContentLength = %d, want len(body) = %d", req.ContentLength, len(rawBody))
+	}
+	if !strings.Contains(string(rawBody), `, "`) {
+		t.Fatalf("expected agy 1.5.16 detrand ', ' spacing in wire body: %s", string(rawBody))
+	}
+	var body map[string]any
+	if errUnmarshal := json.Unmarshal(rawBody, &body); errUnmarshal != nil {
+		t.Fatalf("unmarshal body: %v", errUnmarshal)
+	}
+	if got := body["model"]; got != "gemini-4-neon-xhigh" {
+		t.Fatalf("model = %v, want gemini-4-neon-xhigh", got)
+	}
+	if got := body["project"]; got != "aicode-consumers" {
+		t.Fatalf("project = %v, want aicode-consumers", got)
+	}
+	if got := body["userAgent"]; got != "antigravity" {
+		t.Fatalf("userAgent = %v, want antigravity", got)
+	}
+	if got := body["requestType"]; got != "agent" {
+		t.Fatalf("requestType = %v, want agent", got)
+	}
+	reqID, _ := body["requestId"].(string)
+	if parts := strings.Split(reqID, "/"); len(parts) != 5 || parts[0] != "agent" || parts[4] != "1" {
+		t.Fatalf("requestId = %q, want agent/<cascade>/<ms>/<trajectory>/1", reqID)
+	}
+
+	inner, ok := body["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("request missing: %v", body)
+	}
+	sys, _ := inner["systemInstruction"].(map[string]any)
+	if sys["role"] != "user" {
+		t.Fatalf("systemInstruction.role = %v, want user", sys["role"])
+	}
+	genCfg, _ := inner["generationConfig"].(map[string]any)
+	if maxOut, _ := genCfg["maxOutputTokens"].(float64); int(maxOut) != 262144 {
+		t.Fatalf("maxOutputTokens = %v, want 262144", genCfg["maxOutputTokens"])
+	}
+	tc, _ := genCfg["thinkingConfig"].(map[string]any)
+	if tl, _ := tc["thinkingLevel"].(float64); int(tl) != 7 {
+		t.Fatalf("thinkingLevel = %#v, want 7", tc["thinkingLevel"])
+	}
+	if inc, _ := tc["includeThoughts"].(bool); !inc {
+		t.Fatalf("includeThoughts = %v, want true", tc["includeThoughts"])
+	}
+	labels, _ := inner["labels"].(map[string]any)
+	if labels["model_enum"] != "MODEL_PLACEHOLDER_M535" {
+		t.Fatalf("labels.model_enum = %v, want MODEL_PLACEHOLDER_M535", labels["model_enum"])
+	}
+	if labels["used_claude"] != "false" || labels["used_non_gemini_model"] != "false" {
+		t.Fatalf("unexpected model flags in labels: %v", labels)
+	}
+	if labels["cascade_id"] == "" || labels["trajectory_id"] == "" || labels["cascade_id"] != labels["root_cascade_id"] {
+		t.Fatalf("unexpected trajectory labels: %v", labels)
+	}
 }
 
-func TestAntigravityExecutorSynthesizedSessionIDScopedPerCredential(t *testing.T) {
-	t.Parallel()
-
+func TestAntigravityBuildRequest_NormalizesSystemRoleSessionIDLabelsAltAndStream(t *testing.T) {
 	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Metadata: map[string]any{"project_id": "aicode-consumers"},
+	}
+	payload := []byte(`{
+		"request": {
+			"stream": true,
+			"sessionId": "non-numeric-client-session",
+			"systemInstruction": {"role": "system", "parts": [{"text": "sys"}]},
+			"labels": {"custom_leak": "should-be-dropped"},
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+		}
+	}`)
 
-	captureSessionID := func(t *testing.T, authID, kind, model, userText string, metadata map[string]any) string {
-		t.Helper()
-		var capturedBody []byte
-		ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			var errRead error
-			capturedBody, errRead = io.ReadAll(req.Body)
-			if errRead != nil {
-				return nil, errRead
-			}
-			return &http.Response{
-				StatusCode: http.StatusBadRequest,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"captured"}}`)),
-			}, nil
-		}))
-		auth := &cliproxyauth.Auth{
-			ID: authID,
-			Metadata: map[string]any{
-				"access_token": "token",
-				"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-				"project_id":   "project-1",
-			},
+	req, trajectoryID, err := executor.buildRequestWithTrajectory(context.Background(), auth, "tok-123", "gemini-4-neon-high", payload, true, "json", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequestWithTrajectory error: %v", err)
+	}
+	if req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse" {
+		t.Fatalf("URL = %q, want ?alt=sse regardless of opts.Alt", req.URL.String())
+	}
+	if trajectoryID == "" {
+		t.Fatal("expected non-empty trajectoryID")
+	}
+
+	body := requestBody(t, req)
+	inner, _ := body["request"].(map[string]any)
+	if _, hasStream := inner["stream"]; hasStream {
+		t.Fatalf("request.stream should be removed: %v", inner)
+	}
+	sys, _ := inner["systemInstruction"].(map[string]any)
+	if sys["role"] != "user" {
+		t.Fatalf("systemInstruction.role = %v, want user (forced over system)", sys["role"])
+	}
+	sessionID, _ := inner["sessionId"].(string)
+	if sessionID == "non-numeric-client-session" {
+		t.Fatalf("non-int64 sessionId was not hashed: %q", sessionID)
+	}
+	labels, _ := inner["labels"].(map[string]any)
+	if _, leaked := labels["custom_leak"]; leaked {
+		t.Fatalf("arbitrary client label leaked into request.labels: %v", labels)
+	}
+	if labels["trajectory_id"] != trajectoryID {
+		t.Fatalf("labels.trajectory_id = %v, want %q", labels["trajectory_id"], trajectoryID)
+	}
+}
+
+func TestAntigravityBuildRequest_PreservesExplicitClaudeToolConfigMode(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Metadata: map[string]any{"project_id": "aicode-consumers"},
+	}
+	explicitPayload := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"tools": [{"functionDeclarations": [{"name": "ping", "parameters": {"type": "object"}}]}],
+			"toolConfig": {"functionCallingConfig": {"mode": "NONE"}}
 		}
-		req := cliproxyexecutor.Request{
-			Model:   model,
-			Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"` + userText + `"}]}]}`),
+	}`)
+	req, err := executor.buildRequest(context.Background(), auth, "tok", "claude-sonnet-5-5-medium", explicitPayload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+	body := requestBody(t, req)
+	inner, _ := body["request"].(map[string]any)
+	tc, _ := inner["toolConfig"].(map[string]any)
+	fcc, _ := tc["functionCallingConfig"].(map[string]any)
+	if fcc["mode"] != "NONE" {
+		t.Fatalf("explicit Claude toolConfig mode = %v, want NONE", fcc["mode"])
+	}
+
+	unsetPayload := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"tools": [{"functionDeclarations": [{"name": "ping", "parameters": {"type": "object"}}]}]
 		}
-		opts := cliproxyexecutor.Options{
+	}`)
+	req2, err2 := executor.buildRequest(context.Background(), auth, "tok", "claude-sonnet-5-5-medium", unsetPayload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err2 != nil {
+		t.Fatalf("buildRequest error: %v", err2)
+	}
+	body2 := requestBody(t, req2)
+	inner2, _ := body2["request"].(map[string]any)
+	if _, hasTC := inner2["toolConfig"]; hasTC {
+		t.Fatalf("unset Claude toolConfig should be omitted like agy, got %v", inner2["toolConfig"])
+	}
+}
+
+func TestAntigravityWriteTrajectoryAclsOncePerTrajectory(t *testing.T) {
+	resetAntigravityTrajectoryACLCacheForTest()
+	helps.ResetAntigravityWireStateForTest()
+	origPredicate := antigravityShouldWriteTrajectoryACL
+	antigravityShouldWriteTrajectoryACL = func(string) bool { return true }
+	t.Cleanup(func() {
+		antigravityShouldWriteTrajectoryACL = origPredicate
+		resetAntigravityTrajectoryACLCacheForTest()
+		helps.ResetAntigravityWireStateForTest()
+	})
+
+	var aclCalls []string
+	var aclUA string
+	var streamBodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case antigravityWriteTrajectoryAclsPath:
+			aclUA = r.Header.Get("User-Agent")
+			aclCalls = append(aclCalls, string(body))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+		case antigravityStreamPath:
+			streamBodies = append(streamBodies, string(body))
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}}\n\n"))
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	auth := &cliproxyauth.Auth{
+		ID:         "acl-test-auth",
+		Provider:   "antigravity",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata: map[string]any{
+			"access_token": "tok-acl",
+			"project_id":   "aicode-consumers",
+			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+
+	turn1 := []byte(`{"contents":[{"role":"user","parts":[{"text":"same-conversation"}]}]}`)
+	turn2 := []byte(`{"contents":[{"role":"user","parts":[{"text":"same-conversation"}]},{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"read_file","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"read_file","response":{"output":"42"}}}]}]}`)
+	for turn, payload := range [][]byte{turn1, turn2} {
+		if _, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "gemini-4-neon-high",
+			Payload: payload,
+		}, cliproxyexecutor.Options{
 			SourceFormat:   sdktranslator.FormatGemini,
 			ResponseFormat: sdktranslator.FormatGemini,
-			Metadata:       metadata,
+		}); err != nil {
+			t.Fatalf("turn %d Execute() error = %v", turn, err)
 		}
-		switch kind {
-		case "execute":
-			_, _ = executor.Execute(ctx, auth, req, opts)
-		case "stream":
-			_, _ = executor.ExecuteStream(ctx, auth, req, opts)
-		default:
-			t.Fatalf("unknown route kind %q", kind)
-		}
-		if len(capturedBody) == 0 {
-			t.Fatalf("expected upstream request body to be captured for auth=%s kind=%s model=%s", authID, kind, model)
-		}
-		sessionID := ojson.GetBytes(capturedBody, "request.sessionId").String()
-		assertSignedInt64RequestSessionID(t, sessionID)
-		return sessionID
 	}
 
-	t.Run("canonical session stays stable across models and turns on same credential and rotates on failover", func(t *testing.T) {
-		meta := map[string]any{
-			cliproxyexecutor.CanonicalSessionIDMetadataKey: "claude:sess-7706",
-		}
-		authAGemini := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", "first turn text", meta)
-		authAClaude := captureSessionID(t, "auth-a", "execute", "claude-sonnet-4-6", "different compacted turn text", meta)
-		authAStream := captureSessionID(t, "auth-a", "stream", "gemini-3.7-flash-high", "stream turn text", meta)
-		if authAGemini != authAClaude || authAGemini != authAStream {
-			t.Fatalf("same credential + canonical session produced unstable request.sessionId: gemini=%q claude=%q stream=%q", authAGemini, authAClaude, authAStream)
-		}
+	if len(streamBodies) != 2 {
+		t.Fatalf("streamCalls = %d, want 2", len(streamBodies))
+	}
+	if len(aclCalls) != 1 {
+		t.Fatalf("writeTrajectoryAcls calls = %d (%v), want 1 (deduplicated per trajectory)", len(aclCalls), aclCalls)
+	}
+	if !strings.HasPrefix(aclUA, "antigravity/cli/") {
+		t.Fatalf("writeTrajectoryAcls User-Agent = %q, want antigravity/cli/...", aclUA)
+	}
+	if !strings.Contains(aclCalls[0], `"trajectoryId":"`) {
+		t.Fatalf("writeTrajectoryAcls body = %q, want trajectoryId JSON", aclCalls[0])
+	}
 
-		authBGemini := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", "first turn text", meta)
-		authBClaude := captureSessionID(t, "auth-b", "execute", "claude-sonnet-4-6", "first turn text", meta)
-		authBStream := captureSessionID(t, "auth-b", "stream", "gemini-3.6-flash-high", "first turn text", meta)
-		if authBGemini == authAGemini {
-			t.Fatalf("failover credential auth-b reused auth-a request.sessionId %q", authBGemini)
-		}
-		if authBGemini != authBClaude || authBGemini != authBStream {
-			t.Fatalf("failover credential auth-b produced unstable request.sessionId across paths: gemini=%q claude=%q stream=%q", authBGemini, authBClaude, authBStream)
-		}
-	})
-
-	t.Run("derived session rotates across credential failover", func(t *testing.T) {
-		meta := map[string]any{
-			cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-7706",
-		}
-		authAFirst := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", "prompt", meta)
-		authASecond := captureSessionID(t, "auth-a", "stream", "claude-sonnet-4-6", "different prompt", meta)
-		if authAFirst != authASecond {
-			t.Fatalf("same credential + derived session changed: first=%q second=%q", authAFirst, authASecond)
-		}
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", "prompt", meta)
-		if authB == authAFirst {
-			t.Fatalf("failover credential auth-b reused auth-a derived request.sessionId %q", authB)
-		}
-	})
-
-	t.Run("content fallback rotates across credential failover", func(t *testing.T) {
-		authAFirst := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", "shared first prompt", nil)
-		authASecond := captureSessionID(t, "auth-a", "stream", "gemini-3.7-flash-high", "shared first prompt", nil)
-		if authAFirst != authASecond {
-			t.Fatalf("same credential + content fallback changed: first=%q second=%q", authAFirst, authASecond)
-		}
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", "shared first prompt", nil)
-		if authB == authAFirst {
-			t.Fatalf("failover credential auth-b reused auth-a content-fallback request.sessionId %q", authB)
-		}
-	})
+	// Verify Turn 2 after tool call has exact agy step_index ("2", "<tid>-1", tail "3")
+	// and shares the same UUIDv4 cascade_id / trajectory_id as Turn 1.
+	var b1, b2 map[string]any
+	_ = json.Unmarshal([]byte(streamBodies[0]), &b1)
+	_ = json.Unmarshal([]byte(streamBodies[1]), &b2)
+	l1 := b1["request"].(map[string]any)["labels"].(map[string]any)
+	l2 := b2["request"].(map[string]any)["labels"].(map[string]any)
+	if l1["trajectory_id"] != l2["trajectory_id"] || l1["cascade_id"] != l2["cascade_id"] {
+		t.Fatalf("Turn 2 trajectory/cascade changed: turn1=%v turn2=%v", l1, l2)
+	}
+	if l2["last_step_index"] != "2" {
+		t.Fatalf("Turn 2 tool last_step_index = %v, want 2", l2["last_step_index"])
+	}
+	wantReqLabel := l2["trajectory_id"].(string) + "-1"
+	if l2["request_id"] != wantReqLabel {
+		t.Fatalf("Turn 2 tool labels.request_id = %v, want %q", l2["request_id"], wantReqLabel)
+	}
+	reqID2, _ := b2["requestId"].(string)
+	if parts := strings.Split(reqID2, "/"); len(parts) != 5 || parts[4] != "3" {
+		t.Fatalf("Turn 2 tool requestId = %q, want tail 3", reqID2)
+	}
 }
 
-func TestAntigravityExecutorIncomingSessionIDScopedPerCredentialAndSubagent(t *testing.T) {
-	t.Parallel()
+func TestAntigravityBuildRequestStripsSamplingParamsAndDefaultToolConfig(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
 
 	executor := NewAntigravityExecutor(&config.Config{})
-
-	captureSessionID := func(t *testing.T, authID, kind, model string, sourceFormat sdktranslator.Format, payload []byte, enrich bool, metadata map[string]any) string {
-		t.Helper()
-		var capturedBody []byte
-		ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			var errRead error
-			capturedBody, errRead = io.ReadAll(req.Body)
-			if errRead != nil {
-				return nil, errRead
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "aicode-consumers"}}
+	payload := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"systemInstruction": {"parts": [{"text": "sys"}]},
+			"toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+			"generationConfig": {
+				"temperature": 0.7,
+				"topP": 0.9,
+				"topK": 40,
+				"stopSequences": ["STOP"],
+				"candidateCount": 1,
+				"thinkingConfig": {"thinkingLevel": "high"}
 			}
+		}
+	}`)
+	req, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon", payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+	rawBytes, _ := io.ReadAll(req.Body)
+	raw := string(rawBytes)
+	var body map[string]any
+	_ = json.Unmarshal(rawBytes, &body)
+	inner := body["request"].(map[string]any)
+	if _, hasTC := inner["toolConfig"]; hasTC {
+		t.Fatalf("default AUTO toolConfig should be stripped: %s", raw)
+	}
+	gen := inner["generationConfig"].(map[string]any)
+	for _, forbidden := range []string{"temperature", "topP", "topK", "stopSequences", "candidateCount"} {
+		if _, exists := gen[forbidden]; exists {
+			t.Fatalf("non-agy generationConfig.%s leaked: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestAntigravityBuildRequestNormalizesSnakeToolConfigAndPreservesSiblings(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "tool-cfg-test", Metadata: map[string]any{"project_id": "aicode-consumers"}}
+
+	// 1. snake_case tool_config with allowed_function_names must be preserved (camelCase)
+	p1 := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"tool_config": {"function_calling_config": {"mode": "AUTO", "allowed_function_names": ["read_file"]}}
+		}
+	}`)
+	req1, err1 := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon", p1, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err1 != nil {
+		t.Fatalf("buildRequest(p1) error: %v", err1)
+	}
+	b1 := requestBody(t, req1)
+	inner1 := b1["request"].(map[string]any)
+	if _, hasSnake := inner1["tool_config"]; hasSnake {
+		t.Fatalf("snake_case tool_config should be canonicalized: %v", inner1)
+	}
+	tc1, _ := inner1["toolConfig"].(map[string]any)
+	fcc1, _ := tc1["functionCallingConfig"].(map[string]any)
+	allowed1, _ := fcc1["allowedFunctionNames"].([]any)
+	if len(allowed1) != 1 || allowed1[0] != "read_file" {
+		t.Fatalf("allowedFunctionNames = %v, want [read_file]", allowed1)
+	}
+
+	// 2. AUTO functionCallingConfig with sibling retrievalConfig strips only functionCallingConfig
+	p2 := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"toolConfig": {"functionCallingConfig": {"mode": "AUTO"}, "retrievalConfig": {"latLng": {"latitude": 1}}}
+		}
+	}`)
+	req2, err2 := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon", p2, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err2 != nil {
+		t.Fatalf("buildRequest(p2) error: %v", err2)
+	}
+	b2 := requestBody(t, req2)
+	tc2, _ := b2["request"].(map[string]any)["toolConfig"].(map[string]any)
+	if _, hasFCC := tc2["functionCallingConfig"]; hasFCC {
+		t.Fatalf("no-op AUTO functionCallingConfig should be deleted: %v", tc2)
+	}
+	if _, hasRC := tc2["retrievalConfig"]; !hasRC {
+		t.Fatalf("sibling retrievalConfig must be preserved: %v", tc2)
+	}
+}
+
+func TestAntigravityAICodeMendelRoutingAndFallbackToCCPA(t *testing.T) {
+	t.Setenv("USE_AICODE", "")
+	resetAntigravityTrajectoryACLCacheForTest()
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(func() {
+		resetAntigravityTrajectoryACLCacheForTest()
+		helps.ResetAntigravityWireStateForTest()
+	})
+
+	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	auth := &cliproxyauth.Auth{
+		ID:       "aicode-routing-auth",
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"access_token": "tok-aicode",
+			"project_id":   "aicode-consumers",
+			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	mendelOn := true
+	helps.UpdateAntigravityAccountState(antigravityTransportScope(auth), "g1-ultra-tier", "US", nil, &mendelOn)
+
+	// 0. Default consumer behavior matches agy 1.5.16: even when Mendel has
+	// use-aicode-mendel=true, inference stays on daily-cloudcode-pa unless USE_AICODE=true.
+	if _, use := helps.ShouldUseAntigravityAICode(antigravityTransportScope(auth)); use {
+		t.Fatal("ShouldUseAntigravityAICode() = true with USE_AICODE unset, want false to match agy 1.5.16 consumer default")
+	}
+
+	// 1. Explicit USE_AICODE=true success path: routes to aicode.googleapis.com and wraps unwrapped SSE response.
+	t.Setenv("USE_AICODE", "true")
+	var hitURLs []string
+	var aicodeBody string
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		hitURLs = append(hitURLs, req.URL.String())
+		body, _ := io.ReadAll(req.Body)
+		if req.URL.Host == "aicode.googleapis.com" {
+			if req.ContentLength != int64(len(body)) || req.ContentLength <= 0 || len(req.TransferEncoding) != 0 {
+				t.Fatalf("AICode framing = ContentLength=%d len=%d TE=%v, want fixed Content-Length", req.ContentLength, len(body), req.TransferEncoding)
+			}
+			aicodeBody = string(body)
 			return &http.Response{
-				StatusCode: http.StatusBadRequest,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"captured"}}`)),
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"from-aicode\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3,\"totalTokenCount\":5}}\n\n")),
 			}, nil
-		}))
-		auth := &cliproxyauth.Auth{
-			ID: authID,
-			Metadata: map[string]any{
-				"access_token": "token",
-				"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-				"project_id":   "project-1",
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+
+	payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	resp, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gemini-4-neon-high",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+	})
+	if err != nil {
+		t.Fatalf("Execute(AICode) error = %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "from-aicode") {
+		t.Fatalf("unexpected AICode response payload: %s", resp.Payload)
+	}
+	if !strings.Contains(aicodeBody, `"userTier":"g1-ultra-tier"`) || !strings.Contains(aicodeBody, `"model":"gemini-4-neon-high"`) || strings.Contains(aicodeBody, `"aicode":`) {
+		t.Fatalf("unexpected AICode request payload: %s", aicodeBody)
+	}
+
+	// 2. Fallback path: AICode 403 triggers cooldown and immediate CCPA fallback.
+	var fallbackURLs []string
+	ctxFallback := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		fallbackURLs = append(fallbackURLs, req.URL.String())
+		if req.URL.Host == "aicode.googleapis.com" {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":403}}`)),
+			}, nil
+		}
+		if req.URL.Path == antigravityStreamPath {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"from-ccpa\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3,\"totalTokenCount\":5}}}\n\n")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+	resp2, err2 := exec.Execute(ctxFallback, auth, cliproxyexecutor.Request{
+		Model:   "gemini-4-neon-high",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+	})
+	if err2 != nil {
+		t.Fatalf("Execute(AICode fallback) error = %v", err2)
+	}
+	if !strings.Contains(string(resp2.Payload), "from-ccpa") {
+		t.Fatalf("expected CCPA fallback payload, got: %s", resp2.Payload)
+	}
+	if len(fallbackURLs) < 3 ||
+		!strings.Contains(fallbackURLs[0], "aicode.googleapis.com") ||
+		!strings.Contains(fallbackURLs[1], "writeTrajectoryAcls") ||
+		!strings.Contains(fallbackURLs[len(fallbackURLs)-1], "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent") {
+		t.Fatalf("expected aicode -> writeTrajectoryAcls -> daily-cloudcode-pa fallback sequence, got %v", fallbackURLs)
+	}
+
+	// 3. Post-cooldown request skips aicode.googleapis.com completely.
+	var cooldownURLs []string
+	ctxCooldown := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		cooldownURLs = append(cooldownURLs, req.URL.String())
+		if req.URL.Host == "aicode.googleapis.com" {
+			t.Fatal("aicode.googleapis.com must be skipped during cooldown")
+		}
+		if req.URL.Path == antigravityStreamPath {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"cooldown-ccpa\"}]},\"finishReason\":\"STOP\"}]}}\n\n")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+	if _, err3 := exec.Execute(ctxCooldown, auth, cliproxyexecutor.Request{
+		Model:   "gemini-4-neon-high",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+	}); err3 != nil {
+		t.Fatalf("Execute(post-cooldown) error = %v", err3)
+	}
+
+	// 4. Credits-fallback request skips AICode even when Mendel is active (enabledCreditTypes is CCPA-only).
+	helps.ResetAntigravityWireStateForTest()
+	helps.UpdateAntigravityAccountState(antigravityTransportScope(auth), "g1-ultra-tier", "US", nil, &mendelOn)
+	execCredits := NewAntigravityExecutor(&config.Config{
+		RequestRetry:  1,
+		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
+	})
+	var creditsBody string
+	ctxCredits := cliproxyauth.WithAntigravityCredits(context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "aicode.googleapis.com" {
+			t.Fatal("credits fallback request must not route to aicode.googleapis.com")
+		}
+		if req.URL.Path == antigravityStreamPath {
+			b, _ := io.ReadAll(req.Body)
+			creditsBody = string(b)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"credits-ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	})))
+	if _, err4 := execCredits.Execute(ctxCredits, auth, cliproxyexecutor.Request{
+		Model:   "gemini-4-neon-high",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+	}); err4 != nil {
+		t.Fatalf("Execute(credits) error = %v", err4)
+	}
+	if !strings.Contains(creditsBody, `"enabledCreditTypes":["GOOGLE_ONE_AI"]`) {
+		t.Fatalf("expected enabledCreditTypes in CCPA credits fallback body, got: %s", creditsBody)
+	}
+}
+
+func TestAntigravityWriteTrajectoryAclsRespectsCanceledContext(t *testing.T) {
+	resetAntigravityTrajectoryACLCacheForTest()
+	origPredicate := antigravityShouldWriteTrajectoryACL
+	antigravityShouldWriteTrajectoryACL = func(string) bool { return true }
+	t.Cleanup(func() {
+		antigravityShouldWriteTrajectoryACL = origPredicate
+		resetAntigravityTrajectoryACLCacheForTest()
+	})
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exec := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "acl-cancel-auth", Provider: "antigravity"}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := exec.ensureAntigravityTrajectoryACL(canceledCtx, server.Client(), auth, "tok", server.URL, "traj-cancel-1"); err == nil {
+		t.Fatal("expected context.Canceled error for pre-canceled context")
+	}
+	if calls != 0 {
+		t.Fatalf("writeTrajectoryAcls sent %d HTTP requests on canceled ctx, want 0", calls)
+	}
+}
+
+func TestAntigravityConvertStreamToNonStreamPreservesSignaturesAndGrounding(t *testing.T) {
+	exec := NewAntigravityExecutor(&config.Config{})
+	stream := strings.Join([]string{
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"think1","thought":true,"thoughtSignature":"sig-t1"}]}}],"modelVersion":"gemini-4-neon-high","responseId":"resp-1"},"traceId":"trace-1"}`,
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"think2","thought":true,"thoughtSignature":"sig-t2"}]}}],"modelVersion":"gemini-4-neon-high","responseId":"resp-1"},"traceId":"trace-1"}`,
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"visible answer","thoughtSignature":"sig-text"}]},"groundingMetadata":{"webSearchQueries":["antigravity"],"groundingChunks":[{"web":{"uri":"https://example.com","title":"Example"}}]}}],"modelVersion":"gemini-4-neon-high","responseId":"resp-1"},"traceId":"trace-1"}`,
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"","thoughtSignature":"sig-detached"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"modelVersion":"gemini-4-neon-high","responseId":"resp-1"},"traceId":"trace-1"}`,
+	}, "\n")
+
+	out := exec.convertStreamToNonStream([]byte(stream))
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("unmarshal output: %v; raw=%s", err, out)
+	}
+	respObj, _ := parsed["response"].(map[string]any)
+	cands, _ := respObj["candidates"].([]any)
+	cand, _ := cands[0].(map[string]any)
+	gm, okGM := cand["groundingMetadata"].(map[string]any)
+	if !okGM || len(gm) == 0 {
+		t.Fatalf("groundingMetadata was wiped by terminal chunk: %s", out)
+	}
+	content, _ := cand["content"].(map[string]any)
+	parts, _ := content["parts"].([]any)
+	if len(parts) != 4 {
+		t.Fatalf("parts len = %d, want 4; parts=%v", len(parts), parts)
+	}
+	wantSigs := []string{"sig-t1", "sig-t2", "sig-text", "sig-detached"}
+	for i, wantSig := range wantSigs {
+		p, _ := parts[i].(map[string]any)
+		if got, _ := p["thoughtSignature"].(string); got != wantSig {
+			t.Fatalf("parts[%d].thoughtSignature = %q, want %q; part=%v", i, got, wantSig, p)
+		}
+	}
+}
+
+func TestAntigravityBuildRequest_RemovesSnakeCaseSessionID(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "aicode-consumers"}}
+	payload := []byte(`{"request":{"session_id":"snake-session","contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`)
+	req, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-high", payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+	body := requestBody(t, req)
+	inner, _ := body["request"].(map[string]any)
+	if _, hasSnake := inner["session_id"]; hasSnake {
+		t.Fatalf("request.session_id should be removed: %v", inner)
+	}
+	if sid, _ := inner["sessionId"].(string); sid == "" || sid == "snake-session" {
+		t.Fatalf("request.sessionId = %q, want hashed int64 string", sid)
+	}
+}
+
+func TestAntigravityBuildRequest_NoHTMLEscapeInToolResultsAndStripsExtraNonAgyFields(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "strip-auth", Metadata: map[string]any{"project_id": "aicode-consumers"}}
+
+	payload := []byte(`{
+		"request": {
+			"safety_settings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"}],
+			"cachedContent": "cachedContents/abc",
+			"generationConfig": {
+				"seed": 42,
+				"logprobs": 2,
+				"mediaResolution": "MEDIA_RESOLUTION_HIGH",
+				"thinkingConfig": {"includeThoughts": false, "thinkingLevel": "high"},
+				"responseSchema": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {"answer": {"type": "string", "minLength": 1}}
+				}
 			},
-		}
-		req := cliproxyexecutor.Request{
-			Model:   model,
-			Payload: payload,
-		}
-		opts := cliproxyexecutor.Options{
-			SourceFormat:   sourceFormat,
-			ResponseFormat: sourceFormat,
-			Metadata:       metadata,
-		}
-		if enrich {
-			req, opts = cliproxysession.Enrich(req, opts)
-		}
-		switch kind {
-		case "execute":
-			_, _ = executor.Execute(ctx, auth, req, opts)
-		case "stream":
-			_, _ = executor.ExecuteStream(ctx, auth, req, opts)
-		default:
-			t.Fatalf("unknown route kind %q", kind)
-		}
-		if len(capturedBody) == 0 {
-			t.Fatalf("expected upstream request body to be captured for auth=%s kind=%s model=%s", authID, kind, model)
-		}
-		sessionID := ojson.GetBytes(capturedBody, "request.sessionId").String()
-		assertSignedInt64RequestSessionID(t, sessionID)
-		return sessionID
-	}
-
-	const rawSessionID = "-987654321"
-	parentGeminiPayload := []byte(`{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
-	workerGeminiPayload := []byte(`{"sessionId":"-987654321","metadata":{"agent_id":"swarm-worker-1"},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
-	nestedAntigravityPayload := []byte(`{"request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`)
-	nestedWorkerPayload := []byte(`{"request":{"sessionId":"-987654321","metadata":{"agent_id":"swarm-worker-1"},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`)
-
-	t.Run("gemini incoming sessionId scopes per credential and isolates subagents", func(t *testing.T) {
-		authAGemini := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		authAClaude := captureSessionID(t, "auth-a", "execute", "claude-sonnet-4-6", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		authAStream := captureSessionID(t, "auth-a", "stream", "gemini-3.7-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		if authAGemini == rawSessionID {
-			t.Fatalf("auth-a emitted raw incoming request.sessionId %q without credential scoping", authAGemini)
-		}
-		if authAGemini != authAClaude || authAGemini != authAStream {
-			t.Fatalf("same credential + incoming sessionId unstable across paths: gemini=%q claude=%q stream=%q", authAGemini, authAClaude, authAStream)
-		}
-
-		authBFailover := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		authBFailoverStream := captureSessionID(t, "auth-b", "stream", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		if authBFailover == rawSessionID || authBFailover == authAGemini {
-			t.Fatalf("failover credential auth-b leaked parent sessionId: got=%q authA=%q raw=%q", authBFailover, authAGemini, rawSessionID)
-		}
-		if authBFailover != authBFailoverStream {
-			t.Fatalf("failover credential auth-b unstable across execute/stream: exec=%q stream=%q", authBFailover, authBFailoverStream)
-		}
-
-		workerOnB := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, workerGeminiPayload, true, nil)
-		workerOnBStream := captureSessionID(t, "auth-b", "stream", "claude-sonnet-4-6", sdktranslator.FormatGemini, workerGeminiPayload, true, nil)
-		if workerOnB == rawSessionID || workerOnB == authAGemini || workerOnB == authBFailover {
-			t.Fatalf("subagent on auth-b leaked parent sessionId: worker=%q authA=%q authB=%q raw=%q", workerOnB, authAGemini, authBFailover, rawSessionID)
-		}
-		if workerOnB != workerOnBStream {
-			t.Fatalf("subagent on auth-b unstable across execute/stream: exec=%q stream=%q", workerOnB, workerOnBStream)
-		}
-
-		workerOnA := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, workerGeminiPayload, true, nil)
-		if workerOnA == rawSessionID || workerOnA == authAGemini || workerOnA == workerOnB {
-			t.Fatalf("subagent on auth-a collided with parent or auth-b worker: workerOnA=%q authA=%q workerOnB=%q", workerOnA, authAGemini, workerOnB)
-		}
-	})
-
-	t.Run("native antigravity incoming request.sessionId scopes per credential and subagent", func(t *testing.T) {
-		authA := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", sdktranslator.FormatAntigravity, nestedAntigravityPayload, true, nil)
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", sdktranslator.FormatAntigravity, nestedAntigravityPayload, true, nil)
-		workerB := captureSessionID(t, "auth-b", "stream", "gemini-3.6-flash-high", sdktranslator.FormatAntigravity, nestedWorkerPayload, true, nil)
-		if authA == rawSessionID || authB == rawSessionID || workerB == rawSessionID {
-			t.Fatalf("native antigravity emitted raw incoming sessionId: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-		if authA == authB || workerB == authA || workerB == authB {
-			t.Fatalf("native antigravity failed to isolate credentials/subagent: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-	})
-
-	t.Run("unenriched direct call with auth ID still scopes incoming sessionId per credential", func(t *testing.T) {
-		authAFirst := captureSessionID(t, "auth-a", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, false, nil)
-		authASecond := captureSessionID(t, "auth-a", "stream", "claude-sonnet-4-6", sdktranslator.FormatGemini, parentGeminiPayload, false, nil)
-		if authAFirst == rawSessionID {
-			t.Fatalf("unenriched auth-a emitted raw incoming sessionId %q", authAFirst)
-		}
-		if authAFirst != authASecond {
-			t.Fatalf("unenriched auth-a unstable across paths: first=%q second=%q", authAFirst, authASecond)
-		}
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, false, nil)
-		if authB == rawSessionID || authB == authAFirst {
-			t.Fatalf("unenriched failover credential auth-b leaked auth-a sessionId: authA=%q authB=%q", authAFirst, authB)
-		}
-	})
-
-	t.Run("anonymous auth ID preserves explicit request.sessionId verbatim", func(t *testing.T) {
-		got := captureSessionID(t, "", "execute", "gemini-3.6-flash-high", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		if got != rawSessionID {
-			t.Fatalf("anonymous auth ID request.sessionId = %q, want verbatim %q", got, rawSessionID)
-		}
-	})
-
-	t.Run("image model scopes incoming sessionId per credential and subagent without synthesizing when absent", func(t *testing.T) {
-		authA := captureSessionID(t, "auth-a", "execute", "gemini-3.1-flash-image", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.1-flash-image", sdktranslator.FormatGemini, parentGeminiPayload, true, nil)
-		workerB := captureSessionID(t, "auth-b", "stream", "gemini-3.1-flash-image", sdktranslator.FormatGemini, workerGeminiPayload, true, nil)
-		if authA == rawSessionID || authB == rawSessionID || workerB == rawSessionID {
-			t.Fatalf("image model emitted raw incoming sessionId: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-		if authA == authB || workerB == authA || workerB == authB {
-			t.Fatalf("image model failed to isolate credentials/subagent: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-
-		authAUnenriched := captureSessionID(t, "auth-a", "execute", "gemini-3.1-flash-image", sdktranslator.FormatGemini, parentGeminiPayload, false, nil)
-		authBUnenriched := captureSessionID(t, "auth-b", "execute", "gemini-3.1-flash-image", sdktranslator.FormatGemini, parentGeminiPayload, false, nil)
-		if authAUnenriched == rawSessionID || authBUnenriched == rawSessionID || authAUnenriched == authBUnenriched {
-			t.Fatalf("unenriched image model leaked incoming sessionId: authA=%q authB=%q", authAUnenriched, authBUnenriched)
-		}
-
-		authNoSession := &cliproxyauth.Auth{ID: "auth-a", Metadata: map[string]any{"project_id": "project-1"}}
-		docNoSession := ojson.NewDoc([]byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"draw"}]}]}}`))
-		_, finalNoSession, errNoSession := executor.buildRequestDoc(context.Background(), authNoSession, "token", "gemini-3.1-flash-image", docNoSession, false, "", "https://example.com", "-123456789")
-		if errNoSession != nil {
-			t.Fatalf("buildRequestDoc image without incoming sessionId error: %v", errNoSession)
-		}
-		if ojson.GetBytes(finalNoSession, "request.sessionId").Exists() {
-			t.Fatalf("image model without incoming sessionId should not synthesize request.sessionId: %s", string(finalNoSession))
-		}
-	})
-
-	t.Run("web_search request scopes incoming sessionId per credential and subagent without synthesizing when absent", func(t *testing.T) {
-		webSearchParent := []byte(`{"requestType":"web_search","request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"weather"}]}],"tools":[{"googleSearch":{}}]}}`)
-		webSearchWorker := []byte(`{"requestType":"web_search","request":{"sessionId":"-987654321","metadata":{"agent_id":"swarm-worker-1"},"contents":[{"role":"user","parts":[{"text":"weather"}]}],"tools":[{"googleSearch":{}}]}}`)
-
-		authA := captureSessionID(t, "auth-a", "execute", "gemini-3.1-flash-lite", sdktranslator.FormatAntigravity, webSearchParent, true, nil)
-		authB := captureSessionID(t, "auth-b", "execute", "gemini-3.1-flash-lite", sdktranslator.FormatAntigravity, webSearchParent, true, nil)
-		workerB := captureSessionID(t, "auth-b", "stream", "gemini-3.1-flash-lite", sdktranslator.FormatAntigravity, webSearchWorker, true, nil)
-		if authA == rawSessionID || authB == rawSessionID || workerB == rawSessionID {
-			t.Fatalf("web_search emitted raw incoming sessionId: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-		if authA == authB || workerB == authA || workerB == authB {
-			t.Fatalf("web_search failed to isolate credentials/subagent: authA=%q authB=%q workerB=%q", authA, authB, workerB)
-		}
-
-		authAUnenriched := captureSessionID(t, "auth-a", "execute", "gemini-3.1-flash-lite", sdktranslator.FormatAntigravity, webSearchParent, false, nil)
-		authBUnenriched := captureSessionID(t, "auth-b", "execute", "gemini-3.1-flash-lite", sdktranslator.FormatAntigravity, webSearchParent, false, nil)
-		if authAUnenriched == rawSessionID || authBUnenriched == rawSessionID || authAUnenriched == authBUnenriched {
-			t.Fatalf("unenriched web_search leaked incoming sessionId: authA=%q authB=%q", authAUnenriched, authBUnenriched)
-		}
-
-		authNoSession := &cliproxyauth.Auth{ID: "auth-a", Metadata: map[string]any{"project_id": "project-1"}}
-		docNoSession := ojson.NewDoc([]byte(`{"requestType":"web_search","request":{"contents":[{"role":"user","parts":[{"text":"weather"}]}],"tools":[{"googleSearch":{}}]}}`))
-		_, finalNoSession, errNoSession := executor.buildRequestDoc(context.Background(), authNoSession, "token", "gemini-3.1-flash-lite", docNoSession, false, "", "https://example.com", "-123456789")
-		if errNoSession != nil {
-			t.Fatalf("buildRequestDoc web_search without incoming sessionId error: %v", errNoSession)
-		}
-		if ojson.GetBytes(finalNoSession, "request.sessionId").Exists() {
-			t.Fatalf("web_search without incoming sessionId should not synthesize request.sessionId: %s", string(finalNoSession))
-		}
-	})
-
-	t.Run("payload override and filter remain final barrier with auth ID", func(t *testing.T) {
-		captureWithConfig := func(t *testing.T, cfg *config.Config) []byte {
-			t.Helper()
-			execWithCfg := NewAntigravityExecutor(cfg)
-			var capturedBody []byte
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				var errRead error
-				capturedBody, errRead = io.ReadAll(req.Body)
-				if errRead != nil {
-					return nil, errRead
-				}
-				return &http.Response{
-					StatusCode: http.StatusBadRequest,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"captured"}}`)),
-				}, nil
-			}))
-			auth := &cliproxyauth.Auth{
-				ID: "auth-a",
-				Metadata: map[string]any{
-					"access_token": "token",
-					"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-					"project_id":   "project-1",
-				},
-			}
-			req, opts := cliproxysession.Enrich(
-				cliproxyexecutor.Request{Model: "gemini-3.6-flash-high", Payload: parentGeminiPayload},
-				cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini, ResponseFormat: sdktranslator.FormatGemini},
-			)
-			_, _ = execWithCfg.Execute(ctx, auth, req, opts)
-			if len(capturedBody) == 0 {
-				t.Fatalf("expected upstream request body to be captured")
-			}
-			return capturedBody
-		}
-
-		overrideBody := captureWithConfig(t, &config.Config{Payload: config.PayloadConfig{
-			Override: []config.PayloadRule{{
-				Models: []config.PayloadModelRule{{Name: "gemini-*"}},
-				Params: map[string]any{"sessionId": "-42"},
-			}},
-		}})
-		if got := ojson.GetBytes(overrideBody, "request.sessionId").String(); got != "-42" {
-			t.Fatalf("payload override request.sessionId = %q, want -42", got)
-		}
-
-		filterBody := captureWithConfig(t, &config.Config{Payload: config.PayloadConfig{
-			Filter: []config.PayloadFilterRule{{
-				Models: []config.PayloadModelRule{{Name: "gemini-*"}},
-				Params: []string{"sessionId"},
-			}},
-		}})
-		if !ojson.GetBytes(filterBody, "request.contents").Exists() {
-			t.Fatalf("expected filtered upstream request to retain request.contents: %s", string(filterBody))
-		}
-		if ojson.GetBytes(filterBody, "request.sessionId").Exists() {
-			t.Fatalf("payload filter did not remove request.sessionId: %s", string(filterBody))
-		}
-	})
-}
-
-// TestAntigravityPrepareRequestAuth_DiscoveryTransportErrorIsNotClientFault
-// verifies that a project-discovery failure without an upstream HTTP status
-// (for example a proxy connect error) is reported as a transient transport
-// problem rather than an invalid-request 400, so the conductor does not halt
-// credential rotation on a request that could succeed on another credential.
-func TestAntigravityPrepareRequestAuth_DiscoveryTransportErrorIsNotClientFault(t *testing.T) {
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{
-		"access_token": "token",
-		"expired":      time.Now().Add(1 * time.Hour).Format(time.RFC3339),
-	}}
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		return nil, errors.New("proxy connect: connection refused")
-	}))
-
-	_, err := executor.PrepareRequestAuth(ctx, auth)
-	if err == nil {
-		t.Fatalf("PrepareRequestAuth should fail on transport error")
-	}
-	status, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("error should expose StatusCode(), got %T (%v)", err, err)
-	}
-	if got := status.StatusCode(); got == http.StatusBadRequest {
-		t.Fatalf("status code = %d, transport failure must not masquerade as invalid-request 400", got)
-	}
-}
-
-// TestAntigravityPrepareRequestAuth_MissingRefreshTokenIsNotUpstreamAttempt
-// verifies that a credential missing a refresh token fails as a local
-// preparation error and does not mark an upstream attempt, so it cannot
-// outrank a genuine upstream rejection recorded earlier in the round.
-func TestAntigravityPrepareRequestAuth_MissingRefreshTokenIsNotUpstreamAttempt(t *testing.T) {
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{
-		// access_token present but already expired and no refresh_token: the
-		// credential fails locally before any HTTP request is issued.
-		"access_token": "expired-token",
-		"expired":      time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
-	}}
-	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
-
-	_, err := executor.PrepareRequestAuth(ctx, auth)
-	if err == nil {
-		t.Fatalf("PrepareRequestAuth should fail without refresh token")
-	}
-	if cliproxyexecutor.UpstreamAttempted(ctx) {
-		t.Fatalf("missing refresh token must not mark an upstream attempt")
-	}
-}
-
-// TestAntigravityPrepareRequestAuth_OAuthRefreshFailureMarksUpstreamAttempt
-// verifies that a genuine upstream rejection during OAuth token refresh (e.g.
-// a 403 from the token endpoint) marks the request's upstream-attempt tracker,
-// so the conductor can attribute it as a real upstream error that outranks
-// later local credential-preparation failures.
-func TestAntigravityPrepareRequestAuth_OAuthRefreshFailureMarksUpstreamAttempt(t *testing.T) {
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{
-		// expired access token + refresh token: forces the OAuth refresh path,
-		// which performs a real upstream HTTP call that fails with 403.
-		"access_token":  "expired-token",
-		"refresh_token": "refresh-token",
-		"expired":       time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
-	}}
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusForbidden,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"error":"access_denied"}`)),
-		}, nil
-	}))
-	ctx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-
-	_, err := executor.PrepareRequestAuth(ctx, auth)
-	if err == nil {
-		t.Fatalf("PrepareRequestAuth should fail on upstream 403 during refresh")
-	}
-	if !cliproxyexecutor.UpstreamAttempted(ctx) {
-		t.Fatalf("upstream refresh 403 should mark the upstream attempt tracker")
-	}
-}
-
-// TestAntigravityPrepareRequestAuth_SharedRefreshFailureMarksEachTracker
-// verifies that when concurrent requests share one singleflight OAuth refresh
-// that fails upstream, EACH request's own upstream-attempt tracker is marked —
-// not only the tracker of the request that led the flight.
-func TestAntigravityPrepareRequestAuth_SharedRefreshFailureMarksEachTracker(t *testing.T) {
-	executor := &AntigravityExecutor{}
-	newAuth := func() *cliproxyauth.Auth {
-		return &cliproxyauth.Auth{Metadata: map[string]any{
-			"access_token":  "expired-token",
-			"refresh_token": "shared-refresh-token",
-			"expired":       time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
-		}}
-	}
-	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		// Slow enough that both callers join the same singleflight refresh.
-		time.Sleep(50 * time.Millisecond)
-		return &http.Response{
-			StatusCode: http.StatusForbidden,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"error":"access_denied"}`)),
-		}, nil
-	})
-	newCtx := func() context.Context {
-		c := context.WithValue(context.Background(), "cliproxy.roundtripper", rt)
-		return cliproxyexecutor.WithUpstreamAttemptTracker(c)
-	}
-
-	ctxA, ctxB := newCtx(), newCtx()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = executor.PrepareRequestAuth(ctxA, newAuth()) }()
-	go func() { defer wg.Done(); _, _ = executor.PrepareRequestAuth(ctxB, newAuth()) }()
-	wg.Wait()
-
-	if !cliproxyexecutor.UpstreamAttempted(ctxA) {
-		t.Fatalf("request A tracker was not marked on shared upstream refresh failure")
-	}
-	if !cliproxyexecutor.UpstreamAttempted(ctxB) {
-		t.Fatalf("request B tracker was not marked on shared upstream refresh failure")
-	}
-}
-
-func TestGenerateStableSessionID_ScansAllUserPartsForMultimodalTurn1(t *testing.T) {
-	t.Parallel()
-
-	turn1Inline := []byte(`{
-		"request": {
 			"contents": [
-				{
-					"role": "user",
-					"parts": [
-						{"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}},
-						{"text": "describe this"}
-					]
-				}
+				{"role": "user", "parts": [{"text": "check <a> & <b>"}]},
+				{"role": "model", "parts": [{"functionCall": {"id": "call_1", "name": "read", "args": {"path": "x.html"}}}]},
+				{"role": "user", "parts": [{"functionResponse": {"id": "call_1", "name": "read", "response": {"output": "<div class=\"a\">1 < 2 && 3 > 1</div>"}}}]}
 			]
 		}
 	}`)
-	turn1And2Inline := []byte(`{
-		"request": {
-			"contents": [
-				{
-					"role": "user",
-					"parts": [
-						{"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}},
-						{"text": "describe this"}
-					]
-				},
-				{
-					"role": "model",
-					"parts": [{"text": "It is a diagram."}]
-				},
-				{
-					"role": "user",
-					"parts": [{"text": "now summarize it"}]
-				}
-			]
-		}
-	}`)
-	turn1Plain := []byte(`{
-		"request": {
-			"contents": [
-				{
-					"role": "user",
-					"parts": [{"text": "describe this"}]
-				}
-			]
-		}
-	}`)
-
-	idTurn1 := generateStableSessionID(turn1Inline)
-	idTurn1And2 := generateStableSessionID(turn1And2Inline)
-	idPlain := generateStableSessionID(turn1Plain)
-	if idTurn1 != idPlain {
-		t.Fatalf("multimodal turn 1 sessionId = %q, want deterministic hash %q matching text part", idTurn1, idPlain)
+	normalized := agyNormalizeAntigravityGeminiFunctionResponseRoles(payload)
+	req, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-high", normalized, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
 	}
-	if idTurn1 != idTurn1And2 {
-		t.Fatalf("sessionId changed between turn 1 (%q) and turn 2 (%q)", idTurn1, idTurn1And2)
+	raw, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		t.Fatalf("read body: %v", errRead)
 	}
+	rawStr := string(raw)
 
-	turn1FileAndEmpty := []byte(`{
-		"request": {
-			"contents": [
-				{
-					"role": "user",
-					"parts": [
-						{"fileData": {"mimeType": "application/pdf", "fileUri": "gs://bucket/doc.pdf"}},
-						{"text": ""},
-						{"text": "summarize pdf"}
-					]
-				}
-			]
+	for _, esc := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(rawStr, esc) {
+			t.Fatalf("HTML escape %s leaked into outbound CCPA body: %s", esc, rawStr)
 		}
-	}`)
-	turn1And2FileAndEmpty := []byte(`{
-		"request": {
-			"contents": [
-				{
-					"role": "user",
-					"parts": [
-						{"fileData": {"mimeType": "application/pdf", "fileUri": "gs://bucket/doc.pdf"}},
-						{"text": ""},
-						{"text": "summarize pdf"}
-					]
-				},
-				{
-					"role": "model",
-					"parts": [{"text": "Summary."}]
-				},
-				{
-					"role": "user",
-					"parts": [{"text": "details please"}]
-				}
-			]
-		}
-	}`)
-
-	docTurn1 := ojson.NewDoc(turn1FileAndEmpty)
-	docTurn1And2 := ojson.NewDoc(turn1And2FileAndEmpty)
-	authATurn1 := generateStableSessionIDDocForAuth(docTurn1, "auth-a")
-	authATurn2 := generateStableSessionIDDocForAuth(docTurn1And2, "auth-a")
-	authBTurn1 := generateStableSessionIDDocForAuth(docTurn1, "auth-b")
-	if authATurn1 != authATurn2 {
-		t.Fatalf("auth-scoped multimodal sessionId changed between turn 1 (%q) and turn 2 (%q)", authATurn1, authATurn2)
 	}
-	if authATurn1 == authBTurn1 {
-		t.Fatalf("different authIDs produced identical multimodal sessionId %q", authATurn1)
-	}
-}
-
-func TestAntigravityBuildRequest_CaseInsensitiveClaudeModel(t *testing.T) {
-	t.Parallel()
-
-	payload := []byte(`{
-		"request": {
-			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-			"generationConfig": {"maxOutputTokens": 2048},
-			"tools": [
-				{
-					"functionDeclarations": [
-						{
-							"name": "pick_item",
-							"parametersJsonSchema": {
-								"type": "object",
-								"properties": {
-									"item": {
-										"anyOf": [
-											{"type": "string"},
-											{"type": "object", "properties": {"image": {"type": "string"}}},
-											{"type": "object", "properties": {"audio": {"type": "string"}}}
-										]
-									}
-								}
-							}
-						},
-						{
-							"name": "ping",
-							"parameters": {"type": "object"}
-						}
-					]
-				}
-			]
-		}
-	}`)
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	for _, modelName := range []string{"Claude-Sonnet-5-5", "CLAUDE-OPUS-5-5"} {
-		t.Run(modelName, func(t *testing.T) {
-			doc := ojson.NewDoc(payload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", modelName, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc(%q) error: %v", modelName, errBuild)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.mode").String(); got != "VALIDATED" {
-				t.Fatalf("model %q: mode = %q, want VALIDATED", modelName, got)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 2048 {
-				t.Fatalf("model %q: maxOutputTokens = %d, want 2048", modelName, got)
-			}
-			firstParams := ojson.GetBytes(finalPayload, "request.tools.0.functionDeclarations.0.parameters")
-			if !firstParams.Exists() {
-				t.Fatalf("model %q: expected parameters after parametersJsonSchema rename", modelName)
-			}
-			if firstParams.Get("properties.item.anyOf").Exists() {
-				t.Fatalf("model %q: expected Claude multi-branch anyOf union to be flattened, got %s", modelName, firstParams.Raw)
-			}
-			secondParams := ojson.GetBytes(finalPayload, "request.tools.0.functionDeclarations.1.parameters")
-			if !secondParams.Get("properties.reason").Exists() {
-				t.Fatalf("model %q: expected Antigravity placeholder property on empty object schema, got %s", modelName, secondParams.Raw)
-			}
-		})
-	}
-}
-
-func TestAntigravityBuildRequest_CaseInsensitiveClaudeCapsMaxOutputTokens(t *testing.T) {
-	t.Parallel()
-
-	payload := []byte(`{
-		"request": {
-			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-			"generationConfig": {"maxOutputTokens": 100000}
-		}
-	}`)
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	for _, modelName := range []string{"claude-sonnet-4-6", "Claude-Sonnet-4-6"} {
-		t.Run(modelName, func(t *testing.T) {
-			doc := ojson.NewDoc(payload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", modelName, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc(%q) error: %v", modelName, errBuild)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
-				t.Fatalf("model %q: maxOutputTokens = %d, want capped 64000", modelName, got)
-			}
-		})
-	}
-}
-
-func TestAntigravityBuildRequest_ThinkingGroupPreservesSmallerMaxOutputTokensAndClampsBudget(t *testing.T) {
-	for _, tc := range []struct {
-		name, budgetPath, payload string
-		wantMax, wantBudget       int64
-	}{
-		{"camel case budget with smaller caller limit", "thinkingBudget", `{"maxOutputTokens":32000,"thinkingConfig":{"thinkingBudget":40000}}`, 32000, 31999},
-		{"snake case output and budget with smaller caller limit", "thinking_budget", `{"max_output_tokens":32000,"thinkingConfig":{"thinking_budget":40000}}`, 32000, 31999},
-		{"caller limit above group cap", "thinkingBudget", `{"maxOutputTokens":70000,"thinkingConfig":{"thinkingBudget":68000}}`, 65536, 65535},
+	for _, forbidden := range []string{
+		"request.safety_settings",
+		"request.cachedContent",
+		"request.generationConfig.seed",
+		"request.generationConfig.logprobs",
+		"request.generationConfig.mediaResolution",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":` + tc.payload + `}}`)
-			executor := &AntigravityExecutor{}
-			auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-			selection := cliproxyauth.AntigravityModelSelection{ID: "claude-sonnet-4-6-high", MaxOutputTokens: 65536}
-			doc := ojson.NewDoc(payload)
-			_, finalPayload, errBuild := executor.buildRequestForModelDoc(context.Background(), auth, "token", selection, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestForModelDoc error: %v", errBuild)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.max_output_tokens"); got.Exists() {
-				t.Fatalf("max_output_tokens alias remains in final payload: %s", finalPayload)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != tc.wantMax {
-				t.Fatalf("maxOutputTokens = %d, want %d", got, tc.wantMax)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinkingConfig."+tc.budgetPath).Int(); got != tc.wantBudget {
-				t.Fatalf("%s = %d, want %d", tc.budgetPath, got, tc.wantBudget)
-			}
-		})
+		if ojson.GetBytes(raw, forbidden).Exists() {
+			t.Fatalf("non-agy field %s was not stripped: %s", forbidden, rawStr)
+		}
+	}
+	if !ojson.GetBytes(raw, "request.generationConfig.thinkingConfig.includeThoughts").Bool() {
+		t.Fatalf("includeThoughts should be enforced true: %s", rawStr)
+	}
+	if got := ojson.GetBytes(raw, "request.generationConfig.responseSchema.type").String(); got != "OBJECT" {
+		t.Fatalf("responseSchema.type = %q, want OBJECT", got)
+	}
+	if strings.Contains(rawStr, "No extra properties allowed") || strings.Contains(rawStr, "minLength:") {
+		t.Fatalf("responseSchema leaked proxy watermark hints: %s", rawStr)
 	}
 }
 
-func TestAntigravityBuildRequest_CapsThinkingBudgetWithMaxOutputTokens(t *testing.T) {
-	t.Parallel()
+func TestAntigravityBuildRequest_SnakeResponseSchemaAnd403CredentialScoped(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "snake-resp-auth", Metadata: map[string]any{"project_id": "aicode-consumers"}}
 
 	payload := []byte(`{
 		"request": {
-			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
 			"generationConfig": {
-				"maxOutputTokens": 100000,
-				"thinkingConfig": {"thinkingBudget": 64000}
+				"response_schema": {"type": "object", "minProperties": 1, "properties": {"a": {"type": "string"}}},
+				"thinkingConfig": {"thinkingLevel": "xhigh"}
 			}
 		}
 	}`)
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	for _, modelName := range []string{"claude-sonnet-4-6", "Claude-Sonnet-4-6", "claude-opus-4-6-thinking"} {
-		t.Run(modelName, func(t *testing.T) {
-			doc := ojson.NewDoc(payload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", modelName, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc(%q) error: %v", modelName, errBuild)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
-				t.Fatalf("model %q: maxOutputTokens = %d, want capped 64000", modelName, got)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinkingConfig.thinkingBudget").Int(); got != 63999 {
-				t.Fatalf("model %q: thinkingBudget = %d, want 63999", modelName, got)
-			}
-		})
+	req, err := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon", payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
 	}
-}
+	raw, _ := io.ReadAll(req.Body)
+	if ojson.GetBytes(raw, "request.generationConfig.response_schema").Exists() {
+		t.Fatalf("snake_case response_schema was not canonicalized: %s", raw)
+	}
+	// Under xhigh (UseEnumNumbers=true), responseSchema.type is numeric 6 (OBJECT) and minProperties is stringified "1".
+	if got := ojson.GetBytes(raw, "request.generationConfig.responseSchema.type").Raw; got != "6" {
+		t.Fatalf("responseSchema.type under xhigh = %s, want 6", got)
+	}
+	if got := ojson.GetBytes(raw, "request.generationConfig.responseSchema.minProperties").Raw; got != `"1"` {
+		t.Fatalf("responseSchema.minProperties = %s, want \"1\"", got)
+	}
 
-func TestAntigravityBuildRequest_SnakeCaseMaxOutputTokensAboveCatalogLimit(t *testing.T) {
-	t.Parallel()
+	// Verify HTTP 403 error is credential-scoped so multi-model pools immediately stop trying this credential.
+	err403 := newAntigravityStatusErr(http.StatusForbidden, []byte(`{"error":{"code":403}}`))
+	if !err403.credentialScoped {
+		t.Fatal("expected HTTP 403 Antigravity statusErr to be credentialScoped")
+	}
 
-	payload := []byte(`{
+	// Verify live ModelDetails.thinkingLevel (e.g. 100) flows through buildRequest,
+	// and Gemini parametersJsonSchema preserves draft 2020-12 anyOf/type-array verbatim.
+	t.Cleanup(helps.ResetAntigravityCatalogForTest)
+	helps.UpdateAntigravityCatalog([]helps.AntigravityModelMeta{
+		{ID: "gemini-4-neon-xhigh", ModelEnum: "MODEL_PLACEHOLDER_M535", MaxOutputTokens: 262144, ThinkingLevel: 100},
+	})
+	livePayload := []byte(`{
 		"request": {
-			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-			"generationConfig": {
-				"max_output_tokens": 70000,
-				"thinkingConfig": {"thinkingBudget": 64000}
-			}
-		}
-	}`)
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	doc := ojson.NewDoc(payload)
-	_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "claude-sonnet-4-6", doc, false, "", "https://example.com")
-	if errBuild != nil {
-		t.Fatalf("buildRequestDoc() error: %v", errBuild)
-	}
-	if got := ojson.GetBytes(finalPayload, "request.generationConfig.max_output_tokens"); got.Exists() {
-		t.Fatalf("max_output_tokens alias remains in final payload: %s", finalPayload)
-	}
-	if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
-		t.Fatalf("maxOutputTokens = %d, want 64000; body=%s", got, finalPayload)
-	}
-	if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinkingConfig.thinkingBudget").Int(); got != 63999 {
-		t.Fatalf("thinkingBudget = %d, want 63999; body=%s", got, finalPayload)
-	}
-}
-
-func TestAntigravityBuildRequest_ClaudeCanonicalizesToolConfigBeforeValidated(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-
-	cases := []struct {
-		name               string
-		model              string
-		payload            string
-		wantAllowedFn      string
-		wantIncludeServer  bool
-		checkIncludeServer bool
-	}{
-		{
-			name:               "snake_case_tool_config_and_function_calling_config",
-			model:              "claude-opus-5-5-high",
-			payload:            `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tool_config":{"include_server_side_tool_invocations":false,"function_calling_config":{"mode":"AUTO","allowed_function_names":["bash"]}}}}`,
-			wantAllowedFn:      "bash",
-			wantIncludeServer:  false,
-			checkIncludeServer: true,
-		},
-		{
-			name:          "snake_case_tool_config_camel_functionCallingConfig",
-			model:         "claude-sonnet-4-6",
-			payload:       `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tool_config":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["read_file"]}}}}`,
-			wantAllowedFn: "read_file",
-		},
-		{
-			name:          "camel_toolConfig_snake_function_calling_config",
-			model:         "claude-sonnet-4-6",
-			payload:       `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"toolConfig":{"function_calling_config":{"mode":"AUTO","allowed_function_names":["grep"]}}}}`,
-			wantAllowedFn: "grep",
-		},
-		{
-			name:          "duplicate_tool_config_and_toolConfig_deduplicated",
-			model:         "claude-sonnet-4-6",
-			payload:       `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tool_config":{"function_calling_config":{"mode":"AUTO"}},"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["bash"]}}}}`,
-			wantAllowedFn: "bash",
-		},
-		{
-			name:               "duplicate_containers_preserve_snake_allowed_function_names_and_siblings",
-			model:              "claude-sonnet-4-6",
-			payload:            `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tool_config":{"include_server_side_tool_invocations":false,"function_calling_config":{"mode":"ANY","allowed_function_names":["read_file"]}},"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}}}}`,
-			wantAllowedFn:      "read_file",
-			wantIncludeServer:  false,
-			checkIncludeServer: true,
-		},
-		{
-			name:          "duplicate_function_calling_configs_inside_toolConfig_preserve_snake_allowlist",
-			model:         "claude-sonnet-4-6",
-			payload:       `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"},"function_calling_config":{"mode":"ANY","allowed_function_names":["grep"]}}}}`,
-			wantAllowedFn: "grep",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			doc := ojson.NewDocString(tc.payload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", tc.model, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc(%q) error: %v", tc.model, errBuild)
-			}
-			if ojson.GetBytes(finalPayload, "request.tool_config").Exists() {
-				t.Fatalf("emitted duplicate proto-JSON request.tool_config alongside request.toolConfig: %s", finalPayload)
-			}
-			if ojson.GetBytes(finalPayload, "request.toolConfig.function_calling_config").Exists() {
-				t.Fatalf("emitted duplicate proto-JSON function_calling_config alongside functionCallingConfig: %s", finalPayload)
-			}
-			if got := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.mode").String(); got != "VALIDATED" {
-				t.Fatalf("request.toolConfig.functionCallingConfig.mode = %q, want VALIDATED; body=%s", got, finalPayload)
-			}
-			if tc.wantAllowedFn != "" {
-				allowedCamel := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.allowedFunctionNames.0").String()
-				allowedSnake := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.allowed_function_names.0").String()
-				if allowedCamel != tc.wantAllowedFn && allowedSnake != tc.wantAllowedFn {
-					t.Fatalf("allowed function name lost: camel=%q snake=%q want=%q; body=%s", allowedCamel, allowedSnake, tc.wantAllowedFn, finalPayload)
-				}
-			}
-			if tc.checkIncludeServer {
-				inc := ojson.GetBytes(finalPayload, "request.toolConfig.include_server_side_tool_invocations")
-				if !inc.Exists() || inc.Bool() != tc.wantIncludeServer {
-					t.Fatalf("include_server_side_tool_invocations = %s, want %t; body=%s", inc.Raw, tc.wantIncludeServer, finalPayload)
-				}
-			}
-		})
-	}
-
-	t.Run("duplicate_containers_camelCase_fields_take_precedence_without_alias_duplication", func(t *testing.T) {
-		payload := `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tool_config":{"include_server_side_tool_invocations":false,"function_calling_config":{"mode":"ANY","allowed_function_names":["read_file"]}},"toolConfig":{"includeServerSideToolInvocations":true,"functionCallingConfig":{"mode":"AUTO","allowedFunctionNames":["bash"]}}}}`
-		doc := ojson.NewDocString(payload)
-		_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "claude-sonnet-4-6", doc, false, "", "https://example.com")
-		if errBuild != nil {
-			t.Fatalf("buildRequestDoc() error: %v", errBuild)
-		}
-		if ojson.GetBytes(finalPayload, "request.tool_config").Exists() {
-			t.Fatalf("unexpected request.tool_config: %s", finalPayload)
-		}
-		if ojson.GetBytes(finalPayload, "request.toolConfig.include_server_side_tool_invocations").Exists() {
-			t.Fatalf("unexpected duplicate snake_case include_server_side_tool_invocations: %s", finalPayload)
-		}
-		if ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.allowed_function_names").Exists() {
-			t.Fatalf("unexpected duplicate snake_case allowed_function_names: %s", finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.toolConfig.includeServerSideToolInvocations"); !got.Exists() || !got.Bool() {
-			t.Fatalf("includeServerSideToolInvocations = %s, want true; body=%s", got.Raw, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.allowedFunctionNames.0").String(); got != "bash" {
-			t.Fatalf("allowedFunctionNames.0 = %q, want bash; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.mode").String(); got != "VALIDATED" {
-			t.Fatalf("mode = %q, want VALIDATED; body=%s", got, finalPayload)
-		}
-	})
-}
-
-func TestAntigravityBuildRequest_NonClaudeStripsAllMaxOutputTokenAliases(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-
-	cases := []struct {
-		name              string
-		payload           string
-		wantGenConfigGone bool
-		wantTemperature   float64
-		checkTemperature  bool
-	}{
-		{
-			name:              "snake_container_snake_key_only",
-			payload:           `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":4096}}}`,
-			wantGenConfigGone: true,
-		},
-		{
-			name:             "snake_container_snake_key_preserves_siblings",
-			payload:          `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":4096,"temperature":0.7}}}`,
-			wantTemperature:  0.7,
-			checkTemperature: true,
-		},
-		{
-			name:              "snake_container_camel_key_only",
-			payload:           `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generation_config":{"maxOutputTokens":4096}}}`,
-			wantGenConfigGone: true,
-		},
-		{
-			name:             "camel_container_snake_key",
-			payload:          `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"max_output_tokens":4096,"temperature":0.3}}}`,
-			wantTemperature:  0.3,
-			checkTemperature: true,
-		},
-		{
-			name:             "camel_container_camel_key",
-			payload:          `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":4096,"temperature":0.5}}}`,
-			wantTemperature:  0.5,
-			checkTemperature: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			doc := ojson.NewDocString(tc.payload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "gemini-4-hydrogen-high", doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc() error: %v", errBuild)
-			}
-			for _, path := range []string{
-				"request.generationConfig.maxOutputTokens",
-				"request.generationConfig.max_output_tokens",
-				"request.generation_config.maxOutputTokens",
-				"request.generation_config.max_output_tokens",
-			} {
-				if ojson.GetBytes(finalPayload, path).Exists() {
-					t.Fatalf("%s was not stripped on non-Claude model: %s", path, finalPayload)
-				}
-			}
-			if tc.wantGenConfigGone && ojson.GetBytes(finalPayload, "request.generation_config").Exists() {
-				t.Fatalf("empty request.generation_config should be pruned: %s", finalPayload)
-			}
-			if tc.checkTemperature {
-				tempCamel := ojson.GetBytes(finalPayload, "request.generationConfig.temperature")
-				tempSnake := ojson.GetBytes(finalPayload, "request.generation_config.temperature")
-				if (!tempCamel.Exists() || tempCamel.Float() != tc.wantTemperature) && (!tempSnake.Exists() || tempSnake.Float() != tc.wantTemperature) {
-					t.Fatalf("temperature sibling lost (want %v): %s", tc.wantTemperature, finalPayload)
-				}
-			}
-		})
-	}
-
-	t.Run("mixed_generationConfig_and_generation_config_merged_without_duplication", func(t *testing.T) {
-		payload := `{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}},"generation_config":{"max_output_tokens":4096,"temperature":0.7}}}`
-		doc := ojson.NewDocString(payload)
-		_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "gemini-4-hydrogen-high", doc, false, "", "https://example.com")
-		if errBuild != nil {
-			t.Fatalf("buildRequestDoc() error: %v", errBuild)
-		}
-		if ojson.GetBytes(finalPayload, "request.generation_config").Exists() {
-			t.Fatalf("emitted duplicate request.generation_config alongside request.generationConfig: %s", finalPayload)
-		}
-		for _, path := range []string{
-			"request.generationConfig.maxOutputTokens",
-			"request.generationConfig.max_output_tokens",
-		} {
-			if ojson.GetBytes(finalPayload, path).Exists() {
-				t.Fatalf("%s was not stripped on non-Claude model: %s", path, finalPayload)
-			}
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.temperature").Float(); got != 0.7 {
-			t.Fatalf("temperature = %v, want 0.7; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinkingConfig.thinkingLevel").String(); got != "HIGH" {
-			t.Fatalf("thinkingLevel = %q, want HIGH; body=%s", got, finalPayload)
-		}
-	})
-}
-
-func TestAntigravityBuildRequest_SnakeCaseGenerationConfigMaxOutputTokensCapped(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-
-	t.Run("catalog_limit_caps_snake_case_generation_config", func(t *testing.T) {
-		payload := `{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generation_config":{"max_output_tokens":70000,"temperature":0.5,"thinking_config":{"thinking_budget":64000}}}}`
-		doc := ojson.NewDocString(payload)
-		_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "claude-sonnet-4-6", doc, false, "", "https://example.com")
-		if errBuild != nil {
-			t.Fatalf("buildRequestDoc() error: %v", errBuild)
-		}
-		if ojson.GetBytes(finalPayload, "request.generation_config").Exists() {
-			t.Fatalf("emitted duplicate request.generation_config alongside request.generationConfig: %s", finalPayload)
-		}
-		if ojson.GetBytes(finalPayload, "request.generationConfig.max_output_tokens").Exists() {
-			t.Fatalf("max_output_tokens alias remains in final payload: %s", finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
-			t.Fatalf("maxOutputTokens = %d, want 64000; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.temperature").Float(); got != 0.5 {
-			t.Fatalf("temperature = %v, want 0.5; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinking_config.thinking_budget").Int(); got != 63999 {
-			t.Fatalf("thinking_budget = %d, want 63999; body=%s", got, finalPayload)
-		}
-	})
-
-	t.Run("thinking_group_preserves_smaller_snake_case_generation_config_limit", func(t *testing.T) {
-		payload := `{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generation_config":{"max_output_tokens":32000,"temperature":0.3,"thinking_config":{"thinking_budget":40000}}}}`
-		selection := cliproxyauth.AntigravityModelSelection{ID: "claude-sonnet-4-6-high", MaxOutputTokens: 65536}
-		doc := ojson.NewDocString(payload)
-		_, finalPayload, errBuild := executor.buildRequestForModelDoc(context.Background(), auth, "token", selection, doc, false, "", "https://example.com")
-		if errBuild != nil {
-			t.Fatalf("buildRequestForModelDoc() error: %v", errBuild)
-		}
-		if ojson.GetBytes(finalPayload, "request.generation_config").Exists() {
-			t.Fatalf("emitted duplicate request.generation_config alongside request.generationConfig: %s", finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Int(); got != 32000 {
-			t.Fatalf("maxOutputTokens = %d, want 32000; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.temperature").Float(); got != 0.3 {
-			t.Fatalf("temperature = %v, want 0.3; body=%s", got, finalPayload)
-		}
-		if got := ojson.GetBytes(finalPayload, "request.generationConfig.thinking_config.thinking_budget").Int(); got != 31999 {
-			t.Fatalf("thinking_budget = %d, want 31999; body=%s", got, finalPayload)
-		}
-	})
-}
-
-func TestAntigravityBuildRequest_CaseInsensitiveGeminiProAndImageModels(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-
-	proPayload := []byte(`{
-		"request": {
-			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-			"generationConfig": {"maxOutputTokens": 2048},
-			"tools": [
-				{
-					"functionDeclarations": [
-						{
-							"name": "pick_item",
-							"parameters": {
-								"type": "object",
-								"properties": {
-									"item": {
-										"anyOf": [
-											{"type": "string"},
-											{"type": "object", "properties": {"image": {"type": "string"}}},
-											{"type": "object", "properties": {"audio": {"type": "string"}}}
-										]
-									}
-								}
-							}
+			"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+			"tools": [{
+				"functionDeclarations": [{
+					"name": "artifact",
+					"parametersJsonSchema": {
+						"type": "object",
+						"properties": {
+							"opt": {"type": ["string", "null"]},
+							"val": {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "null"}]}
 						},
-						{
-							"name": "ping",
-							"parameters": {"type": "object"}
+						"required": ["opt", "opt"]
+					}
+				}]
+			}],
+			"generationConfig": {"thinkingConfig": {"thinkingLevel": "xhigh"}}
+		},
+		"enabledCreditTypes": ["GOOGLE_ONE_AI"]
+	}`)
+	liveReq, errLive := executor.buildRequest(context.Background(), auth, "tok", "gemini-4-neon-xhigh", livePayload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+	if errLive != nil {
+		t.Fatalf("buildRequest live error: %v", errLive)
+	}
+	liveRaw, _ := io.ReadAll(liveReq.Body)
+	if got := ojson.GetBytes(liveRaw, "request.generationConfig.thinkingConfig.thinkingLevel").Raw; got != "100" {
+		t.Fatalf("live thinkingLevel = %s, want 100", got)
+	}
+	if got := ojson.GetBytes(liveRaw, "enabledCreditTypes.0").Raw; got != "1" {
+		t.Fatalf("live xhigh enabledCreditTypes[0] = %s, want 1", got)
+	}
+	schema := ojson.GetBytes(liveRaw, "request.tools.0.functionDeclarations.0.parametersJsonSchema")
+	if schema.Get("properties.opt.type").Raw != `["string", "null"]` || schema.Get("properties.opt.nullable").Exists() {
+		t.Fatalf("buildRequest mutated draft 2020-12 type array: %s", schema.Raw)
+	}
+	if len(schema.Get("properties.val.anyOf").Array()) != 3 || schema.Get("properties.val.nullable").Exists() {
+		t.Fatalf("buildRequest flattened anyOf union: %s", schema.Raw)
+	}
+	if schema.Get("required").Raw != `["opt"]` {
+		t.Fatalf("buildRequest did not deduplicate required: %s", schema.Raw)
+	}
+}
+
+func TestAntigravityAICodeXHighKeepsStringEnumsWhileCCPAFallbackUsesNumbers(t *testing.T) {
+	t.Setenv("USE_AICODE", "true")
+	resetAntigravityTrajectoryACLCacheForTest()
+	helps.ResetAntigravityWireStateForTest()
+	helps.ResetAntigravityCatalogForTest()
+	t.Cleanup(func() {
+		resetAntigravityTrajectoryACLCacheForTest()
+		helps.ResetAntigravityWireStateForTest()
+		helps.ResetAntigravityCatalogForTest()
+	})
+
+	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	auth := &cliproxyauth.Auth{
+		ID:       "aicode-xhigh-enums-auth",
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"access_token": "tok-aicode-xhigh",
+			"project_id":   "aicode-xhigh-project",
+			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	mendelOn := true
+	helps.UpdateAntigravityAccountState(antigravityTransportScope(auth), "g1-ultra-tier", "US", nil, &mendelOn)
+
+	var aicodeBody, ccpaBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		if req.URL.Host == "aicode.googleapis.com" {
+			aicodeBody = body
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":403}}`)),
+			}, nil
+		}
+		if req.URL.Path == antigravityStreamPath {
+			ccpaBody = body
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+
+	payload := []byte(`{
+		"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+		"tools": [{
+			"functionDeclarations": [{
+				"name": "ping",
+				"behavior": "BLOCKING",
+				"parametersJsonSchema": {"type": "object", "properties": {"q": {"type": "string"}}}
+			}]
+		}],
+		"toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+		"safetySettings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE", "method": "SEVERITY"}],
+		"generationConfig": {
+			"responseModalities": ["TEXT"],
+			"responseSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+			"thinkingConfig": {"thinkingLevel": "xhigh"}
+		}
+	}`)
+	if _, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gemini-4-neon-xhigh",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+	}); err != nil {
+		t.Fatalf("Execute(xhigh aicode->ccpa) error = %v", err)
+	}
+	if len(aicodeBody) == 0 || len(ccpaBody) == 0 {
+		t.Fatalf("expected both aicode (%d bytes) and ccpa (%d bytes) requests to be captured", len(aicodeBody), len(ccpaBody))
+	}
+
+	// AICode always marshals with UseEnumNumbers=false: unknown thinkingLevel=7 stays numeric,
+	// while all known enums remain strings (preventing aiplatform.master enum numbers from leaking onto aicode).
+	if got := ojson.GetBytes(aicodeBody, "generationConfig.thinkingConfig.thinkingLevel").Raw; got != "7" {
+		t.Fatalf("aicode thinkingLevel = %s, want 7", got)
+	}
+	if got := ojson.GetBytes(aicodeBody, "toolConfig.functionCallingConfig.mode").Raw; got != `"ANY"` {
+		t.Fatalf("aicode toolConfig.functionCallingConfig.mode = %s, want \"ANY\"", got)
+	}
+	if got := ojson.GetBytes(aicodeBody, "generationConfig.responseModalities.0").Raw; got != `"TEXT"` {
+		t.Fatalf("aicode generationConfig.responseModalities[0] = %s, want \"TEXT\"", got)
+	}
+	if got := ojson.GetBytes(aicodeBody, "generationConfig.responseSchema.type").Raw; got != `"OBJECT"` {
+		t.Fatalf("aicode generationConfig.responseSchema.type = %s, want \"OBJECT\"", got)
+	}
+	if got := ojson.GetBytes(aicodeBody, "tools.0.functionDeclarations.0.behavior").Raw; got != `"BLOCKING"` {
+		t.Fatalf("aicode functionDeclarations[0].behavior = %s, want \"BLOCKING\"", got)
+	}
+	if ojson.GetBytes(aicodeBody, "safetySettings").Exists() {
+		t.Fatalf("aicode safetySettings should remain stripped: %s", string(aicodeBody))
+	}
+
+	// CCPA fallback still flips known enums to numbers when thinkingLevel > 4.
+	if got := ojson.GetBytes(ccpaBody, "request.generationConfig.thinkingConfig.thinkingLevel").Raw; got != "7" {
+		t.Fatalf("ccpa thinkingLevel = %s, want 7", got)
+	}
+	if got := ojson.GetBytes(ccpaBody, "request.toolConfig.functionCallingConfig.mode").Raw; got != "2" {
+		t.Fatalf("ccpa toolConfig.functionCallingConfig.mode = %s, want 2", got)
+	}
+	if got := ojson.GetBytes(ccpaBody, "request.generationConfig.responseModalities.0").Raw; got != "1" {
+		t.Fatalf("ccpa generationConfig.responseModalities[0] = %s, want 1", got)
+	}
+	if got := ojson.GetBytes(ccpaBody, "request.generationConfig.responseSchema.type").Raw; got != "6" {
+		t.Fatalf("ccpa generationConfig.responseSchema.type = %s, want 6", got)
+	}
+	if got := ojson.GetBytes(ccpaBody, "request.tools.0.functionDeclarations.0.behavior").Raw; got != "1" {
+		t.Fatalf("ccpa functionDeclarations[0].behavior = %s, want 1", got)
+	}
+	if ojson.GetBytes(ccpaBody, "request.safetySettings").Exists() {
+		t.Fatalf("ccpa safetySettings should remain stripped: %s", string(ccpaBody))
+	}
+}
+
+func TestAntigravityBuildRequest_FunctionResponseTurnsUseModelRoleForEveryModel(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "fr-role-auth", Metadata: map[string]any{"project_id": "aicode-consumers"}}
+	// Raw contents bypass the Gemini-only executor normalizer, as direct /v1beta
+	// payloads for Claude or GPT targets do.
+	payload := []byte(`{"request":{"contents":[
+		{"role":"user","parts":[{"text":"run"}]},
+		{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"run","args":{}}}]},
+		{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"run","response":{"result":"one"}}}]},
+		{"role":"model","parts":[{"functionCall":{"id":"call_2","name":"run","args":{}}}]},
+		{"role":"function","parts":[{"function_response":{"id":"call_2","name":"run","response":{"result":"two"}}}]},
+		{"role":"user","parts":[{"functionResponse":{"id":"call_3","name":"run","response":{"result":"three"}}},{"text":"user note"}]}
+	]}}`)
+	for _, model := range []string{"claude-opus-4-6-thinking", "gpt-oss-120b-medium", "gemini-4-neon-high"} {
+		req, err := executor.buildRequest(context.Background(), auth, "tok", model, payload, true, "", "https://daily-cloudcode-pa.googleapis.com")
+		if err != nil {
+			t.Fatalf("%s: buildRequest error: %v", model, err)
+		}
+		raw, _ := io.ReadAll(req.Body)
+		contents := ojson.GetBytes(raw, "request.contents").Array()
+		if len(contents) != 6 {
+			t.Fatalf("%s: contents = %d, want 6; body=%s", model, len(contents), raw)
+		}
+		for _, index := range []int{2, 4} {
+			if got := contents[index].Get("role").String(); got != "model" {
+				t.Fatalf("%s: functionResponse turn %d role = %q, want model; body=%s", model, index, got, raw)
+			}
+		}
+		// A turn that mixes a tool result with user text stays a user turn.
+		if got := contents[5].Get("role").String(); got != "user" {
+			t.Fatalf("%s: mixed turn role = %q, want user; body=%s", model, got, raw)
+		}
+		// Two model turns precede the request, not four: tool results are not LLM turns.
+		if got := ojson.GetBytes(raw, "request.labels.last_step_index").String(); got != "5" {
+			t.Fatalf("%s: last_step_index = %q, want 5", model, got)
+		}
+		if got := ojson.GetBytes(raw, "request.labels.request_id").String(); !strings.HasSuffix(got, "-2") {
+			t.Fatalf("%s: request_id label = %q, want llmTurnCount 2 suffix", model, got)
+		}
+	}
+}
+
+func TestAntigravityBuildRequest_AppliesToolDescriptionReplacements(t *testing.T) {
+	helps.ResetAntigravityWireStateForTest()
+	t.Cleanup(helps.ResetAntigravityWireStateForTest)
+
+	cfg := &config.Config{
+		Antigravity: config.AntigravityConfig{
+			ToolDescriptionReplacements: map[string]string{
+				"an Amp thread":      "a session thread",
+				"An Amp thread":      "A session thread",
+				"Amp attachment URL": "attachment URL",
+			},
+		},
+	}
+	executor := NewAntigravityExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "tool-desc-auth", Metadata: map[string]any{"project_id": "aicode-consumers"}}
+	payload := []byte(`{
+		"request": {
+			"systemInstruction": {"role": "user", "parts": [{"text": "Keep an Amp thread in systemInstruction."}]},
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"tools": [{
+				"functionDeclarations": [
+					{
+						"name": "manage_amp",
+						"description": "Inspect <target> on an Amp thread.",
+						"parameters": {
+							"type": "object",
+							"properties": {
+								"attachment": {"type": "string", "description": "An Amp attachment URL"},
+								"mode": {"type": "string", "enum": ["an Amp thread"]}
+							},
+							"unevaluatedProperties": {"type": "string", "description": "Extra an Amp thread field"},
+							"required": ["attachment"]
 						}
-					]
-				}
+					},
+					{
+						"name": "bare_mcp_tool",
+						"description": "Create task",
+						"parameters": {
+							"thread_id": {"type": "string", "description": "An Amp thread ID"}
+						}
+					}
+				]
+			}]
+		}
+	}`)
+
+	prepared, err := executor.buildPreparedRequest(context.Background(), auth, "tok", "gemini-4-neon-high", payload, true, "", "https://daily-cloudcode-pa.googleapis.com", "", "")
+	if err != nil {
+		t.Fatalf("buildPreparedRequest error: %v", err)
+	}
+	aicodeBody, errAICode := helps.BuildAntigravityAICodePayload(prepared.rawBodyBytes, "g1-pro-tier")
+	if errAICode != nil {
+		t.Fatalf("BuildAntigravityAICodePayload error: %v", errAICode)
+	}
+	for label, body := range map[string][]byte{"ccpa": prepared.bodyBytes, "aicode": aicodeBody} {
+		toolsPath := "request.tools"
+		sysPath := "request.systemInstruction.parts.0.text"
+		if label == "aicode" {
+			toolsPath = "tools"
+			sysPath = "systemInstruction.parts.0.text"
+		}
+		decl := ojson.GetBytes(body, toolsPath+".0.functionDeclarations.0")
+		if got := decl.Get("name").String(); got != "manage_amp" {
+			t.Fatalf("%s: tool name = %q, want manage_amp", label, got)
+		}
+		if got := decl.Get("description").String(); got != "Inspect <target> on a session thread." {
+			t.Fatalf("%s: tool description = %q", label, got)
+		}
+		if got := decl.Get("parametersJsonSchema.properties.attachment.description").String(); got != "An attachment URL" {
+			t.Fatalf("%s: param description = %q", label, got)
+		}
+		if got := decl.Get("parametersJsonSchema.unevaluatedProperties.description").String(); got != "Extra a session thread field" {
+			t.Fatalf("%s: unevaluatedProperties description = %q", label, got)
+		}
+		if got := decl.Get("parametersJsonSchema.properties.mode.enum.0").String(); got != "an Amp thread" {
+			t.Fatalf("%s: enum mutated: %q", label, got)
+		}
+		mcpDecl := ojson.GetBytes(body, toolsPath+".0.functionDeclarations.1")
+		if got := mcpDecl.Get("parametersJsonSchema.properties.thread_id.description").String(); got != "A session thread ID" {
+			t.Fatalf("%s: bare MCP property map description = %q, want A session thread ID; body=%s", label, got, body)
+		}
+		if got := ojson.GetBytes(body, sysPath).String(); got != "Keep an Amp thread in systemInstruction." {
+			t.Fatalf("%s: systemInstruction unexpectedly mutated: %q", label, got)
+		}
+	}
+
+	// Legacy-parameter models emit protobuf Schema parameters (uppercase types)
+	// after inlining local $ref definitions and normalizing bare property maps.
+	legacyPayload := []byte(`{
+		"request": {
+			"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+			"tools": [{
+				"functionDeclarations": [
+					{
+						"name": "ref_tool",
+						"description": "Use an Amp thread",
+						"parameters": {
+							"type": "object",
+							"$defs": {
+								"Target": {"type": "string", "description": "An Amp thread ref target"}
+							},
+							"properties": {
+								"target": {"$ref": "#/$defs/Target"}
+							}
+						}
+					},
+					{
+						"name": "legacy_mcp_tool",
+						"description": "Create legacy task",
+						"parameters": {
+							"thread_id": {"type": "string", "description": "An Amp thread ID"}
+						}
+					}
+				]
+			}]
+		}
+	}`)
+	legacyPrepared, errLegacy := executor.buildPreparedRequest(context.Background(), auth, "tok", "claude-sonnet-5-5-medium", legacyPayload, true, "", "https://daily-cloudcode-pa.googleapis.com", "", "")
+	if errLegacy != nil {
+		t.Fatalf("legacy buildPreparedRequest error: %v", errLegacy)
+	}
+	legacyDecl := ojson.GetBytes(legacyPrepared.bodyBytes, "request.tools.0.functionDeclarations.0")
+	if got := legacyDecl.Get("description").String(); got != "Use a session thread" {
+		t.Fatalf("legacy description = %q", got)
+	}
+	if got := legacyDecl.Get("parameters.properties.target.description").String(); got != "A session thread ref target" {
+		t.Fatalf("legacy inlined $ref description = %q; body=%s", got, legacyPrepared.bodyBytes)
+	}
+	legacyMCP := ojson.GetBytes(legacyPrepared.bodyBytes, "request.tools.0.functionDeclarations.1")
+	if got := legacyMCP.Get("parameters.properties.thread_id.description").String(); got != "A session thread ID" {
+		t.Fatalf("legacy bare MCP description = %q; body=%s", got, legacyPrepared.bodyBytes)
+	}
+}
+
+func TestAntigravityBuildPreparedRequest_NormalizesFunctionResponseResultToOutput(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "test-funcresp-output",
+		Provider: "antigravity",
+		Metadata: map[string]any{"project_id": "proj-1", "refresh_token": "rt-funcresp"},
+	}
+	rawGemini := []byte(`{
+		"request": {
+			"contents": [
+				{"role": "user", "parts": [{"text": "run"}]},
+				{"role": "model", "parts": [{"functionCall": {"id": "call-1", "name": "Bash", "args": {"cmd": "pwd"}}}, {"functionCall": {"id": "call-2", "name": "Obj", "args": {}}}]},
+				{"role": "user", "parts": [
+					{"functionResponse": {"id": "call-1", "name": "Bash", "response": {"result": "/tmp"}}},
+					{"functionResponse": {"id": "call-2", "name": "Obj", "response": {"result": {"ok": true}}}}
+				]}
 			]
 		}
 	}`)
 
-	for _, modelName := range []string{"Gemini-3-Pro", "Gemini-3.1-Pro"} {
-		t.Run(modelName, func(t *testing.T) {
-			doc := ojson.NewDoc(proPayload)
-			_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", modelName, doc, false, "", "https://example.com")
-			if errBuild != nil {
-				t.Fatalf("buildRequestDoc(%q) error: %v", modelName, errBuild)
-			}
-			if ojson.GetBytes(finalPayload, "request.toolConfig.functionCallingConfig.mode").Exists() {
-				t.Fatalf("model %q: unexpected VALIDATED mode on Gemini model", modelName)
-			}
-			if ojson.GetBytes(finalPayload, "request.generationConfig.maxOutputTokens").Exists() {
-				t.Fatalf("model %q: maxOutputTokens should be removed for non-Claude model", modelName)
-			}
-			firstParams := ojson.GetBytes(finalPayload, "request.tools.0.functionDeclarations.0.parameters")
-			if got := len(firstParams.Get("properties.item.anyOf").Array()); got != 3 {
-				t.Fatalf("model %q: expected preserved 3-branch anyOf union, got %d (%s)", modelName, got, firstParams.Raw)
-			}
-			secondParams := ojson.GetBytes(finalPayload, "request.tools.0.functionDeclarations.1.parameters")
-			if !secondParams.Get("properties.reason").Exists() {
-				t.Fatalf("model %q: expected Antigravity placeholder property on empty object schema, got %s", modelName, secondParams.Raw)
-			}
-		})
+	prepared, err := executor.buildPreparedRequest(context.Background(), auth, "tok", "gemini-4-neon-high", rawGemini, true, "", "https://daily-cloudcode-pa.googleapis.com", "", "")
+	if err != nil {
+		t.Fatalf("buildPreparedRequest error: %v", err)
 	}
 
-	t.Run("Gemini-3.1-Flash-Image", func(t *testing.T) {
-		doc := ojson.NewDoc([]byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"draw a cat"}]}]}}`))
-		_, finalPayload, errBuild := executor.buildRequestDoc(context.Background(), auth, "token", "Gemini-3.1-Flash-Image", doc, false, "", "https://example.com")
-		if errBuild != nil {
-			t.Fatalf("buildRequestDoc image model error: %v", errBuild)
-		}
-		if got := ojson.GetBytes(finalPayload, "requestType").String(); got != "image_gen" {
-			t.Fatalf("requestType = %q, want image_gen", got)
-		}
-		if got := ojson.GetBytes(finalPayload, "requestId").String(); !strings.HasPrefix(got, "image_gen/") {
-			t.Fatalf("requestId = %q, want image_gen/ prefix", got)
-		}
-		if ojson.GetBytes(finalPayload, "request.sessionId").Exists() {
-			t.Fatalf("image model request should not set request.sessionId: %s", string(finalPayload))
-		}
-	})
-}
-
-func TestAntigravityExecute_CaseInsensitiveGeminiRouteToStreamHelper(t *testing.T) {
-	t.Parallel()
-
-	for _, modelName := range []string{"Gemini-3-Pro", "Gemini-3.1-Flash-Image"} {
-		t.Run(modelName, func(t *testing.T) {
-			var capturedPath string
-			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				capturedPath = req.URL.Path
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-					Body:       io.NopCloser(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n")),
-				}, nil
-			})
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", rt)
-			executor := &AntigravityExecutor{cfg: &config.Config{}}
-			auth := &cliproxyauth.Auth{
-				ID: "auth-case-route",
-				Metadata: map[string]any{
-					"access_token": "token",
-					"expired":      time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-					"project_id":   "project-1",
-				},
-			}
-			req := cliproxyexecutor.Request{
-				Model:   modelName,
-				Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
-			}
-			opts := cliproxyexecutor.Options{
-				SourceFormat:   sdktranslator.FormatGemini,
-				ResponseFormat: sdktranslator.FormatGemini,
-			}
-
-			_, errExec := executor.Execute(ctx, auth, req, opts)
-			if errExec != nil {
-				t.Fatalf("Execute(%q) error: %v", modelName, errExec)
-			}
-			if !strings.Contains(capturedPath, "streamGenerateContent") {
-				t.Fatalf("Execute(%q) hit path %q, want streamGenerateContent via executeClaudeNonStream", modelName, capturedPath)
-			}
-		})
+	aicodeBody, errAICode := helps.BuildAntigravityAICodePayload(prepared.rawBodyBytes, "g1-pro-tier")
+	if errAICode != nil {
+		t.Fatalf("BuildAntigravityAICodePayload error: %v", errAICode)
 	}
-}
 
-func TestAntigravitySessionIDDistributionIncludesPositiveAndNegative(t *testing.T) {
-	t.Parallel()
-
-	t.Run("generateSessionID emits signed int64 values with both signs", func(t *testing.T) {
-		var pos, neg int
-		for i := 0; i < 128; i++ {
-			val := assertSignedInt64RequestSessionID(t, generateSessionID())
-			if val > 0 {
-				pos++
-			} else if val < 0 {
-				neg++
-			}
+	// Verify both CCPA envelope (request.contents) and AICode body (contents).
+	for _, tc := range []struct {
+		name   string
+		body   []byte
+		prefix string
+	}{
+		{name: "ccpa", body: prepared.bodyBytes, prefix: "request.contents.2"},
+		{name: "aicode", body: aicodeBody, prefix: "contents.2"},
+	} {
+		turn := ojson.GetBytes(tc.body, tc.prefix)
+		if got := turn.Get("role").String(); got != "model" {
+			t.Fatalf("%s turn role = %q, want model; body=%s", tc.name, got, tc.body)
 		}
-		if pos == 0 || neg == 0 {
-			t.Fatalf("generateSessionID produced skewed signs: pos=%d neg=%d", pos, neg)
+		resp0 := turn.Get("parts.0.functionResponse.response")
+		if got := resp0.Get("output").String(); got != "/tmp" || resp0.Get("result").Exists() {
+			t.Fatalf("%s string response = %s, want {\"output\":\"/tmp\"}", tc.name, resp0.Raw)
 		}
-	})
-
-	t.Run("generateStableSessionIDFromContentsForAuth matches FNV-1a signed int64 with both signs", func(t *testing.T) {
-		var unauthPos, unauthNeg int
-		var authPos, authNeg int
-		for i := 0; i < 64; i++ {
-			unauthPrompt := fmt.Sprintf("conversation-%d: explain topic", i)
-			unauthDoc := ojson.NewDoc([]byte(fmt.Sprintf(`{"request":{"contents":[{"role":"user","parts":[{"text":%q}]}]}}`, unauthPrompt)))
-
-			unauthID := generateStableSessionIDDocForAuth(unauthDoc, "")
-			wantUnauth := helps.HashAntigravitySessionID([]byte(unauthPrompt))
-			if unauthID != wantUnauth {
-				t.Fatalf("unauthenticated stable sessionId = %q, want %q", unauthID, wantUnauth)
-			}
-			unauthVal := assertSignedInt64RequestSessionID(t, unauthID)
-			if unauthVal > 0 {
-				unauthPos++
-			} else if unauthVal < 0 {
-				unauthNeg++
-			}
-
-			// Sequential trailing-digit prompts still avalanche across both signs when auth-scoped.
-			authPrompt := fmt.Sprintf("user prompt %d", i)
-			authDoc := ojson.NewDoc([]byte(fmt.Sprintf(`{"request":{"contents":[{"role":"user","parts":[{"text":%q}]}]}}`, authPrompt)))
-			authID := generateStableSessionIDDocForAuth(authDoc, "auth-a")
-			wantAuth := helps.HashAntigravitySessionID([]byte(authPrompt + "\x00auth-a\x00cli-proxy-api:antigravity:content-session"))
-			if authID != wantAuth {
-				t.Fatalf("auth-scoped stable sessionId = %q, want %q", authID, wantAuth)
-			}
-			authVal := assertSignedInt64RequestSessionID(t, authID)
-			if authVal > 0 {
-				authPos++
-			} else if authVal < 0 {
-				authNeg++
-			}
+		resp1 := turn.Get("parts.1.functionResponse.response")
+		if !resp1.Get("result.ok").Bool() || resp1.Get("output").Exists() {
+			t.Fatalf("%s structured response = %s, want preserved result object", tc.name, resp1.Raw)
 		}
-		if unauthPos == 0 || unauthNeg == 0 {
-			t.Fatalf("unauthenticated generateStableSessionIDDocForAuth produced skewed signs: pos=%d neg=%d", unauthPos, unauthNeg)
-		}
-		if authPos == 0 || authNeg == 0 {
-			t.Fatalf("auth-scoped generateStableSessionIDDocForAuth produced skewed signs: pos=%d neg=%d", authPos, authNeg)
-		}
-	})
+	}
 }

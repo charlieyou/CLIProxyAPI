@@ -231,6 +231,7 @@ func setSourceAuthFileDisabled(path string, disabled bool) error {
 	}
 	coreauth.NormalizeCredentialMetadata(metadata)
 	metadata["disabled"] = disabled
+	delete(metadata, "quarantined")
 	raw, errMarshal := json.Marshal(metadata)
 	if errMarshal != nil {
 		return fmt.Errorf("marshal auth file: %w", errMarshal)
@@ -263,6 +264,7 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["disabled"] = disabled
+	delete(auth.Metadata, "quarantined")
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -853,6 +855,7 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 	if !ok {
 		return
 	}
+	delete(auth.Metadata, "quarantined")
 	wasDisabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
 	auth.Disabled = disabled
 	if disabled {

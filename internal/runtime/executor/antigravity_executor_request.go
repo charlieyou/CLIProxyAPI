@@ -3,163 +3,283 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	antigravityauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/latencydiag"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry/agymodels"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-	antigravitygemini "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util/agyutil"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
-type antigravityPreparedRequest struct {
-	model              helps.AntigravityRequestModel
-	auth               *cliproxyauth.Auth
-	token              string
-	originalPayload    []byte
-	originalTranslated []byte
-	translated         []byte
-	cooldownRejected   bool
+const (
+	antigravityTrajectoryACLCacheCapacity = 4096
+	antigravityTrajectoryACLTimeout       = 10 * time.Second
+	antigravityPreSessionCheckInterval    = 5 * time.Minute
+	antigravityAICodeStreamEndpoint       = "https://aicode.googleapis.com/v1alpha:streamGenerateContent?alt=sse"
+)
+
+type antigravityTrajectoryACLKey struct {
+	credential   string
+	trajectoryID string
 }
 
-func (e *AntigravityExecutor) prepareAntigravityRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, stream, countTokens bool) (antigravityPreparedRequest, error) {
-	source := opts.OriginalRequest
-	if len(source) == 0 {
-		source = req.Payload
+var (
+	antigravityTrajectoryACLMu          sync.Mutex
+	antigravityTrajectoryACLSet         = make(map[antigravityTrajectoryACLKey]struct{})
+	antigravityTrajectoryACLOrder       []antigravityTrajectoryACLKey
+	antigravityTrajectoryACLGroup       singleflight.Group
+	antigravityShouldWriteTrajectoryACL = defaultAntigravityShouldWriteTrajectoryACL
+)
+
+func defaultAntigravityShouldWriteTrajectoryACL(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
 	}
-	from, to := opts.SourceFormat, sdktranslator.FormatAntigravity
-	prepared := antigravityPreparedRequest{auth: auth}
-	useCredits := !countTokens && antigravityShouldBypassShortCooldown(ctx, e.cfg)
-	rejectCooldown := func(model string, err error) error {
-		prepared.cooldownRejected = true
-		if model != baseModel {
-			return cliproxyauth.RejectAntigravityTarget(err)
-		}
-		return err
-	}
-	translate := func(credential *cliproxyauth.Auth) error {
-		translateCtx := cache.WithSignatureCacheScope(ctx, antigravitySignatureCacheScope(credential))
-		model := helps.SelectAntigravityRequestModel(translateCtx, e.cfg, credential, req.Model, baseModel, from.String(), source, countTokens)
-		if model.ID != baseModel {
-			if errCooldown := cliproxyauth.CheckAntigravityTargetModel(ctx, credential, model.ID, time.Now(), useCredits); errCooldown != nil {
-				return rejectCooldown(model.ID, errCooldown)
-			}
-		} else if useCredits {
-			if errCooldown := cliproxyauth.CheckAntigravityDirectCreditsModel(ctx, credential, model.ID, time.Now()); errCooldown != nil {
-				prepared.cooldownRejected = true
-				return cliproxyauth.RejectAntigravityTarget(errCooldown)
-			}
-		}
-		if errCooldown := e.checkAntigravityRequestCooldown(ctx, credential, model.ID, countTokens); errCooldown != nil {
-			return rejectCooldown(model.ID, errCooldown)
-		}
-		original, errValidate := validateAntigravityRequestSignatures(translateCtx, model.ID, from, source)
-		if errValidate != nil {
-			return errValidate
-		}
-		prepared.model, prepared.originalPayload = model, original
-		envelope := sdktranslator.RequestEnvelope{Format: from, Model: model.ID, Body: original, Stream: stream, ModelInfo: model.TranslationModelInfo(req, baseModel, from)}
-		if countTokens {
-			translated := helps.TranslateRequestEnvelopeWithCodexMultiAgentV2(translateCtx, opts.Headers, e.cfg, from, to, envelope)
-			if translated.Err != nil {
-				return translated.Err
-			}
-			prepared.translated = translated.Body
-			prepared.originalTranslated = append([]byte(nil), translated.Body...)
-			return nil
-		}
-		var errTranslate error
-		prepared.originalTranslated, prepared.translated, errTranslate = helps.TranslateRequestEnvelopePairWithCodexMultiAgentV2(translateCtx, opts.Headers, e.cfg, from, to, envelope, original, original)
-		return errTranslate
-	}
-	// A translation refusal must precede token refresh and any upstream request.
-	if errTranslate := translate(auth); errTranslate != nil {
-		return prepared, errTranslate
-	}
-	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
-	if errToken != nil {
-		return antigravityPreparedRequest{}, errToken
-	}
-	if updatedAuth != nil {
-		// A changed catalog identity, exclusion policy, or signature scope invalidates this attempt's snapshot.
-		if !cliproxyauth.SameAntigravityModelCatalogScope(auth, updatedAuth) || antigravitySignatureCacheScope(auth) != antigravitySignatureCacheScope(updatedAuth) {
-			if errTranslate := translate(updatedAuth); errTranslate != nil {
-				return prepared, errTranslate
-			}
-		} else if prepared.model.ID != baseModel {
-			if errCooldown := cliproxyauth.CheckAntigravityTargetModel(ctx, updatedAuth, prepared.model.ID, time.Now(), useCredits); errCooldown != nil {
-				err := rejectCooldown(prepared.model.ID, errCooldown)
-				return prepared, err
-			}
-		} else if useCredits {
-			if errCooldown := cliproxyauth.CheckAntigravityDirectCreditsModel(ctx, updatedAuth, prepared.model.ID, time.Now()); errCooldown != nil {
-				prepared.cooldownRejected = true
-				return prepared, cliproxyauth.RejectAntigravityTarget(errCooldown)
-			}
-		}
-		prepared.auth = updatedAuth
-	}
-	prepared.token = token
-	if prepared.model.ID != baseModel {
-		cliproxyexecutor.SetUpstreamAttemptModel(ctx, prepared.model.ID)
-	}
-	return prepared, nil
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "daily-cloudcode-pa.googleapis.com" ||
+		host == "cloudcode-pa.googleapis.com" ||
+		strings.HasSuffix(host, ".googleapis.com")
 }
 
-func (e *AntigravityExecutor) checkAntigravityRequestCooldown(ctx context.Context, auth *cliproxyauth.Auth, model string, countTokens bool) error {
-	if antigravityCoolingDisabled(auth, e.cfg) {
+func resetAntigravityTrajectoryACLCacheForTest() {
+	antigravityTrajectoryACLMu.Lock()
+	antigravityTrajectoryACLSet = make(map[antigravityTrajectoryACLKey]struct{})
+	antigravityTrajectoryACLOrder = nil
+	antigravityTrajectoryACLMu.Unlock()
+}
+
+func hasAntigravityTrajectoryACL(key antigravityTrajectoryACLKey) bool {
+	antigravityTrajectoryACLMu.Lock()
+	defer antigravityTrajectoryACLMu.Unlock()
+	_, ok := antigravityTrajectoryACLSet[key]
+	return ok
+}
+
+func markAntigravityTrajectoryACL(key antigravityTrajectoryACLKey) {
+	antigravityTrajectoryACLMu.Lock()
+	defer antigravityTrajectoryACLMu.Unlock()
+	if _, exists := antigravityTrajectoryACLSet[key]; exists {
+		return
+	}
+	if len(antigravityTrajectoryACLOrder) >= antigravityTrajectoryACLCacheCapacity {
+		oldest := antigravityTrajectoryACLOrder[0]
+		antigravityTrajectoryACLOrder[0] = antigravityTrajectoryACLKey{}
+		antigravityTrajectoryACLOrder = antigravityTrajectoryACLOrder[1:]
+		delete(antigravityTrajectoryACLSet, oldest)
+	}
+	antigravityTrajectoryACLSet[key] = struct{}{}
+	antigravityTrajectoryACLOrder = append(antigravityTrajectoryACLOrder, key)
+}
+
+// ensureAntigravityTrajectoryACL sends POST /v1internal:writeTrajectoryAcls once
+// per (credential, trajectoryID) before the first turn of a new trajectory,
+// matching agy 1.5.16's exact pre-inference handshake.
+func (e *AntigravityExecutor) ensureAntigravityTrajectoryACL(ctx context.Context, httpClient *http.Client, auth *cliproxyauth.Auth, token, baseURL, trajectoryID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+	trajectoryID = strings.TrimSpace(trajectoryID)
+	token = strings.TrimSpace(token)
+	if trajectoryID == "" || token == "" || httpClient == nil {
 		return nil
 	}
-	inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, model, time.Now())
-	if errCooldown != nil {
-		return homeKVUnavailableStatusErr(errCooldown)
+	base := strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = resolveAntigravityRequestBaseURL(auth)
 	}
-	if inCooldown && (countTokens || !antigravityShouldBypassShortCooldown(ctx, e.cfg)) {
-		if latencydiag.FromContext(ctx) != nil {
-			latencydiag.Event(ctx, "antigravity_short_cooldown_skip", map[string]any{
-				"model":        model,
-				"credential":   latencydiag.Opaque(ctx, antigravityAuthID(auth)),
-				"remaining_ms": remaining.Milliseconds(),
-			})
+	if !antigravityShouldWriteTrajectoryACL(base) {
+		return nil
+	}
+	credScope := antigravityTransportScope(auth)
+	key := antigravityTrajectoryACLKey{
+		credential:   credScope,
+		trajectoryID: trajectoryID,
+	}
+	if hasAntigravityTrajectoryACL(key) || helps.HasAntigravityTrajectoryACLWritten(trajectoryID) {
+		return nil
+	}
+	sfKey := key.credential + "|" + key.trajectoryID
+	ch := antigravityTrajectoryACLGroup.DoChan(sfKey, func() (any, error) {
+		if hasAntigravityTrajectoryACL(key) || helps.HasAntigravityTrajectoryACLWritten(trajectoryID) {
+			return nil, nil
 		}
-		log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", antigravityAuthID(auth), model, remaining)
-		return statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &remaining}
+		aclCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), antigravityTrajectoryACLTimeout)
+		defer cancel()
+
+		body, errMarshal := json.Marshal(map[string]string{"trajectoryId": trajectoryID})
+		if errMarshal != nil {
+			return nil, nil
+		}
+		endpoint := base + antigravityWriteTrajectoryAclsPath
+		req, errReq := http.NewRequestWithContext(aclCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if errReq != nil {
+			return nil, nil
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", resolveUserAgent(auth))
+		if host := resolveHost(base); host != "" {
+			req.Host = host
+		}
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(req, attrs)
+
+		resp, errDo := httpClient.Do(req)
+		if errDo != nil {
+			log.Debugf("antigravity executor: writeTrajectoryAcls error: %v", errDo)
+			return nil, nil
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256<<10))
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("antigravity executor: close writeTrajectoryAcls body error: %v", errClose)
+		}
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			markAntigravityTrajectoryACL(key)
+			helps.MarkAntigravityTrajectoryACLWritten(trajectoryID)
+		} else {
+			log.Debugf("antigravity executor: writeTrajectoryAcls returned status %d", resp.StatusCode)
+		}
+		return nil, nil
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ch:
+		return ctx.Err()
 	}
-	return nil
+}
+
+// ensureAntigravityColdStartWarmup runs agy's full control-plane startup sequence
+// once per credential if the process booted with an expired token (which skipped
+// startup probing) so the first inference never fires writeTrajectoryAcls and
+// streamGenerateContent without preceding userinfo/loadCodeAssist/fetchAvailableModels.
+// Coordinated via helps.DoAntigravityControlPlaneSync so it shares one singleflight
+// with probeAntigravityModelCapabilityHints and never fires two overlapping bursts.
+func (e *AntigravityExecutor) ensureAntigravityColdStartWarmup(ctx context.Context, httpClient *http.Client, auth *cliproxyauth.Auth, token, projectID, baseURL string) error {
+	if !helps.IsAntigravityGoogleHost(baseURL) || httpClient == nil || strings.TrimSpace(token) == "" {
+		return nil
+	}
+	if _, ok := httpClient.Transport.(*http.Transport); !ok {
+		return nil
+	}
+	credScope := antigravityTransportScope(auth)
+	if helps.HasAntigravityControlPlaneSynced(credScope) {
+		return nil
+	}
+	return helps.DoAntigravityControlPlaneSync(ctx, credScope, 0, func(syncCtx context.Context) bool {
+		warmCtx, cancel := context.WithTimeout(syncCtx, 25*time.Second)
+		defer cancel()
+		authSvc := antigravityauth.NewAntigravityAuth(e.cfg, httpClient)
+		state := authSvc.RunCompanionControlPlane(warmCtx, token, projectID, true)
+		if state != nil {
+			helps.UpdateAntigravityAccountState(credScope, state.PaidTierID, state.RegionCode, state.TelemetryEnabled, state.UseAICodeMendel)
+		}
+		return warmCtx.Err() == nil
+	})
+}
+
+// maybeRunAntigravityPreSessionCheck runs agy's pre-session quota/license check
+// synchronously BEFORE writeTrajectoryAcls on brand-new Turn-1 trajectories only
+// (never mid-tool-loop and never racing asynchronously behind streamGenerateContent).
+func (e *AntigravityExecutor) maybeRunAntigravityPreSessionCheck(ctx context.Context, httpClient *http.Client, auth *cliproxyauth.Auth, token, projectID, baseURL string, prepared *antigravityPreparedRequest) {
+	if prepared == nil || prepared.llmTurnCount != 0 || !helps.IsAntigravityGoogleHost(baseURL) || httpClient == nil || strings.TrimSpace(token) == "" {
+		return
+	}
+	if _, ok := httpClient.Transport.(*http.Transport); !ok {
+		return
+	}
+	credScope := antigravityTransportScope(auth)
+	key := antigravityTrajectoryACLKey{
+		credential:   credScope,
+		trajectoryID: strings.TrimSpace(prepared.trajectoryID),
+	}
+	if key.trajectoryID != "" && (hasAntigravityTrajectoryACL(key) || helps.HasAntigravityTrajectoryACLWritten(key.trajectoryID)) {
+		return
+	}
+	if !helps.ClaimAntigravityPreSessionCheck(credScope, antigravityPreSessionCheckInterval) {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	authSvc := antigravityauth.NewAntigravityAuth(e.cfg, httpClient)
+	state := authSvc.RunPreSessionCheck(checkCtx, token, projectID)
+	if state != nil && state.PaidTierID != "" {
+		helps.UpdateAntigravityAccountState(credScope, state.PaidTierID, state.RegionCode, state.TelemetryEnabled, nil)
+	}
+}
+
+func isAntigravityRetryableStatus(code int) bool {
+	return code == http.StatusUnauthorized || code == http.StatusTooManyRequests || code == http.StatusRequestTimeout || code >= http.StatusInternalServerError
+}
+
+type antigravityPreparedRequest struct {
+	httpReq      *http.Request
+	bodyBytes    []byte
+	rawBodyBytes []byte
+	trajectoryID string
+	projectID    string
+	llmTurnCount int
+	isImageModel bool
+	isWebSearch  bool
 }
 
 func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string, derivedSessionIDs ...string) (*http.Request, error) {
-	doc := ojson.NewDoc(payload)
-	httpReq, _, err := e.buildRequestDoc(ctx, auth, token, modelName, doc, stream, alt, baseURL, derivedSessionIDs...)
-	return httpReq, err
+	req, _, err := e.buildRequestWithTrajectory(ctx, auth, token, modelName, payload, stream, alt, baseURL, derivedSessionIDs...)
+	return req, err
 }
 
-func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, doc *ojson.Doc, stream bool, alt, baseURL string, derivedSessionIDs ...string) (*http.Request, []byte, error) {
-	selection := cliproxyauth.SelectAntigravityModel(ctx, auth, modelName, "", e.cfg)
-	return e.buildRequestForModelDoc(ctx, auth, token, selection, doc, stream, alt, baseURL, derivedSessionIDs...)
+func (e *AntigravityExecutor) buildRequestWithTrajectory(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string, derivedSessionIDs ...string) (*http.Request, string, error) {
+	derivedSessionID := ""
+	if len(derivedSessionIDs) > 0 {
+		derivedSessionID = derivedSessionIDs[0]
+	}
+	prepared, err := e.buildPreparedRequest(ctx, auth, token, modelName, payload, stream, alt, baseURL, derivedSessionID, "")
+	if err != nil {
+		return nil, "", err
+	}
+	return prepared.httpReq, prepared.trajectoryID, nil
 }
 
-func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth *cliproxyauth.Auth, token string, selection cliproxyauth.AntigravityModelSelection, doc *ojson.Doc, stream bool, alt, baseURL string, derivedSessionIDs ...string) (*http.Request, []byte, error) {
+func (e *AntigravityExecutor) buildPreparedRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL, derivedSessionID, explicitSessionID string) (*antigravityPreparedRequest, error) {
 	if token == "" {
-		return nil, nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token", credentialScoped: true}
 	}
-	if doc == nil {
-		doc = ojson.NewDoc(nil)
+
+	payload = helps.NormalizeAntigravityGenerationConfig(payload)
+	resolvedModel, resolvedLevel := helps.ResolveAntigravityUpstreamModel(modelName, payload, "")
+	if resolvedModel != "" {
+		modelName = resolvedModel
 	}
+	payload = helps.NormalizeAntigravityThinkingWireFormat(payload, modelName, resolvedLevel)
 
 	base := strings.TrimSuffix(baseURL, "/")
 	if base == "" {
@@ -173,12 +293,8 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 	requestURL.WriteString(base)
 	requestURL.WriteString(path)
 	if stream {
-		if alt != "" {
-			requestURL.WriteString("?$alt=")
-			requestURL.WriteString(url.QueryEscape(alt))
-		} else {
-			requestURL.WriteString("?alt=sse")
-		}
+		// agy always uses ?alt=sse on streamGenerateContent; never forward client $alt values.
+		requestURL.WriteString("?alt=sse")
 	} else if alt != "" {
 		requestURL.WriteString("?$alt=")
 		requestURL.WriteString(url.QueryEscape(alt))
@@ -186,61 +302,86 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 
 	projectID, errProject := e.projectIDForRequest(ctx, auth, token)
 	if errProject != nil {
-		return nil, nil, errProject
+		return nil, errProject
 	}
-	modelName := selection.ID
-	isAgent := geminiToAntigravityDocForAuth(doc, selection, projectID, auth, derivedSessionIDs...)
-	promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutputDoc(modelName, doc)
-	antigravitygemini.NormalizeAntigravityRequestDoc(doc)
+	helps.TouchAntigravityActivity()
+	credScope := antigravityTransportScope(auth)
+	payload = helps.CanonicalizeAntigravityProtoKeys(payload)
+	if snakeSys := ojson.GetBytes(payload, "request.system_instruction"); snakeSys.Exists() && !ojson.GetBytes(payload, "request.systemInstruction").Exists() {
+		payload, _ = ojson.SetRawBytes(payload, "request.systemInstruction", []byte(snakeSys.Raw))
+		payload, _ = ojson.DeleteBytes(payload, "request.system_instruction")
+	}
+	payload = helps.NormalizeAntigravitySystemInstructionParts(payload)
+	// Enforce agy's role and {"output": "..."} response key on tool results for
+	// every source format and model family (CCPA and AICode bodies both derive
+	// from this payload) before step counting, conversation fingerprinting, and
+	// USER_REQUEST wrapping inspect the turns.
+	payload = helps.NormalizeAntigravityFunctionResponseRoles(payload)
+	payload = helps.NormalizeAntigravityFunctionResponseOutputs(payload)
+	_, llmTurnCount := helps.CountAntigravityAgentSteps(payload)
+	payload = geminiToAntigravityWithScope(credScope, strings.TrimSpace(explicitSessionID), modelName, payload, projectID, derivedSessionID)
+	payload = e.obfuscateSensitiveWords(payload)
 
-	lowerModel := strings.ToLower(modelName)
-	useAntigravitySchema, isClaudeModel := antigravitySchemaSanitizationFlags(modelName)
+	isImageModel := strings.Contains(strings.ToLower(modelName), "image") || strings.EqualFold(strings.TrimSpace(ojson.GetBytes(payload, "requestType").String()), "image_gen")
+	isWebSearch := strings.EqualFold(strings.TrimSpace(ojson.GetBytes(payload, "requestType").String()), "web_search")
 
-	// A matched variant limits output using the same catalog as its ID and enum.
-	if selection.MaxOutputTokens > 0 {
-		helps.CapAntigravityMaxOutputTokensDoc(doc, selection.MaxOutputTokens, isClaudeModel)
-	} else if maxOut, ok := antigravityRequestedMaxOutputTokensDoc(doc); ok {
-		modelInfo := registry.LookupModelInfo(modelName, "antigravity")
-		if modelInfo == nil && lowerModel != modelName {
-			modelInfo = registry.LookupModelInfo(lowerModel, "antigravity")
+	if !strings.Contains(strings.ToLower(modelName), "claude") {
+		payload = helps.NormalizeAntigravityToolCallIDs(payload)
+	}
+	trajectoryID := strings.TrimSpace(ojson.GetBytes(payload, "request.labels.trajectory_id").String())
+
+	// Align maxOutputTokens with agy: keep/cap it for agent requests (defaulting
+	// to the model's upstream maxOutputTokens when known), while still dropping
+	// it on image generation requests.
+	modelMaxOut := helps.AntigravityModelMaxOutputTokens(modelName)
+	if modelMaxOut <= 0 {
+		if modelInfo := agymodels.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+			modelMaxOut = modelInfo.MaxCompletionTokens
 		}
-		if modelInfo != nil && modelInfo.MaxCompletionTokens > 0 && maxOut > modelInfo.MaxCompletionTokens {
-			helps.CapAntigravityMaxOutputTokensDoc(doc, modelInfo.MaxCompletionTokens, isClaudeModel)
-		}
 	}
-	if antigravityRequestNeedsSchemaSanitizationDoc(doc) {
-		sanitizeAntigravityRequestSchemasForModelDoc(doc, useAntigravitySchema, isClaudeModel)
-	}
-	e.applyToolDescriptionReplacementsDoc(doc)
-	if isClaudeModel {
-		if !promptStructuredOutput && !antigravityToolChoiceModeIsNoneDoc(doc) {
-			canonicalizeAntigravityToolConfigForValidatedDoc(doc)
-			_ = doc.Set("request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+	if !isImageModel && !isWebSearch {
+		if maxOut := ojson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == ojson.Number {
+			if modelMaxOut > 0 && int(maxOut.Int()) > modelMaxOut {
+				payload, _ = ojson.SetBytes(payload, "request.generationConfig.maxOutputTokens", modelMaxOut)
+			}
+		} else if modelMaxOut > 0 {
+			payload, _ = ojson.SetBytes(payload, "request.generationConfig.maxOutputTokens", modelMaxOut)
 		}
-	} else if selection.MaxOutputTokens == 0 {
-		stripAntigravityMaxOutputTokensDoc(doc)
+		payload = normalizeAntigravityToolConfig(payload)
+		payload = stripNonAgyGenerationAndToolConfig(payload)
 	}
 
-	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
-	helps.FinalizePayloadDoc(ctx, doc)
-	if isAgent {
-		// A filtered requestType is not reinserted. If a rule explicitly selected
-		// another request type, keep that protocol's serialization unchanged.
-		requestType := doc.Get("requestType")
-		isAgent = !requestType.Exists() || strings.TrimSpace(requestType.String()) == "agent"
+	var finalBytes []byte
+	if antigravityRequestNeedsSchemaSanitization(payload) {
+		payloadStr := sanitizeAntigravityNativeRequestSchemas(string(payload), agyutil.IsAntigravityLegacyParametersModel(modelName))
+		if isImageModel {
+			payloadStr, _ = ojson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+		}
+		finalBytes = agyApplyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
+	} else {
+		if isImageModel {
+			payload, _ = ojson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+		}
+		finalBytes = agyApplyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
 	}
-	finalPayload := helps.SerializeAntigravityPayload(doc, isAgent)
-	var (
-		bodyReader io.Reader = bytes.NewReader(finalPayload)
-		payloadLog []byte
-	)
-	if e.cfg != nil && e.cfg.RequestLog {
-		payloadLog = append([]byte(nil), finalPayload...)
+	// Apply tool description replacements after schema normalization and local
+	// $ref inlining so bare MCP property maps and inlined definitions are also
+	// scrubbed across both CCPA and AICode payloads.
+	if e.cfg != nil && len(e.cfg.Antigravity.ToolDescriptionReplacements) > 0 {
+		finalBytes = helps.ApplyAntigravityToolDescriptionReplacements(finalBytes, e.cfg.Antigravity.ToolDescriptionReplacements)
 	}
+	// Preserve the pre-CCPA-formatted envelope for AICode, where agy 1.5.16's
+	// aicodeConverter always marshals with UseEnumNumbers=false (keeping known
+	// enums as strings even when thinkingLevel > 4 flips CCPA to enum numbers).
+	rawBodyBytes := finalBytes
+	finalBytes = helps.FormatAntigravityCCPAWireJSON(rawBodyBytes)
 
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bodyReader)
+	// Pass *bytes.Reader directly so net/http sets Content-Length (matching
+	// agy 1.5.16's ccpahttp.(*Transport).newPostRequest, which never sends
+	// Transfer-Encoding: chunked).
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(finalBytes))
 	if errReq != nil {
-		return nil, nil, errReq
+		return nil, errReq
 	}
 	// Deliberately no httpReq.Close: the native Antigravity client omits the
 	// Connection header and keeps its HTTP/1.1 connections alive, so forcing
@@ -258,6 +399,26 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
 
+	return &antigravityPreparedRequest{
+		httpReq:      httpReq,
+		bodyBytes:    finalBytes,
+		rawBodyBytes: rawBodyBytes,
+		trajectoryID: trajectoryID,
+		projectID:    projectID,
+		llmTurnCount: llmTurnCount,
+		isImageModel: isImageModel,
+		isWebSearch:  isWebSearch,
+	}, nil
+}
+
+func (e *AntigravityExecutor) recordAntigravityAPIRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request, body []byte) {
+	if req == nil {
+		return
+	}
+	var payloadLog []byte
+	if e.cfg != nil && e.cfg.RequestLog {
+		payloadLog = append([]byte(nil), body...)
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -265,9 +426,9 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 		authType, authValue = auth.AccountInfo()
 	}
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       requestURL.String(),
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
+		URL:       req.URL.String(),
+		Method:    req.Method,
+		Headers:   req.Header.Clone(),
 		Body:      payloadLog,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
@@ -275,101 +436,284 @@ func (e *AntigravityExecutor) buildRequestForModelDoc(ctx context.Context, auth 
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-
-	return httpReq, finalPayload, nil
 }
 
-// antigravityToolChoiceModeIsNoneDoc reports whether the request already sets
-// function calling mode to NONE under either camelCase or snake_case proto-JSON
-// paths, canonicalizing non-canonical casing or surrounding whitespace in place.
-func antigravityToolChoiceModeIsNoneDoc(doc *ojson.Doc) bool {
-	if doc == nil {
-		return false
-	}
-	for _, container := range []string{"request.toolConfig", "request.tool_config"} {
-		for _, key := range []string{"functionCallingConfig", "function_calling_config"} {
-			modePath := container + "." + key + ".mode"
-			mode := doc.Get(modePath)
-			if mode.Type == ojson.String && strings.EqualFold(strings.TrimSpace(mode.String()), "NONE") {
-				if mode.String() != "NONE" {
-					_ = doc.Set(modePath, "NONE")
+// normalizeAntigravityToolConfig canonicalizes snake_case request.tool_config
+// (and nested function_calling_config / allowed_function_names) to camelCase
+// request.toolConfig so stripping and AICode conversion see one uniform shape.
+func normalizeAntigravityToolConfig(payload []byte) []byte {
+	if snakeTC := ojson.GetBytes(payload, "request.tool_config"); snakeTC.Exists() && snakeTC.IsObject() {
+		if camelTC := ojson.GetBytes(payload, "request.toolConfig"); camelTC.Exists() && camelTC.IsObject() {
+			snakeTC.ForEach(func(k, v ojson.Result) bool {
+				key := k.String()
+				if !ojson.GetBytes(payload, "request.toolConfig."+key).Exists() {
+					payload, _ = ojson.SetRawBytes(payload, "request.toolConfig."+key, []byte(v.Raw))
 				}
 				return true
-			}
+			})
+		} else {
+			payload, _ = ojson.SetRawBytes(payload, "request.toolConfig", []byte(snakeTC.Raw))
 		}
+		payload, _ = ojson.DeleteBytes(payload, "request.tool_config")
 	}
-	return false
-}
-
-// canonicalizeAntigravityToolConfigForValidatedDoc merges snake_case tool_config
-// and function_calling_config containers into their camelCase canonical paths before
-// setting VALIDATED mode, preserving non-conflicting fields while preventing
-// duplicate proto-JSON keys on upstream requests.
-func canonicalizeAntigravityToolConfigForValidatedDoc(doc *ojson.Doc) {
-	if doc == nil {
-		return
+	const tcPath = "request.toolConfig"
+	if !ojson.GetBytes(payload, tcPath).IsObject() {
+		return payload
 	}
-	canonicalizeAntigravityFunctionCallingConfigDoc(doc)
-	if snakeToolConfig := doc.Get("request.tool_config"); snakeToolConfig.Exists() {
-		if snakeToolConfig.IsObject() {
-			if !doc.Get("request.toolConfig").IsObject() {
-				_ = doc.SetRaw("request.toolConfig", snakeToolConfig.Raw)
-				canonicalizeAntigravityFunctionCallingConfigDoc(doc)
-			} else {
-				helps.MergeAntigravityProtoObjectDoc(doc, "request.toolConfig", snakeToolConfig, "functioncallingconfig")
-				if fcc := snakeToolConfig.Get("functionCallingConfig"); fcc.IsObject() {
-					helps.MergeAntigravityProtoObjectDoc(doc, "request.toolConfig.functionCallingConfig", fcc)
+	if snakeFCC := ojson.GetBytes(payload, tcPath+".function_calling_config"); snakeFCC.Exists() && snakeFCC.IsObject() {
+		if camelFCC := ojson.GetBytes(payload, tcPath+".functionCallingConfig"); camelFCC.Exists() && camelFCC.IsObject() {
+			snakeFCC.ForEach(func(k, v ojson.Result) bool {
+				key := k.String()
+				if !ojson.GetBytes(payload, tcPath+".functionCallingConfig."+key).Exists() {
+					payload, _ = ojson.SetRawBytes(payload, tcPath+".functionCallingConfig."+key, []byte(v.Raw))
 				}
-				if fccSnake := snakeToolConfig.Get("function_calling_config"); fccSnake.IsObject() {
-					helps.MergeAntigravityProtoObjectDoc(doc, "request.toolConfig.functionCallingConfig", fccSnake)
-				}
-			}
+				return true
+			})
+		} else {
+			payload, _ = ojson.SetRawBytes(payload, tcPath+".functionCallingConfig", []byte(snakeFCC.Raw))
 		}
-		_ = doc.Delete("request.tool_config")
+		payload, _ = ojson.DeleteBytes(payload, tcPath+".function_calling_config")
 	}
+	const fccPath = tcPath + ".functionCallingConfig"
+	if snakeAllowed := ojson.GetBytes(payload, fccPath+".allowed_function_names"); snakeAllowed.Exists() {
+		if !ojson.GetBytes(payload, fccPath+".allowedFunctionNames").Exists() {
+			payload, _ = ojson.SetRawBytes(payload, fccPath+".allowedFunctionNames", []byte(snakeAllowed.Raw))
+		}
+		payload, _ = ojson.DeleteBytes(payload, fccPath+".allowed_function_names")
+	}
+	return payload
 }
 
-func canonicalizeAntigravityFunctionCallingConfigDoc(doc *ojson.Doc) {
-	if doc == nil {
-		return
-	}
-	snakeFCC := doc.Get("request.toolConfig.function_calling_config")
-	if !snakeFCC.Exists() {
-		return
-	}
-	if snakeFCC.IsObject() {
-		helps.MergeAntigravityProtoObjectDoc(doc, "request.toolConfig.functionCallingConfig", snakeFCC)
-	}
-	_ = doc.Delete("request.toolConfig.function_calling_config")
-}
-
-// stripAntigravityMaxOutputTokensDoc removes maxOutputTokens and its snake_case
-// aliases under both generationConfig and generation_config containers, pruning
-// an emptied generation_config container and merging mixed containers when both
-// generationConfig and generation_config remain present.
-func stripAntigravityMaxOutputTokensDoc(doc *ojson.Doc) {
-	if doc == nil {
-		return
-	}
-	_ = doc.Delete("request.generationConfig.maxOutputTokens")
-	_ = doc.Delete("request.generationConfig.max_output_tokens")
-	deletedSnakeGenConfig := false
-	for _, path := range []string{
-		"request.generation_config.maxOutputTokens",
-		"request.generation_config.max_output_tokens",
+// stripNonAgyGenerationAndToolConfig removes sampling fields that real agy
+// never sends (temperature, topP, topK, candidateCount, stopSequences,
+// penalties) and strips default no-op functionCallingConfig (mode AUTO with no
+// allowedFunctionNames) without deleting sibling toolConfig fields.
+func stripNonAgyGenerationAndToolConfig(payload []byte) []byte {
+	const genPrefix = "request.generationConfig."
+	for _, key := range []string{
+		"temperature", "topP", "top_p", "topK", "top_k",
+		"candidateCount", "candidate_count",
+		"stopSequences", "stop_sequences",
+		"presencePenalty", "presence_penalty",
+		"frequencyPenalty", "frequency_penalty",
+		"seed", "logprobs",
+		"responseLogprobs", "response_logprobs",
+		"speechConfig", "speech_config",
+		"routingConfig", "routing_config",
+		"mediaResolution", "media_resolution",
+		"enableEnhancedCivicAnswers", "enable_enhanced_civic_answers",
 	} {
-		if doc.Get(path).Exists() && doc.Delete(path) == nil {
-			deletedSnakeGenConfig = true
+		if ojson.GetBytes(payload, genPrefix+key).Exists() {
+			payload, _ = ojson.DeleteBytes(payload, genPrefix+key)
 		}
 	}
-	if deletedSnakeGenConfig {
-		if gc := doc.Get("request.generation_config"); gc.Exists() && gc.IsObject() && len(gc.Map()) == 0 {
-			_ = doc.Delete("request.generation_config")
+	if tb := ojson.GetBytes(payload, genPrefix+"thinkingConfig.thinkingBudget"); tb.Exists() && tb.Int() < 0 {
+		payload, _ = ojson.DeleteBytes(payload, genPrefix+"thinkingConfig.thinkingBudget")
+		if tc := ojson.GetBytes(payload, genPrefix+"thinkingConfig"); tc.Exists() && tc.IsObject() && len(tc.Map()) == 0 {
+			payload, _ = ojson.DeleteBytes(payload, genPrefix+"thinkingConfig")
 		}
 	}
-	if doc.Get("request.generation_config").Exists() && doc.Get("request.generationConfig").Exists() {
-		helps.CanonicalizeAntigravityGenerationConfigDoc(doc)
+	if gc := ojson.GetBytes(payload, "request.generationConfig"); gc.Exists() && gc.IsObject() && len(gc.Map()) == 0 {
+		payload, _ = ojson.DeleteBytes(payload, "request.generationConfig")
 	}
+
+	if tc := ojson.GetBytes(payload, "request.toolConfig"); tc.Exists() && tc.IsObject() {
+		fcc := tc.Get("functionCallingConfig")
+		if fcc.Exists() && fcc.IsObject() {
+			mode := strings.ToUpper(strings.TrimSpace(fcc.Get("mode").String()))
+			allowed := fcc.Get("allowedFunctionNames")
+			hasAllowed := allowed.IsArray() && len(allowed.Array()) > 0
+			if !hasAllowed && (mode == "" || mode == "AUTO") {
+				payload, _ = ojson.DeleteBytes(payload, "request.toolConfig.functionCallingConfig")
+				if remaining := ojson.GetBytes(payload, "request.toolConfig"); remaining.Exists() && remaining.IsObject() && len(remaining.Map()) == 0 {
+					payload, _ = ojson.DeleteBytes(payload, "request.toolConfig")
+				}
+			}
+		}
+	}
+	return payload
+}
+
+func antigravityAuthID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+func antigravityAuthLogName(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return filepath.Base(fileName)
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return filepath.Base(id)
+	}
+	return ""
+}
+
+func antigravityEndpointName(usedAICode bool) string {
+	if usedAICode {
+		return "aicode"
+	}
+	return "ccpa"
+}
+
+func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, auth *cliproxyauth.Auth) (func(), error) {
+	if e == nil || e.cfg == nil {
+		return func() {}, nil
+	}
+	maxConcurrent := e.cfg.Antigravity.MaxConcurrentRequests
+	maxRPM := e.cfg.Antigravity.MaxRPM
+	if maxConcurrent <= 0 && maxRPM <= 0 {
+		return func() {}, nil
+	}
+	return helps.AcquireAntigravityRateLimit(ctx, antigravityTransportScope(auth), maxConcurrent, maxRPM)
+}
+
+func withAntigravityLatencyTrace(ctx context.Context, req *http.Request) *http.Request {
+	if req == nil || latencydiag.FromContext(ctx) == nil {
+		return req
+	}
+	trace := &httptrace.ClientTrace{
+		GetConn: func(string) { latencydiag.Event(ctx, "upstream_get_conn", nil) },
+		GotConn: func(info httptrace.GotConnInfo) {
+			latencydiag.Event(ctx, "upstream_got_conn", map[string]any{"reused": info.Reused, "was_idle": info.WasIdle})
+		},
+		ConnectStart: func(network, _ string) {
+			latencydiag.Event(ctx, "upstream_connect_start", map[string]any{"network": network})
+		},
+		ConnectDone: func(network, _ string, err error) {
+			latencydiag.Event(ctx, "upstream_connect_done", map[string]any{"network": network, "ok": err == nil})
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			latencydiag.Event(ctx, "upstream_request_written", map[string]any{"ok": info.Err == nil})
+		},
+		GotFirstResponseByte: func() { latencydiag.Event(ctx, "upstream_first_response_byte", nil) },
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+
+func emitAntigravityUpstreamAttempt(ctx context.Context, baseModel, authID string, stream, useCredits bool, endpoint string) {
+	if latencydiag.FromContext(ctx) == nil {
+		return
+	}
+	latencydiag.Event(ctx, "antigravity_upstream_attempt", map[string]any{
+		"model":       baseModel,
+		"credential":  latencydiag.Opaque(ctx, authID),
+		"stream":      stream,
+		"use_credits": useCredits,
+		"endpoint":    endpoint,
+	})
+}
+
+// doAntigravityStreamRequest handles pre-inference ACL + rate-limited
+// pre-session companion checks and optional Mendel AICode routing (with
+// automatic fallback to daily-cloudcode-pa on 401/403/404).
+func (e *AntigravityExecutor) doAntigravityStreamRequest(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseHTTPClient *http.Client,
+	auth *cliproxyauth.Auth,
+	token, baseURL, baseModel string,
+	stream, useCredits bool,
+	prepared *antigravityPreparedRequest,
+) (*http.Response, bool, error) {
+	if errWarm := e.ensureAntigravityColdStartWarmup(ctx, baseHTTPClient, auth, token, prepared.projectID, baseURL); errWarm != nil {
+		return nil, false, errWarm
+	}
+	e.maybeRunAntigravityPreSessionCheck(ctx, baseHTTPClient, auth, token, prepared.projectID, baseURL, prepared)
+
+	authID := antigravityAuthID(auth)
+	credScope := antigravityTransportScope(auth)
+	creditsRequested := cliproxyauth.AntigravityCreditsRequested(ctx) || ojson.GetBytes(prepared.bodyBytes, "enabledCreditTypes").Exists()
+
+	// Route through aicode.googleapis.com/v1alpha:streamGenerateContent?alt=sse
+	// when explicitly enabled (USE_AICODE=true), falling back to daily-cloudcode-pa
+	// on 401/403/404 or transport error. Defer writeTrajectoryAcls until CCPA is used.
+	attemptedAICode := false
+	if baseURL == antigravityBaseURLDaily && !prepared.isImageModel && !prepared.isWebSearch && !creditsRequested {
+		if userTier, useAICode := helps.ShouldUseAntigravityAICode(credScope); useAICode {
+			aicodeSource := prepared.rawBodyBytes
+			if len(aicodeSource) == 0 {
+				aicodeSource = prepared.bodyBytes
+			}
+			if aicodeBody, errBuild := helps.BuildAntigravityAICodePayload(aicodeSource, userTier); errBuild == nil {
+				aicodeReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, antigravityAICodeStreamEndpoint, bytes.NewReader(aicodeBody))
+				if errReq == nil {
+					aicodeReq.Header.Set("Content-Type", "application/json")
+					aicodeReq.Header.Set("Authorization", "Bearer "+token)
+					aicodeReq.Header.Set("User-Agent", resolveUserAgent(auth))
+					aicodeReq.Host = "aicode.googleapis.com"
+					var attrs map[string]string
+					if auth != nil {
+						attrs = auth.Attributes
+					}
+					util.ApplyCustomHeadersFromAttrs(aicodeReq, attrs)
+
+					aicodeReq = withAntigravityLatencyTrace(ctx, aicodeReq)
+					attemptedAICode = true
+					emitAntigravityUpstreamAttempt(ctx, baseModel, authID, stream, useCredits, "aicode")
+					e.recordAntigravityAPIRequest(ctx, auth, aicodeReq, aicodeBody)
+					resp, errDo := httpClient.Do(aicodeReq)
+					if errDo == nil && resp != nil {
+						if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+							helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+							// Close without reading so TrackHTTPClient's TTFT wrapper does not
+							// lock first-byte timing to the rejected AICode fallback response.
+							if errClose := resp.Body.Close(); errClose != nil {
+								log.Debugf("antigravity executor: close AICode fallback body error: %v", errClose)
+							}
+							helps.MarkAntigravityAICodeCooldown(credScope, 0)
+							latencydiag.Event(ctx, "antigravity_aicode_fallback", map[string]any{"status": resp.StatusCode})
+							log.Debugf("antigravity executor: AICode returned %d; falling back to daily-cloudcode-pa", resp.StatusCode)
+						} else {
+							return resp, true, nil
+						}
+					} else if errDo != nil && (ctx == nil || ctx.Err() == nil) && !errors.Is(errDo, context.Canceled) && !errors.Is(errDo, context.DeadlineExceeded) {
+						helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+						helps.MarkAntigravityAICodeCooldown(credScope, 0)
+						latencydiag.Event(ctx, "antigravity_aicode_fallback", map[string]any{"outcome": "transport_error"})
+						log.Debugf("antigravity executor: AICode transport error (%v); falling back to daily-cloudcode-pa", errDo)
+					} else if errDo != nil {
+						latencydiag.Event(ctx, "antigravity_upstream_termination", map[string]any{"outcome": "canceled"})
+						return nil, false, errDo
+					} else {
+						helps.MarkAntigravityAICodeCooldown(credScope, 0)
+						latencydiag.Event(ctx, "antigravity_aicode_fallback", map[string]any{"outcome": "nil_response"})
+						log.Debug("antigravity executor: AICode returned nil response; falling back to daily-cloudcode-pa")
+					}
+				}
+			}
+		}
+	}
+
+	if errACL := e.ensureAntigravityTrajectoryACL(ctx, baseHTTPClient, auth, token, baseURL, prepared.trajectoryID); errACL != nil {
+		if attemptedAICode {
+			outcome := "acl_error"
+			if errors.Is(errACL, context.Canceled) || errors.Is(errACL, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
+				outcome = "canceled"
+			}
+			latencydiag.Event(ctx, "antigravity_upstream_termination", map[string]any{"outcome": outcome})
+		}
+		return nil, false, errACL
+	}
+
+	ccpaReq := withAntigravityLatencyTrace(ctx, prepared.httpReq)
+	emitAntigravityUpstreamAttempt(ctx, baseModel, authID, stream, useCredits, "ccpa")
+	e.recordAntigravityAPIRequest(ctx, auth, ccpaReq, prepared.bodyBytes)
+	httpResp, errDo := httpClient.Do(ccpaReq)
+	if errDo != nil {
+		outcome := "transport_error"
+		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
+			outcome = "canceled"
+		}
+		latencydiag.Event(ctx, "antigravity_upstream_termination", map[string]any{"outcome": outcome})
+		return nil, false, errDo
+	}
+	return httpResp, false, nil
 }
 
 // sanitizeAntigravityRequestSchemas cleans the JSON schemas carried by an Antigravity request.
@@ -379,64 +723,28 @@ func stripAntigravityMaxOutputTokensDoc(doc *ojson.Doc) {
 // data keys inside functionCall arguments replayed from conversation history. Running it over the
 // whole document silently mutated that history, so tools lost required argument fields and the
 // model imitated the corrupted examples on later turns.
-// sanitizeAntigravityRequestSchemas cleans with union-preserving (Gemini) tool semantics.
-// Claude tool unions are flattened only when the caller supplies the model flag via
-// sanitizeAntigravityRequestSchemasForModel; the placeholder group alone must not decide it,
-// because gemini-3-pro models share that group and accept preserved unions.
 func sanitizeAntigravityRequestSchemas(payloadStr string, useAntigravitySchema bool) string {
-	return sanitizeAntigravityRequestSchemasForModel(payloadStr, useAntigravitySchema, false)
-}
-
-// sanitizeAntigravityRequestSchemasForModel applies sanitizeAntigravityRequestSchemas with an
-// explicit Antigravity Claude flag. Antigravity Claude tool schemas additionally flatten
-// multi-branch anyOf/oneOf unions, which the Claude-side upstream rejects (Issue 3662).
-func sanitizeAntigravityRequestSchemasForModel(payloadStr string, useAntigravitySchema, isClaudeModel bool) string {
-	payloadStr = sanitizeAntigravityToolSchemasForModel(payloadStr, useAntigravitySchema, isClaudeModel)
+	payloadStr = sanitizeAntigravityToolSchemas(payloadStr, useAntigravitySchema, false, true)
 	return sanitizeAntigravityGenerationSchemas(payloadStr)
 }
 
-func antigravitySchemaSanitizationFlags(modelName string) (useAntigravitySchema, isClaudeModel bool) {
-	lowerModel := strings.ToLower(modelName)
-	isClaudeModel = strings.Contains(lowerModel, "claude")
-	useAntigravitySchema = isClaudeModel || strings.Contains(lowerModel, "gemini-3-pro") || strings.Contains(lowerModel, "gemini-3.1-pro")
-	return useAntigravitySchema, isClaudeModel
-}
-
-func sanitizeAntigravityRequestSchemasForModelIfNeededDoc(modelName string, doc *ojson.Doc) bool {
-	if !antigravityRequestNeedsSchemaSanitizationDoc(doc) {
-		return false
-	}
-	useAntigravitySchema, isClaudeModel := antigravitySchemaSanitizationFlags(modelName)
-	return sanitizeAntigravityRequestSchemasForModelDoc(doc, useAntigravitySchema, isClaudeModel)
-}
-
-func sanitizeAntigravityRequestSchemasForModelDoc(doc *ojson.Doc, useAntigravitySchema, isClaudeModel bool) bool {
-	if doc == nil {
-		return false
-	}
-	changed := sanitizeAntigravityToolSchemasForModelDoc(doc, useAntigravitySchema, isClaudeModel)
-	if sanitizeAntigravityGenerationSchemasDoc(doc) {
-		changed = true
-	}
-	return changed
+func sanitizeAntigravityNativeRequestSchemas(payloadStr string, useLegacyParameters bool) string {
+	payloadStr = sanitizeAntigravityToolSchemas(payloadStr, false, true, useLegacyParameters)
+	return sanitizeAntigravityNativeGenerationSchemas(payloadStr)
 }
 
 // sanitizeAntigravityToolSchemas applies the existing declaration rewrites to
 // a small document containing only request.tools, then replaces that subtree
 // once. This preserves rewrite order and bytes without copying the full request
 // for every declaration schema.
-func sanitizeAntigravityToolSchemas(payloadStr string, useAntigravitySchema bool) string {
-	return sanitizeAntigravityToolSchemasForModel(payloadStr, useAntigravitySchema, false)
-}
-
-func sanitizeAntigravityToolSchemasForModel(payloadStr string, useAntigravitySchema, isClaudeModel bool) string {
+func sanitizeAntigravityToolSchemas(payloadStr string, useAntigravitySchema, nativeProtoJSON, useLegacyParameters bool) string {
 	tools := ojson.Get(payloadStr, "request.tools")
 	if !tools.IsArray() {
 		return payloadStr
 	}
 
 	toolDocument := `{"request":{"tools":` + tools.Raw + `}}`
-	toolDocument = sanitizeAntigravityToolSchemaDocumentForModel(toolDocument, useAntigravitySchema, isClaudeModel)
+	toolDocument = sanitizeAntigravityToolSchemaDocument(toolDocument, useAntigravitySchema, nativeProtoJSON, useLegacyParameters)
 	cleanedTools := ojson.Get(toolDocument, "request.tools")
 	if !cleanedTools.IsArray() || cleanedTools.Raw == tools.Raw {
 		return payloadStr
@@ -449,300 +757,178 @@ func sanitizeAntigravityToolSchemasForModel(payloadStr string, useAntigravitySch
 	return string(updated)
 }
 
-func sanitizeAntigravityToolSchemasForModelDoc(doc *ojson.Doc, useAntigravitySchema, isClaudeModel bool) bool {
-	if doc == nil {
-		return false
-	}
-	tools := doc.Get("request.tools")
-	if !tools.IsArray() {
-		return false
-	}
-
-	toolDocument := `{"request":{"tools":` + tools.Raw + `}}`
-	toolDocument = sanitizeAntigravityToolSchemaDocumentForModel(toolDocument, useAntigravitySchema, isClaudeModel)
-	cleanedTools := ojson.Get(toolDocument, "request.tools")
-	if !cleanedTools.IsArray() || cleanedTools.Raw == tools.Raw {
-		return false
-	}
-	if errSet := doc.SetRawBytes("request.tools", []byte(cleanedTools.Raw)); errSet != nil {
-		log.Debugf("antigravity: failed to write cleaned request.tools: %v", errSet)
-		return false
-	}
-	return true
-}
-
-func sanitizeAntigravityToolSchemaDocument(payloadStr string, useAntigravitySchema bool) string {
-	return sanitizeAntigravityToolSchemaDocumentForModel(payloadStr, useAntigravitySchema, false)
-}
-
-// antigravityDeclarationContainers lists both spellings of the declarations
-// array a tool may carry.
-var antigravityDeclarationContainers = []string{"functionDeclarations", "function_declarations"}
-
-// sanitizeAntigravityToolSchemaDocumentForModel renames and cleans every
-// declaration schema in the tools-only document. Each declaration is edited
-// on its own raw bytes and the results are spliced back into the tools array
-// in a single pass, so the cost stays linear in the document size instead of
-// scaling with declarations x document size (Issue 6714). The emitted bytes
-// match the previous whole-document edits: changed elements are spliced at
-// their original offsets, so untouched bytes (including whitespace around
-// array elements) survive verbatim, and changed nodes go through the same
-// sjson edits, scoped to one declaration.
-func sanitizeAntigravityToolSchemaDocumentForModel(payloadStr string, useAntigravitySchema, isClaudeModel bool) string {
-	toolSchemaCleaner := func(schema string, isParameterSchema bool) string {
-		// Only declaration parameter schemas become Claude custom.input_schema upstream,
-		// so only they need Claude union flattening. Function return schemas keep the
-		// union-preserving cleaning like every other response-side schema.
-		if isClaudeModel && isParameterSchema {
-			return util.CleanJSONSchemaForAntigravityClaudeTool(schema, useAntigravitySchema)
+func sanitizeAntigravityToolSchemaDocument(payloadStr string, useAntigravitySchema, nativeProtoJSON, useLegacyParameters bool) string {
+	if nativeProtoJSON {
+		for _, base := range antigravityFunctionDeclarationPaths(payloadStr) {
+			snakeResp := base + ".response_json_schema"
+			camelResp := base + ".responseJsonSchema"
+			if ojson.Get(payloadStr, snakeResp).Exists() {
+				if ojson.Get(payloadStr, camelResp).Exists() {
+					payloadStr, _ = ojson.Delete(payloadStr, snakeResp)
+				} else if renamed, errRename := agyutil.RenameKey(payloadStr, snakeResp, camelResp); errRename == nil {
+					payloadStr = renamed
+				}
+			}
 		}
-		return util.CleanJSONSchemaForAntigravityTool(schema, useAntigravitySchema)
 	}
-	cleanNestedToolSchema := func(schemaRaw string, isParameterSchema bool) string {
-		return cleanNestedSchema(func(schema string) string {
-			return toolSchemaCleaner(schema, isParameterSchema)
-		}, schemaRaw)
-	}
+	if nativeProtoJSON && !useLegacyParameters {
+		// Modern Gemini models on agy 1.5.16 emit FunctionDeclaration.parametersJsonSchema
+		// (standard lowercase JSON Schema) rather than legacy protobuf Schema parameters.
+		for _, base := range antigravityFunctionDeclarationPaths(payloadStr) {
+			snakePath := base + ".parameters_json_schema"
+			camelPath := base + ".parametersJsonSchema"
+			if ojson.Get(payloadStr, snakePath).Exists() {
+				if ojson.Get(payloadStr, camelPath).Exists() {
+					payloadStr, _ = ojson.Delete(payloadStr, snakePath)
+				} else if renamed, errRename := agyutil.RenameKey(payloadStr, snakePath, camelPath); errRename == nil {
+					payloadStr = renamed
+				}
+			}
+			legacyPath := base + ".parameters"
+			if ojson.Get(payloadStr, legacyPath).Exists() {
+				if ojson.Get(payloadStr, camelPath).Exists() {
+					payloadStr, _ = ojson.Delete(payloadStr, legacyPath)
+				} else if renamed, errRename := agyutil.RenameKey(payloadStr, legacyPath, camelPath); errRename == nil {
+					payloadStr = renamed
+				}
+			}
+		}
 
-	tools := ojson.Parse(payloadStr).Get("request.tools")
-	if !tools.IsArray() {
+		allPaths := antigravityDeclarationSchemaPaths(payloadStr)
+		toolJSONSchemaPaths := make([]string, 0, len(allPaths))
+		respJSONSchemaPaths := make([]string, 0)
+		protoPaths := make([]string, 0)
+		for _, path := range allPaths {
+			switch {
+			case strings.HasSuffix(path, ".parametersJsonSchema") || strings.HasSuffix(path, ".parameters_json_schema"):
+				toolJSONSchemaPaths = append(toolJSONSchemaPaths, path)
+			case strings.HasSuffix(path, ".responseJsonSchema") || strings.HasSuffix(path, ".response_json_schema"):
+				respJSONSchemaPaths = append(respJSONSchemaPaths, path)
+			default:
+				protoPaths = append(protoPaths, path)
+			}
+		}
+		if len(toolJSONSchemaPaths) > 0 {
+			payloadStr = cleanAntigravitySchemasAtPaths(payloadStr, toolJSONSchemaPaths, agyutil.CleanJSONSchemaForAntigravityNativeJSONSchema)
+		}
+		if len(protoPaths) > 0 {
+			payloadStr = cleanAntigravitySchemasAtPaths(payloadStr, protoPaths, agyutil.CleanJSONSchemaForAntigravityNativeTool)
+		}
+		if len(respJSONSchemaPaths) > 0 {
+			payloadStr = cleanAntigravitySchemasAtPaths(payloadStr, respJSONSchemaPaths, func(s string) string {
+				return agyutil.CleanJSONSchemaForAntigravityNativeResponse(s, false)
+			})
+		}
 		return payloadStr
 	}
-	elements := make([]ojson.Result, 0)
-	edits := make([]antigravityElementEdit, 0)
-	tools.ForEach(func(_, tool ojson.Result) bool {
-		elements = append(elements, tool)
-		if !tool.IsObject() {
-			return true
-		}
-		var toolDoc *ojson.Doc
-		toolChanged := false
-		for _, declKey := range antigravityDeclarationContainers {
-			decls := tool.Get(declKey)
-			if !decls.IsArray() {
+
+	renameKeys := []string{"parametersJsonSchema"}
+	if nativeProtoJSON {
+		renameKeys = append(renameKeys, "parameters_json_schema")
+	}
+	for _, base := range antigravityFunctionDeclarationPaths(payloadStr) {
+		for _, oldKey := range renameKeys {
+			oldPath := base + "." + oldKey
+			if !ojson.Get(payloadStr, oldPath).Exists() {
 				continue
 			}
-			cleanedDecls, declsChanged := sanitizeAntigravityDeclarations(decls, cleanNestedToolSchema)
-			if !declsChanged {
+			renamed, errRename := agyutil.RenameKey(payloadStr, oldPath, base+".parameters")
+			if errRename != nil {
+				log.Debugf("antigravity: failed to rename %s: %v", oldPath, errRename)
 				continue
 			}
-			if toolDoc == nil {
-				toolDoc = ojson.NewDoc([]byte(tool.Raw))
-			}
-			if errSet := toolDoc.SetRawBytes(declKey, []byte(cleanedDecls)); errSet != nil {
-				log.Debugf("antigravity: failed to write cleaned %s: %v", declKey, errSet)
-				continue
-			}
-			toolChanged = true
+			payloadStr = renamed
 		}
-		if toolChanged && toolDoc != nil {
-			toolRaw := string(toolDoc.Bytes())
-			if toolRaw != tool.Raw {
-				edits = append(edits, antigravityElementEdit{offset: tool.Index - tools.Index, raw: tool.Raw, replacement: toolRaw})
+	}
+
+	if nativeProtoJSON {
+		allPaths := antigravityDeclarationSchemaPaths(payloadStr)
+		protoPaths := make([]string, 0, len(allPaths))
+		jsonSchemaPaths := make([]string, 0)
+		for _, path := range allPaths {
+			if strings.HasSuffix(path, ".responseJsonSchema") || strings.HasSuffix(path, ".response_json_schema") {
+				jsonSchemaPaths = append(jsonSchemaPaths, path)
+			} else {
+				protoPaths = append(protoPaths, path)
 			}
 		}
-		return true
-	})
-	if len(edits) == 0 {
+		// Clean native protobuf Schema fields directly (without cleanNestedSchema's
+		// {"schema": ...} wrapper, which breaks local #/$defs JSON Pointer resolution).
+		payloadStr = cleanAntigravitySchemasAtPaths(payloadStr, protoPaths, agyutil.CleanJSONSchemaForAntigravityNativeTool)
+		if len(jsonSchemaPaths) > 0 {
+			payloadStr = cleanAntigravitySchemasAtPaths(payloadStr, jsonSchemaPaths, func(s string) string {
+				return agyutil.CleanJSONSchemaForAntigravityNativeResponse(s, false)
+			})
+		}
 		return payloadStr
 	}
-	updated, errSet := ojson.SetRawBytes([]byte(payloadStr), "request.tools", []byte(applyAntigravityElementEdits(tools.Raw, tools.Index, elements, edits)))
-	if errSet != nil {
-		log.Debugf("antigravity: failed to write cleaned request.tools: %v", errSet)
-		return payloadStr
-	}
-	return string(updated)
-}
 
-// antigravityElementEdit replaces one array element (raw, at offset within
-// the array's raw bytes) with replacement.
-type antigravityElementEdit struct {
-	offset      int
-	raw         string
-	replacement string
-}
-
-// applyAntigravityElementEdits splices element replacements into an array's
-// raw bytes in offset order, keeping every other byte (commas, whitespace,
-// unchanged elements) verbatim. Edits whose offsets do not line up with the
-// array bytes fall back to joining the elements with commas: still valid
-// and semantically identical, just without the original separators. gjson
-// reports element offsets into the parsed document, so offsets here are
-// relative to the array start.
-func applyAntigravityElementEdits(arrayRaw string, arrayIndex int, elements []ojson.Result, edits []antigravityElementEdit) string {
-	var rebuilt strings.Builder
-	rebuilt.Grow(len(arrayRaw))
-	cursor := 0
-	for _, edit := range edits {
-		if edit.offset < cursor || edit.offset+len(edit.raw) > len(arrayRaw) || arrayRaw[edit.offset:edit.offset+len(edit.raw)] != edit.raw {
-			return joinAntigravityElements(arrayIndex, elements, edits)
-		}
-		rebuilt.WriteString(arrayRaw[cursor:edit.offset])
-		rebuilt.WriteString(edit.replacement)
-		cursor = edit.offset + len(edit.raw)
+	toolSchemaCleaner := func(schema string) string {
+		return agyutil.CleanJSONSchemaForAntigravityTool(schema, useAntigravitySchema)
 	}
-	rebuilt.WriteString(arrayRaw[cursor:])
-	return rebuilt.String()
-}
-
-// joinAntigravityElements rebuilds an array by joining element bytes with
-// commas, substituting replacements where recorded. It is the fallback for
-// applyAntigravityElementEdits when splice offsets cannot be trusted.
-func joinAntigravityElements(arrayIndex int, elements []ojson.Result, edits []antigravityElementEdit) string {
-	replacements := make(map[int]string, len(edits))
-	for _, edit := range edits {
-		replacements[edit.offset] = edit.replacement
+	cleanNestedToolSchema := func(schemaRaw string) string {
+		return cleanNestedSchema(toolSchemaCleaner, schemaRaw)
 	}
-	var rebuilt strings.Builder
-	rebuilt.WriteByte('[')
-	for i, element := range elements {
-		if i > 0 {
-			rebuilt.WriteByte(',')
-		}
-		if replacement, ok := replacements[element.Index-arrayIndex]; ok {
-			rebuilt.WriteString(replacement)
-		} else {
-			rebuilt.WriteString(element.Raw)
-		}
-	}
-	rebuilt.WriteByte(']')
-	return rebuilt.String()
-}
-
-// sanitizeAntigravityDeclarations rebuilds one declarations array, applying
-// the rename and schema cleaning to each declaration in isolation. It
-// reports whether any declaration actually changed so callers can keep the
-// original bytes when the array is already clean.
-func sanitizeAntigravityDeclarations(decls ojson.Result, clean func(schemaRaw string, isParameterSchema bool) string) (string, bool) {
-	elements := make([]ojson.Result, 0)
-	edits := make([]antigravityElementEdit, 0)
-	decls.ForEach(func(_, decl ojson.Result) bool {
-		elements = append(elements, decl)
-		if !decl.IsObject() {
-			return true
-		}
-		cleanedDecl := sanitizeAntigravityDeclaration(decl, clean)
-		if cleanedDecl != decl.Raw {
-			edits = append(edits, antigravityElementEdit{offset: decl.Index - decls.Index, raw: decl.Raw, replacement: cleanedDecl})
-		}
-		return true
-	})
-	if len(edits) == 0 {
-		return "", false
-	}
-	return applyAntigravityElementEdits(decls.Raw, decls.Index, elements, edits), true
-}
-
-// sanitizeAntigravityDeclaration applies the declaration-level edits that
-// used to run against the whole tools document: parametersJsonSchema is
-// renamed onto parameters first, then every object schema is cleaned in
-// place. Failed edits keep the declaration as-is and are only logged.
-func sanitizeAntigravityDeclaration(decl ojson.Result, clean func(schemaRaw string, isParameterSchema bool) string) string {
-	declRaw := decl.Raw
-	if decl.Get("parametersJsonSchema").Exists() {
-		renamed, errRename := util.RenameKey(declRaw, "parametersJsonSchema", "parameters")
-		if errRename != nil {
-			log.Debugf("antigravity: failed to rename parametersJsonSchema: %v", errRename)
-		} else {
-			declRaw = renamed
-			decl = ojson.Parse(declRaw)
-		}
-	}
-	var declDoc *ojson.Doc
-	changed := false
-	for _, key := range antigravityDeclarationSchemaKeys {
-		schema := decl.Get(key)
-		if !schema.IsObject() {
-			continue
-		}
-		cleanedSchema := clean(schema.Raw, isParameterSchemaPath(key))
-		if cleanedSchema == schema.Raw {
-			continue
-		}
-		if declDoc == nil {
-			declDoc = ojson.NewDoc([]byte(declRaw))
-		}
-		if errSet := declDoc.SetRawBytes(key, []byte(cleanedSchema)); errSet != nil {
-			log.Debugf("antigravity: failed to write cleaned schema at %s: %v", key, errSet)
-			continue
-		}
-		changed = true
-	}
-	if changed && declDoc != nil {
-		return string(declDoc.Bytes())
-	}
-	return declRaw
+	return cleanAntigravitySchemasAtPaths(
+		payloadStr,
+		antigravityDeclarationSchemaPaths(payloadStr),
+		cleanNestedToolSchema,
+	)
 }
 
 // sanitizeAntigravityGenerationSchemas batches every schema edit within one
 // generation config before replacing that config in the full request.
 func sanitizeAntigravityGenerationSchemas(payloadStr string) string {
-	doc := ojson.NewDoc([]byte(payloadStr))
-	if !sanitizeAntigravityGenerationSchemasDoc(doc) {
-		return payloadStr
-	}
-	return string(doc.Bytes())
+	return sanitizeAntigravityGenerationSchemasWithCleaner(payloadStr, false)
 }
 
-func sanitizeAntigravityGenerationSchemasDoc(doc *ojson.Doc) bool {
-	if doc == nil {
-		return false
-	}
-	changed := false
+func sanitizeAntigravityNativeGenerationSchemas(payloadStr string) string {
+	return sanitizeAntigravityGenerationSchemasWithCleaner(payloadStr, true)
+}
+
+func sanitizeAntigravityGenerationSchemasWithCleaner(payloadStr string, native bool) string {
 	for _, container := range antigravityGenerationConfigContainers {
-		generationConfig := doc.Get(container)
+		generationConfig := ojson.Get(payloadStr, container)
 		if !generationConfig.IsObject() {
 			continue
 		}
-		var configDoc *ojson.Doc
-		configChanged := false
+		cleanedConfig := generationConfig.Raw
 		for _, key := range antigravityGenerationSchemaKeys {
-			schema := generationConfig.Get(key)
+			schema := ojson.Get(cleanedConfig, key)
 			if !schema.IsObject() {
 				continue
 			}
-			cleanedSchema := util.CleanJSONSchemaForAntigravityResponse(schema.Raw)
+			var cleanedSchema string
+			if native {
+				uppercase := key == "responseSchema" || key == "response_schema"
+				cleanedSchema = agyutil.CleanJSONSchemaForAntigravityNativeResponse(schema.Raw, uppercase)
+			} else {
+				cleanedSchema = agyutil.CleanJSONSchemaForAntigravityResponse(schema.Raw)
+			}
 			if cleanedSchema == schema.Raw {
 				continue
 			}
-			if configDoc == nil {
-				configDoc = ojson.NewDoc([]byte(generationConfig.Raw))
-			}
-			if errSet := configDoc.SetRawBytes(key, []byte(cleanedSchema)); errSet != nil {
+			updated, errSet := ojson.SetRawBytes([]byte(cleanedConfig), key, []byte(cleanedSchema))
+			if errSet != nil {
 				log.Debugf("antigravity: failed to write cleaned schema at %s.%s: %v", container, key, errSet)
 				continue
 			}
-			configChanged = true
+			cleanedConfig = string(updated)
 		}
-		if !configChanged || configDoc == nil {
+		if cleanedConfig == generationConfig.Raw {
 			continue
 		}
-		cleanedConfig := configDoc.Bytes()
-		if string(cleanedConfig) == generationConfig.Raw {
-			continue
-		}
-		if errSet := doc.SetRawBytes(container, cleanedConfig); errSet != nil {
+		updated, errSet := ojson.SetRawBytes([]byte(payloadStr), container, []byte(cleanedConfig))
+		if errSet != nil {
 			log.Debugf("antigravity: failed to write cleaned %s: %v", container, errSet)
 			continue
 		}
-		changed = true
+		payloadStr = string(updated)
 	}
-	return changed
-}
-
-// isParameterSchemaPath reports whether a declaration schema path holds tool input
-// parameters rather than a function return schema.
-func isParameterSchemaPath(schemaPath string) bool {
-	key := schemaPath
-	if idx := strings.LastIndex(schemaPath, "."); idx >= 0 {
-		key = schemaPath[idx+1:]
-	}
-	return strings.HasPrefix(key, "parameters")
+	return payloadStr
 }
 
 func cleanAntigravitySchemasAtPaths(payloadStr string, schemaPaths []string, clean func(string) string) string {
-	var doc *ojson.Doc
-	changed := false
 	for _, schemaPath := range schemaPaths {
 		schema := ojson.Get(payloadStr, schemaPath)
 		if !schema.Exists() {
@@ -752,19 +938,14 @@ func cleanAntigravitySchemasAtPaths(payloadStr string, schemaPaths []string, cle
 		if cleanedSchema == schema.Raw {
 			continue
 		}
-		if doc == nil {
-			doc = ojson.NewDoc([]byte(payloadStr))
-		}
-		if errSet := doc.SetRawBytes(schemaPath, []byte(cleanedSchema)); errSet != nil {
+		updated, errSet := ojson.SetRawBytes([]byte(payloadStr), schemaPath, []byte(cleanedSchema))
+		if errSet != nil {
 			log.Debugf("antigravity: failed to write cleaned schema at %s: %v", schemaPath, errSet)
 			continue
 		}
-		changed = true
+		payloadStr = string(updated)
 	}
-	if !changed || doc == nil {
-		return payloadStr
-	}
-	return string(doc.Bytes())
+	return payloadStr
 }
 
 // antigravitySchemaWrapperKey nests a schema during cleaning. It is never sent upstream.
@@ -777,12 +958,11 @@ const antigravitySchemaWrapperKey = "schema"
 // cleaning always saw tool schemas nested inside the request, so nesting is reproduced here to keep
 // the emitted schema byte-identical to the previous behaviour.
 func cleanNestedSchema(clean func(string) string, schemaRaw string) string {
-	schemaRaw = util.NormalizeJSONSchemaNumericConstraints(schemaRaw)
-	wrappedDoc := ojson.NewDocString("{}")
-	if errWrap := wrappedDoc.SetRaw(antigravitySchemaWrapperKey, schemaRaw); errWrap != nil {
+	wrapped, errWrap := ojson.SetRaw("{}", antigravitySchemaWrapperKey, schemaRaw)
+	if errWrap != nil {
 		return clean(schemaRaw)
 	}
-	if unwrapped := ojson.Get(clean(wrappedDoc.String()), antigravitySchemaWrapperKey); unwrapped.Exists() {
+	if unwrapped := ojson.Get(clean(wrapped), antigravitySchemaWrapperKey); unwrapped.Exists() {
 		return unwrapped.Raw
 	}
 	return clean(schemaRaw)
@@ -863,29 +1043,12 @@ var (
 )
 
 func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
-	if ojson.GetBytesNoCopy(payload, "request.tools.0").Exists() {
+	if ojson.GetBytes(payload, "request.tools.0").Exists() {
 		return true
 	}
 	for _, container := range antigravityGenerationConfigContainers {
 		for _, key := range antigravityGenerationSchemaKeys {
-			if ojson.GetBytesNoCopy(payload, container+"."+key).Exists() {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func antigravityRequestNeedsSchemaSanitizationDoc(doc *ojson.Doc) bool {
-	if doc == nil {
-		return false
-	}
-	if doc.Get("request.tools.0").Exists() {
-		return true
-	}
-	for _, container := range antigravityGenerationConfigContainers {
-		for _, key := range antigravityGenerationSchemaKeys {
-			if doc.Get(container + "." + key).Exists() {
+			if ojson.GetBytes(payload, container+"."+key).Exists() {
 				return true
 			}
 		}
@@ -903,7 +1066,10 @@ func resolveAntigravityRequestBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func antigravityLoadCodeAssistBaseURL(auth *cliproxyauth.Auth) string {
-	return resolveAntigravityRequestBaseURL(auth)
+	if base := resolveCustomAntigravityBaseURL(auth); base != "" {
+		return base
+	}
+	return antigravityBaseURLDaily
 }
 
 func resolveHost(base string) string {
@@ -919,10 +1085,6 @@ func resolveHost(base string) string {
 
 func resolveUserAgent(auth *cliproxyauth.Auth) string {
 	return misc.AntigravityRequestUserAgent(antigravityConfiguredUserAgent(auth))
-}
-
-func resolveLoadCodeAssistUserAgent(auth *cliproxyauth.Auth) string {
-	return misc.AntigravityLoadCodeAssistUserAgent(antigravityConfiguredUserAgent(auth))
 }
 
 func antigravityConfiguredUserAgent(auth *cliproxyauth.Auth) string {
@@ -962,308 +1124,142 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
-func antigravityAuthID(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	return strings.TrimSpace(auth.ID)
-}
+func geminiToAntigravityWithScope(credScope, metadataExplicitSessionID, modelName string, payload []byte, projectID string, derivedSessionIDs ...string) []byte {
+	template := payload
+	template = helps.SetStringIfDifferent(template, "model", modelName)
+	template = helps.SetStringIfDifferent(template, "userAgent", "antigravity")
 
-// acquireAntigravityRateLimit waits for the optional per-credential
-// antigravity.max-concurrent-requests and antigravity.max-rpm caps. The
-// returned release function must be called once the upstream exchange ends.
-func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, auth *cliproxyauth.Auth) (func(), error) {
-	if e == nil || e.cfg == nil {
-		return func() {}, nil
-	}
-	return helps.AcquireAntigravityRateLimit(ctx, antigravityTransportScope(auth), e.cfg.Antigravity.MaxConcurrentRequests, e.cfg.Antigravity.MaxRPM)
-}
-
-const (
-	antigravitySignatureGrantScopeMetadataKey       = "cpa_signature_cache_grant"
-	antigravitySignatureGrantBindingMetadataKey     = "cpa_signature_cache_grant_binding"
-	antigravitySignatureGrantHomeBindingMetadataKey = "cpa_signature_cache_grant_home_binding"
-)
-
-func antigravitySignatureGrantBinding(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Metadata == nil {
-		return ""
-	}
-	refresh := strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token"))
-	access := strings.TrimSpace(metaStringValue(auth.Metadata, "access_token"))
-	if refresh == "" && access == "" {
-		return ""
-	}
-	return antigravityCredentialScope("grant:", refresh+"\x00"+access)
-}
-
-func antigravitySignatureGrantHomeBinding(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Attributes == nil || strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")) != "" {
-		return ""
-	}
-	homeScope := strings.TrimSpace(auth.Attributes[cliproxyauth.AntigravityModelEnumHomeScopeAttribute])
-	if homeScope == "" {
-		return ""
-	}
-	return antigravityCredentialScope("home-bind:", homeScope)
-}
-
-func antigravityHasValidSignatureGrant(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	retained := strings.TrimSpace(metaStringValue(auth.Metadata, antigravitySignatureGrantScopeMetadataKey))
-	if retained == "" {
-		return false
-	}
-	tokenBinding := antigravitySignatureGrantBinding(auth)
-	if tokenBinding == "" {
-		return false
-	}
-	binding := strings.TrimSpace(metaStringValue(auth.Metadata, antigravitySignatureGrantBindingMetadataKey))
-	if binding != "" && binding == tokenBinding {
-		return true
-	}
-	homeBinding := strings.TrimSpace(metaStringValue(auth.Metadata, antigravitySignatureGrantHomeBindingMetadataKey))
-	if homeBinding != "" {
-		if expected := antigravitySignatureGrantHomeBinding(auth); expected != "" && homeBinding == expected {
-			return true
-		}
-	}
-	return false
-}
-
-func antigravitySignatureGrantIdentity(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	binding := antigravitySignatureGrantBinding(auth)
-	if binding == "" {
-		return ""
-	}
-	if antigravityHasValidSignatureGrant(auth) {
-		return strings.TrimSpace(metaStringValue(auth.Metadata, antigravitySignatureGrantScopeMetadataKey))
-	}
-	if auth.Attributes != nil && strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")) == "" {
-		if homeScope := strings.TrimSpace(auth.Attributes[cliproxyauth.AntigravityModelEnumHomeScopeAttribute]); homeScope != "" {
-			return antigravityCredentialScope("home-grant:", homeScope)
-		}
-	}
-	return binding
-}
-
-func antigravitySignatureCacheScope(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	scope := strings.TrimSpace(auth.ID)
-	if scope != "" {
-		scope = "id:" + scope
-	} else if auth.Attributes != nil {
-		if path := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); path != "" {
-			scope = "path:" + path
-		} else if source := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); source != "" {
-			scope = "source:" + source
-		}
-	}
-	grantIdentity := antigravitySignatureGrantIdentity(auth)
-	if grantIdentity == "" {
-		return ""
-	}
-	scope += "\x00" + grantIdentity
-	if auth.Metadata != nil {
-		if projectID, ok := auth.Metadata["project_id"].(string); ok {
-			if projectID = strings.TrimSpace(projectID); projectID != "" {
-				scope += "\x00" + projectID
-			}
-		}
-	}
-	return scope
-}
-
-// geminiToAntigravityDocForAuth builds the upstream envelope and reports whether
-// it used the agent protocol.
-func geminiToAntigravityDocForAuth(doc *ojson.Doc, selection cliproxyauth.AntigravityModelSelection, projectID string, auth *cliproxyauth.Auth, derivedSessionIDs ...string) bool {
-	if doc == nil {
-		return false
-	}
-	modelName := selection.ID
-	helps.SetStringIfDifferentDoc(doc, "model", modelName)
-	helps.SetStringIfDifferentDoc(doc, "userAgent", "antigravity")
-
-	isImageModel := strings.Contains(strings.ToLower(modelName), "image")
-	reqType := strings.TrimSpace(doc.Get("requestType").String())
+	reqType := strings.TrimSpace(ojson.GetBytes(template, "requestType").String())
+	isImageModel := strings.Contains(strings.ToLower(modelName), "image") || strings.EqualFold(reqType, "image_gen")
 	if reqType == "" {
 		if isImageModel {
 			reqType = "image_gen"
 		} else {
 			reqType = "agent"
 		}
-		_ = doc.Set("requestType", reqType)
+		template, _ = ojson.SetBytes(template, "requestType", reqType)
 	}
 
 	if projectID != "" {
-		helps.SetStringIfDifferentDoc(doc, "project", projectID)
+		template = helps.SetStringIfDifferent(template, "project", projectID)
 	} else {
-		_ = doc.Delete("project")
+		template, _ = ojson.DeleteBytes(template, "project")
 	}
 
-	authID := antigravityAuthID(auth)
-	incomingSessionID := strings.TrimSpace(doc.Get("request.sessionId").String())
+	explicitSessionID := strings.TrimSpace(ojson.GetBytes(template, "request.sessionId").String())
+	if explicitSessionID == "" {
+		explicitSessionID = strings.TrimSpace(ojson.GetBytes(template, "request.session_id").String())
+	}
+	if explicitSessionID == "" {
+		explicitSessionID = strings.TrimSpace(metadataExplicitSessionID)
+	}
 	derivedSessionID := ""
 	if len(derivedSessionIDs) > 0 {
 		derivedSessionID = strings.TrimSpace(derivedSessionIDs[0])
 	}
 
-	switch {
-	case isImageModel:
-		if strings.TrimSpace(doc.Get("requestId").String()) == "" {
-			_ = doc.Set("requestId", generateImageGenRequestID())
-		}
-		if incomingSessionID != "" && authID != "" {
-			_ = doc.Set("request.sessionId", scopeIncomingAntigravitySessionID(authID, incomingSessionID, derivedSessionID))
-		}
-	case reqType == "web_search":
-		if incomingSessionID != "" && authID != "" {
-			_ = doc.Set("request.sessionId", scopeIncomingAntigravitySessionID(authID, incomingSessionID, derivedSessionID))
-		}
-	default:
-		var sessionID string
-		if authID != "" {
-			if derivedSessionID != "" || incomingSessionID != "" {
-				sessionID = scopeIncomingAntigravitySessionID(authID, incomingSessionID, derivedSessionID)
-			}
-		} else {
-			sessionID = incomingSessionID
-			if sessionID == "" {
-				sessionID = derivedSessionID
-			}
-		}
-		if sessionID == "" {
-			sessionID = generateStableSessionIDDocForAuth(doc, authID)
-		}
-		_ = doc.Set("request.sessionId", sessionID)
-		if reqType == "agent" {
-			helps.ApplyAntigravityAgentEnvelope(doc, auth, sessionID, modelName, selection.Enum)
-		} else if strings.TrimSpace(doc.Get("requestId").String()) == "" {
-			_ = doc.Set("requestId", reqType+"/"+uuid.NewString())
+	lastStepIndex, llmTurnCount := helps.CountAntigravityAgentSteps(template)
+	conv := helps.ResolveAntigravityConversation(
+		credScope,
+		explicitSessionID,
+		derivedSessionID,
+		helps.AntigravityRootFingerprint(template),
+		llmTurnCount,
+	)
+
+	template, _ = ojson.SetBytes(template, "request.sessionId", conv.SessionID)
+	if isImageModel {
+		template, _ = ojson.SetBytes(template, "requestId", generateImageGenRequestID())
+	} else if strings.EqualFold(reqType, "web_search") {
+		template, _ = ojson.SetBytes(template, "requestId", generateWebSearchRequestID())
+	} else {
+		template, _ = ojson.SetBytes(template, "requestId", generateAgentRequestID(conv.CascadeID, conv.TrajectoryID, lastStepIndex))
+	}
+	template = applyAntigravityAgentLabels(template, modelName, conv.CascadeID, conv.TrajectoryID, lastStepIndex, llmTurnCount)
+	if !isImageModel && !strings.EqualFold(reqType, "web_search") {
+		template = helps.WrapAntigravityUserRequests(template, conv.TrajectoryID, conv.CreatedAt)
+	}
+	template, _ = ojson.DeleteBytes(template, "request.session_id")
+
+	if sys := ojson.GetBytes(template, "request.systemInstruction"); sys.Exists() && sys.IsObject() {
+		if sys.Get("role").String() != "user" {
+			template, _ = ojson.SetBytes(template, "request.systemInstruction.role", "user")
 		}
 	}
 
-	_ = doc.Delete("request.safetySettings")
-	if toolConfig := doc.Get("toolConfig"); toolConfig.Exists() && !doc.Get("request.toolConfig").Exists() {
-		_ = doc.SetRawBytes("request.toolConfig", []byte(toolConfig.Raw))
-		_ = doc.Delete("toolConfig")
+	template, _ = ojson.DeleteBytes(template, "request.stream")
+	template, _ = ojson.DeleteBytes(template, "request.safetySettings")
+	template, _ = ojson.DeleteBytes(template, "request.safety_settings")
+	template, _ = ojson.DeleteBytes(template, "request.cachedContent")
+	template, _ = ojson.DeleteBytes(template, "request.cached_content")
+	if toolConfig := ojson.GetBytes(template, "toolConfig"); toolConfig.Exists() && !ojson.GetBytes(template, "request.toolConfig").Exists() {
+		template, _ = ojson.SetRawBytes(template, "request.toolConfig", []byte(toolConfig.Raw))
+		template, _ = ojson.DeleteBytes(template, "toolConfig")
 	}
-	return !isImageModel && reqType == "agent"
+	return template
 }
 
-func scopeIncomingAntigravitySessionID(authID, incomingSessionID, derivedSessionID string) string {
-	if derivedSessionID != "" {
-		return derivedSessionID
-	}
-	return helps.ScopeAntigravitySessionIDForAuth(authID, incomingSessionID)
+func generateAgentRequestID(cascadeID, trajectoryID string, lastStepIndex int) string {
+	return fmt.Sprintf("agent/%s/%d/%s/%d", cascadeID, time.Now().UnixMilli(), trajectoryID, lastStepIndex+1)
 }
 
 func generateImageGenRequestID() string {
 	return fmt.Sprintf("image_gen/%d/%s/12", time.Now().UnixMilli(), uuid.NewString())
 }
 
-func generateSessionID() string {
-	randSourceMutex.Lock()
-	n := int64(randSource.Uint64())
-	randSourceMutex.Unlock()
-	return strconv.FormatInt(n, 10)
+func generateWebSearchRequestID() string {
+	return fmt.Sprintf("web_search/%d/%s/12", time.Now().UnixMilli(), uuid.NewString())
 }
 
-func generateStableSessionID(payload []byte) string {
+func applyAntigravityAgentLabels(payload []byte, modelName, cascadeID, trajectoryID string, lastStepIndex, llmTurnCount int) []byte {
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	isClaude := strings.Contains(lowerModel, "claude")
+	isNonGemini := !strings.Contains(lowerModel, "gemini")
+
+	labels := map[string]string{
+		"cascade_id":               cascadeID,
+		"last_step_index":          strconv.Itoa(lastStepIndex),
+		"request_id":               fmt.Sprintf("%s-%d", trajectoryID, llmTurnCount),
+		"root_cascade_id":          cascadeID,
+		"trajectory_id":            trajectoryID,
+		"used_claude":              strconv.FormatBool(isClaude),
+		"used_claude_conservative": strconv.FormatBool(isClaude),
+		"used_non_gemini_model":    strconv.FormatBool(isNonGemini),
+	}
+	if modelEnum := helps.AntigravityModelEnum(modelName); modelEnum != "" {
+		labels["model_enum"] = modelEnum
+	}
+	updated, err := ojson.SetBytes(payload, "request.labels", labels)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func agyGenerateSessionID() string {
+	return helps.AntigravityHashSessionID(uuid.NewString())
+}
+
+func agyGenerateStableSessionID(payload []byte) string {
 	contents := util.GetGJSONBytesNoCopy(payload, "request.contents")
 	if !contents.IsArray() {
-		contents = util.GetGJSONBytesNoCopy(payload, "contents")
-	}
-	return generateStableSessionIDFromContents(contents)
-}
-
-func generateStableSessionIDDoc(doc *ojson.Doc) string {
-	return generateStableSessionIDDocForAuth(doc, "")
-}
-
-func generateStableSessionIDDocForAuth(doc *ojson.Doc, authID string) string {
-	if doc == nil {
-		return generateSessionID()
-	}
-	contents := doc.Get("request.contents")
-	if !contents.IsArray() {
-		contents = doc.Get("contents")
-	}
-	return generateStableSessionIDFromContentsForAuth(contents, authID)
-}
-
-func generateStableSessionIDFromContents(contents ojson.Result) string {
-	return generateStableSessionIDFromContentsForAuth(contents, "")
-}
-
-func generateStableSessionIDFromContentsForAuth(contents ojson.Result, authID string) string {
-	if !contents.IsArray() {
-		return generateSessionID()
+		return agyGenerateSessionID()
 	}
 
-	authID = strings.TrimSpace(authID)
 	stableID := ""
 	contents.ForEach(func(_, content ojson.Result) bool {
 		if content.Get("role").String() != "user" {
 			return true
 		}
-		text := ""
-		if parts := content.Get("parts"); parts.IsArray() {
-			parts.ForEach(func(_, part ojson.Result) bool {
-				if candidate := part.Get("text").String(); candidate != "" {
-					text = candidate
-					return false
-				}
-				return true
-			})
-		}
+		text := content.Get("parts.0.text").String()
 		if text == "" {
 			return true
 		}
-		var hashInput []byte
-		if authID != "" {
-			// Place variable text and authID before the fixed domain suffix so trailing-byte
-			// changes avalanche into the sign bit of FNV-1a.
-			hashInput = []byte(text + "\x00" + authID + "\x00cli-proxy-api:antigravity:content-session")
-		} else {
-			hashInput = []byte(text)
-		}
-		stableID = helps.HashAntigravitySessionID(hashInput)
+		stableID = helps.AntigravityHashSessionID(text)
 		return false
 	})
 	if stableID != "" {
 		return stableID
 	}
-	return generateSessionID()
-}
-
-func antigravityRequestedMaxOutputTokensDoc(doc *ojson.Doc) (int, bool) {
-	if doc == nil {
-		return 0, false
-	}
-	maxOut := 0
-	found := false
-	for _, path := range []string{
-		"request.generationConfig.maxOutputTokens",
-		"request.generationConfig.max_output_tokens",
-		"request.generation_config.maxOutputTokens",
-		"request.generation_config.max_output_tokens",
-	} {
-		val := doc.Get(path)
-		if val.Exists() && val.Type == ojson.Number {
-			n := int(val.Int())
-			if !found || n > maxOut {
-				maxOut = n
-				found = true
-			}
-		}
-	}
-	return maxOut, found
+	return agyGenerateSessionID()
 }

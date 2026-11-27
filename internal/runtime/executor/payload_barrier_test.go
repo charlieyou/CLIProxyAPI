@@ -95,40 +95,6 @@ func TestPayloadBarrierCodexImageFilter(t *testing.T) {
 	}
 }
 
-func TestPayloadBarrierAntigravityRebuiltAttempts(t *testing.T) {
-	cfg := &config.Config{Payload: config.PayloadConfig{
-		Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "gemini-*"}}, Params: map[string]any{"generationConfig.maxOutputTokens": 123, "toolConfig.functionCallingConfig.mode": "CUSTOM"}}},
-		Filter:   []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "gemini-*"}}, Params: []string{"sessionId", "contents.0"}}},
-	}}
-	req := cliproxyexecutor.Request{Model: "gemini-3.1-pro-preview"}
-	body := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"first"}]},{"role":"user","parts":[{"text":"second"}]}]}}`)
-	ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", req.Model, "antigravity", "request", body, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini}))
-	executor := NewAntigravityExecutor(cfg)
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-test"}}
-	for attempt := 0; attempt < 2; attempt++ {
-		request, errBuild := executor.buildRequest(ctx, auth, "token", req.Model, body, attempt == 1, "", "https://example.invalid", "injected-session")
-		if errBuild != nil {
-			t.Fatal(errBuild)
-		}
-		wire, errRead := io.ReadAll(request.Body)
-		if errRead != nil {
-			t.Fatal(errRead)
-		}
-		if errClose := request.Body.Close(); errClose != nil {
-			t.Fatal(errClose)
-		}
-		if ojson.GetBytes(wire, "request.generationConfig.maxOutputTokens").Int() != 123 {
-			t.Fatalf("built-in cleanup undid override: %s", wire)
-		}
-		if ojson.GetBytes(wire, "request.sessionId").Exists() {
-			t.Fatalf("session reinjected: %s", wire)
-		}
-		if got := ojson.GetBytes(wire, "request.contents.#").Int(); got != 1 {
-			t.Fatalf("filter applied more than once: %s", wire)
-		}
-	}
-}
-
 func TestPayloadBarrierAIStudio(t *testing.T) {
 	cfg := &config.Config{Payload: config.PayloadConfig{
 		Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*"}}, Params: map[string]any{"generationConfig.maxOutputTokens": 900000, "generationConfig.thinkingConfig.thinkingLevel": "low"}}},
