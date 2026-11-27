@@ -406,12 +406,16 @@ func TestGeminiVertexExecutorClaudeStreamTruncationReportsError(t *testing.T) {
 	}
 }
 
-// Upstream SSE error event after message_start must not be treated as a completed
-// message for continuity/usage accounting: claudeMessageIDFromSSE must return empty
-// and ExecuteStream must surface a terminal chunk error and failed usage record.
+// Upstream SSE error event after content has started must not be treated as a
+// completed message for continuity/usage accounting: claudeMessageIDFromSSE must
+// return empty and ExecuteStream must forward the error frame, then surface a
+// terminal chunk error and failed usage record. Errors before any content are
+// covered by the pre-content retry tests instead.
 func TestClaudeExecutorStreamErrorEventDoesNotCommitContinuityAndMarksFailed(t *testing.T) {
 	sseWithError := "event: message_start\n" +
 		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
 		"event: error\n" +
 		"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
 

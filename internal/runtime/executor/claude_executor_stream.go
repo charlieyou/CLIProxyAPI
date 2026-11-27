@@ -425,15 +425,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return false
 				}
 			}
-			for scanner.Scan() {
-				line := scanner.Bytes()
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				reporter.ObserveResponseModel(line)
-				streamUsage.ObserveClaudeStream(line)
+			// forwardLine reports whether scanning must stop and whether the
+			// goroutine may continue after it.
+			forwardLine := func(line []byte) (stop, ok bool) {
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 				if errRestore != nil {
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
-					return
+					return true, false
 				}
 				line = e.restoreResponseModel(restoredLine, req.Model)
 				advisorState.ObserveSSELine(line)
@@ -442,11 +440,53 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if len(bytes.TrimSpace(line)) == 0 {
 					if !flushEvent() {
 						emitCancellation(ctx.Err())
-						return
+						return true, false
 					}
 					if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
-						break
+						return true, true
 					}
+				}
+				return false, true
+			}
+			preContentGate := &helps.ClaudeStreamPreContentGate{}
+		passthroughScan:
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				reporter.ObserveResponseModel(line)
+				streamUsage.ObserveClaudeStream(line)
+				if !preContentGate.Committed() {
+					if payload, isError := helps.ClaudeStreamErrorPayload(line); isError {
+						emitResponseError(claudeStreamErrorFromPayload(payload))
+						return
+					}
+					if preContentGate.Hold(line) {
+						continue
+					}
+					for _, held := range preContentGate.Release() {
+						stop, ok := forwardLine(held)
+						if !ok {
+							return
+						}
+						if stop {
+							break passthroughScan
+						}
+					}
+				}
+				stop, ok := forwardLine(line)
+				if !ok {
+					return
+				}
+				if stop {
+					break
+				}
+			}
+			if !preContentGate.Committed() {
+				// Nothing reached the client, so drop the held frames and let the
+				// terminal error below stay retryable.
+				preContentGate.Release()
+				if preContentGate.AwaitingErrorData() && upstreamStreamErr == nil {
+					upstreamStreamErr = statusErr{code: http.StatusBadGateway, msg: claudeStreamEndedBeforeErrorDataMessage}
 				}
 			}
 			if !flushEvent() {
@@ -491,22 +531,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var upstreamStreamErr error
 		var eventBuf bytes.Buffer
 		upstreamCompleted := false
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			eventBuf.Write(line)
-			eventBuf.WriteByte('\n')
-			if len(bytes.TrimSpace(line)) == 0 {
-				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
-				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
-				eventBuf.Reset()
-			}
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			reporter.ObserveResponseModel(line)
-			streamUsage.ObserveClaudeStream(line)
+		// translateLine reports whether scanning must stop and whether the
+		// goroutine may continue after it.
+		translateLine := func(line []byte) (stop, ok bool) {
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 			if errRestore != nil {
 				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
-				return
+				return true, false
 			}
 			line = e.restoreResponseModel(restoredLine, req.Model)
 			advisorState.ObserveSSELine(line)
@@ -539,14 +570,60 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					if !upstreamCompleted {
 						emitCancellation(ctx.Err())
 					}
-					return
+					return true, false
 				}
 			}
 			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+				return true, false
+			}
+			return upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)), true
+		}
+		preContentGate := &helps.ClaudeStreamPreContentGate{}
+	translatedScan:
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			eventBuf.Write(line)
+			eventBuf.WriteByte('\n')
+			if len(bytes.TrimSpace(line)) == 0 {
+				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
+				eventBuf.Reset()
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			reporter.ObserveResponseModel(line)
+			streamUsage.ObserveClaudeStream(line)
+			if !preContentGate.Committed() {
+				if payload, isError := helps.ClaudeStreamErrorPayload(line); isError {
+					emitResponseError(claudeStreamErrorFromPayload(payload))
+					return
+				}
+				if preContentGate.Hold(line) {
+					continue
+				}
+				for _, held := range preContentGate.Release() {
+					stop, ok := translateLine(held)
+					if !ok {
+						return
+					}
+					if stop {
+						break translatedScan
+					}
+				}
+			}
+			stop, ok := translateLine(line)
+			if !ok {
 				return
 			}
-			if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
+			if stop {
 				break
+			}
+		}
+		if !preContentGate.Committed() {
+			// Nothing reached the client, so drop the held frames and let the
+			// terminal error below stay retryable.
+			preContentGate.Release()
+			if preContentGate.AwaitingErrorData() && upstreamStreamErr == nil {
+				upstreamStreamErr = statusErr{code: http.StatusBadGateway, msg: claudeStreamEndedBeforeErrorDataMessage}
 			}
 		}
 		if eventBuf.Len() > 0 {
@@ -591,6 +668,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	return result, nil
 }
 
+const claudeStreamEndedBeforeErrorDataMessage = "claude executor: upstream stream ended before error event data"
+
+// claudeStreamErrorFromPayload turns an Anthropic SSE error event into a
+// status error whose code drives auth retry and cooldown decisions.
+func claudeStreamErrorFromPayload(payload []byte) statusErr {
+	code, message := helps.ClaudeStreamErrorStatus(payload)
+	return statusErr{code: code, msg: "claude executor: upstream returned error event: " + message}
+}
+
 func validateClaudeStreamingResponse(data []byte) error {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(nil, 52_428_800)
@@ -616,14 +702,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 		root := util.ParseGJSONBytesNoCopy(payload)
 		switch root.Get("type").String() {
 		case "error":
-			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
-			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			return claudeStreamErrorFromPayload(payload)
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
