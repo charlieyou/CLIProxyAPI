@@ -10,7 +10,8 @@ swap_size_mb = 512
   TZ = "America/New_York"
 
 [processes]
-  app = "/CLIProxyAPI/CLIProxyAPI --config /data/config.yaml"
+  # wireproxy serves socks5h://127.0.0.1:1080 over the home WireGuard tunnel in /data/wireproxy.conf; fly-wireproxy.sh keeps it running.
+  app = "sh -c 'sh /CLIProxyAPI/fly-wireproxy.sh & exec /CLIProxyAPI/CLIProxyAPI --config /data/config.yaml'"
 
 [http_service]
   internal_port = 8317
