@@ -2500,8 +2500,12 @@ func (m *Manager) markResult(ctx context.Context, result Result) bool {
 	if authSnapshot != nil && len(projections) > 0 {
 		reg.ApplyClientModelProjections(result.AuthID, regEpoch, authSnapshot.Generation, projections)
 	}
-	// A 429 is the cue to refresh usage windows for quota-aware routing.
-	if authSnapshot != nil && !result.Success && statusCodeFromResult(result.Error) == http.StatusTooManyRequests {
+	// A 429 is the cue to refresh usage windows for quota-aware routing. Antigravity
+	// usage changes only on the account serving requests, and that account's token is
+	// fresh, so it is refreshed after every success too; refreshQuota skips the fetch
+	// while the cached windows are younger than stale_threshold/2.
+	is429 := !result.Success && statusCodeFromResult(result.Error) == http.StatusTooManyRequests
+	if authSnapshot != nil && (is429 || (result.Success && authSnapshot.Provider == "antigravity")) {
 		quotaProvider := strings.TrimSpace(result.Provider)
 		if quotaProvider == "" {
 			quotaProvider = strings.TrimSpace(authSnapshot.Provider)

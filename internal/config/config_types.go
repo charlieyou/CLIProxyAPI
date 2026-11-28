@@ -717,7 +717,7 @@ func DefaultQuotaRefreshConfig() QuotaRefreshConfig {
 
 // Validate checks that enabled_providers contains only providers with a usage endpoint.
 func (c *QuotaRefreshConfig) Validate() error {
-	validKeys := []string{constant.Claude, constant.Codex}
+	validKeys := []string{constant.Claude, constant.Codex, constant.Antigravity}
 	for _, p := range c.EnabledProviders {
 		if !slices.Contains(validKeys, p) {
 			return fmt.Errorf("quota-refresh.enabled_providers: unknown provider %q (valid: %s)", p, strings.Join(validKeys, ", "))

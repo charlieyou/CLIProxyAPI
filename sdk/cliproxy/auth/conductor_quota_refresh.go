@@ -138,14 +138,18 @@ func (m *Manager) quotaSnapshotsForSelectorLocked(auths []*Auth) map[string]Quot
 // enqueueInitialQuotaRefresh queues initial quota refreshes for eligible auths.
 // This runs once at startup to populate quota windows before any 429s occur.
 func (m *Manager) enqueueInitialQuotaRefresh(ctx context.Context) {
-	m.enqueueEligibleQuotaRefresh(ctx, "initial check")
+	m.enqueueEligibleQuotaRefresh(ctx, "initial check", false)
 }
 
 // enqueueEligibleQuotaRefresh queues quota refreshes for every eligible auth
 // (quota-refresh enabled, not read-only, provider in EnabledProviders, not
 // disabled). It is the shared body behind both the startup population and the
-// periodic refresh loop; reason is only used for log context.
-func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string) {
+// periodic refresh loop; reason is only used for log context. The periodic loop
+// skips Antigravity accounts that already have their weekly bucket: an idle
+// account's usage cannot change, so it is refreshed after it serves a request
+// instead, without refreshing idle accounts' tokens. Accounts whose fetch has not
+// succeeded yet keep retrying.
+func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string, periodic bool) {
 	if m == nil {
 		return
 	}
@@ -171,6 +175,9 @@ func (m *Manager) enqueueEligibleQuotaRefresh(ctx context.Context, reason string
 			continue
 		}
 		if !slices.Contains(cfg.EnabledProviders, auth.Provider) {
+			continue
+		}
+		if _, hasWeekly := quotaWindowNamed(auth.QuotaWindows.Windows, "gemini-weekly"); periodic && auth.Provider == "antigravity" && hasWeekly {
 			continue
 		}
 		ids = append(ids, auth.ID)
@@ -230,7 +237,7 @@ func (m *Manager) periodicQuotaRefresh(ctx context.Context) {
 			if !m.quotaRefreshEnabled("") {
 				continue
 			}
-			m.enqueueEligibleQuotaRefresh(ctx, "periodic refresh")
+			m.enqueueEligibleQuotaRefresh(ctx, "periodic refresh", true)
 		}
 	}
 }
@@ -334,7 +341,27 @@ func (m *Manager) refreshQuota(ctx context.Context, authID string, afterReset bo
 		return &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "quota provider unavailable"}
 	}
 
-	windows, err := provider.FetchWindows(ctx, authClone, "")
+	fetchAuth := authClone
+	var err error
+	if providerKey == "antigravity" {
+		// Antigravity refreshes access tokens only while preparing a request, so an
+		// idle account's token has usually expired by the startup fetch. Refresh and
+		// persist it first.
+		var prepared *Auth
+		if prepared, err = m.prepareRequestAuth(ctx, m.executorFor(providerKey), authClone); prepared != nil {
+			fetchAuth = prepared
+		}
+	}
+	var windows []QuotaWindow
+	if err == nil {
+		if viaExecutor, ok := provider.(ExecutorQuotaProvider); ok {
+			windows, err = viaExecutor.FetchWindowsVia(ctx, fetchAuth, func(req *http.Request) (*http.Response, error) {
+				return m.HttpRequest(ctx, fetchAuth, req)
+			})
+		} else {
+			windows, err = provider.FetchWindows(ctx, fetchAuth, "")
+		}
+	}
 
 	// If the worker was cancelled mid-fetch (e.g., StartAutoRefresh restart),
 	// don't write a stale error back over potentially-good state from a new
@@ -393,7 +420,7 @@ func (m *Manager) refreshQuota(ctx context.Context, authID string, afterReset bo
 	var recovered bool
 	var recoverySnapshot *Auth
 	// Usage fetched before a newer request failed must not undo that failure.
-	if !auth.Disabled && auth.Status != StatusDisabled && auth.Generation == authClone.Generation {
+	if !auth.Disabled && auth.Status != StatusDisabled && auth.Generation == fetchAuth.Generation {
 		if !afterReset {
 			resumedModels, recovered = reconcileQuotaWindowRollovers(auth, previousWindows, windows, now)
 		}

@@ -9,7 +9,7 @@ import "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 //
 // Important: This function does NOT register providers on its own. You must
 // still import this quota package for registration to occur. All providers
-// (Claude, Codex) are defined within this package and register
+// (Claude, Codex, Antigravity) are defined within this package and register
 // via init() functions when the package is imported.
 //
 // Primary pattern (preferred): Use blank import in main.go

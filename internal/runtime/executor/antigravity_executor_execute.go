@@ -153,7 +153,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		err = errReq
 		return resp, err
 	}
-	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth)
+	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth, opts)
 	if errLimit != nil {
 		err = errLimit
 		return resp, err

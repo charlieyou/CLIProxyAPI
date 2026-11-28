@@ -24,7 +24,9 @@ func (e *AntigravityExecutor) SkipPrepareRequestAuthForCountTokens() bool {
 // CountTokens estimates token count locally for Antigravity requests without
 // calling any upstream endpoint, matching agy 1.5.14 which never sends
 // /v1internal:countTokens requests with the user's OAuth token.
-func (e *AntigravityExecutor) CountTokens(ctx context.Context, _ *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	// Tokens are counted locally, so free the slot routing reserved for this request.
+	helps.ReleaseAntigravityReservation(antigravityTransportScope(auth), capacityReservationKey(opts))
 	suffix := agythinking.ParseSuffix(req.Model)
 	baseModel := suffix.ModelName
 

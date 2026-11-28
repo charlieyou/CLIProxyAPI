@@ -9,6 +9,9 @@ import (
 const (
 	rpmWindow                      = time.Minute
 	antigravityRateLimiterCapacity = 512
+	// antigravityReservationTTL bounds how long a routing reservation holds a slot
+	// for a request that never reaches Acquire, such as one that failed while preparing.
+	antigravityReservationTTL = 10 * time.Second
 )
 
 var (
@@ -34,6 +37,8 @@ type antigravityRateEntry struct {
 	pending    int
 	timestamps []time.Time
 	notify     chan struct{}
+	// reservations maps each routing reservation's key to its expiry.
+	reservations map[string]time.Time
 }
 
 // NewAntigravityRateLimiter returns an AntigravityRateLimiter with the default
@@ -55,6 +60,78 @@ func AcquireAntigravityRateLimit(ctx context.Context, credScope string, maxConcu
 		return noopRateLimitRelease, nil
 	}
 	return defaultAntigravityRateLimiter.Acquire(ctx, credScope, maxConcurrent, maxRPM)
+}
+
+// AntigravityReserve reserves a slot for credScope on the package-level limiter.
+// See AntigravityRateLimiter.Reserve.
+func AntigravityReserve(credScope, key string, maxConcurrent, maxRPM int, force bool) bool {
+	return defaultAntigravityRateLimiter.Reserve(credScope, key, maxConcurrent, maxRPM, force)
+}
+
+// ReleaseAntigravityReservation drops the reservation key holds on credScope,
+// for a routed request that will not call Acquire.
+func ReleaseAntigravityReservation(credScope, key string) {
+	defaultAntigravityRateLimiter.ReleaseReservation(credScope, key)
+}
+
+type antigravityReservationKey struct{}
+
+// WithAntigravityReservation tells Acquire which routing reservation the
+// request holds, so it turns that reservation, and no other, into its slot.
+func WithAntigravityReservation(ctx context.Context, key string) context.Context {
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, antigravityReservationKey{}, key)
+}
+
+// Reserve holds a slot on credScope under key for a request being routed there,
+// until that request calls Acquire with the same key, calls ReleaseReservation,
+// or antigravityReservationTTL passes. Requests routed at the same moment then
+// see the slot as taken. Unless force is set, it reports false, reserving
+// nothing, when the credential's in-flight, waiting, and reserved requests
+// already reach a cap. Reservations only steer routing: Acquire never waits for them.
+func (l *AntigravityRateLimiter) Reserve(credScope, key string, maxConcurrent, maxRPM int, force bool) bool {
+	if l == nil || credScope == "" || key == "" || (maxConcurrent <= 0 && maxRPM <= 0) {
+		return true
+	}
+	l.mu.Lock()
+	entry := l.entryLocked(credScope)
+	entry.mu.Lock()
+	l.mu.Unlock()
+	defer entry.mu.Unlock()
+
+	now := l.currentTime()
+	entry.pruneTimestampsLocked(now, l.rpmWindow())
+	entry.pruneReservationsLocked(now)
+	claimed := entry.pending + len(entry.reservations)
+	if !force && maxConcurrent > 0 && entry.inFlight+claimed >= maxConcurrent {
+		return false
+	}
+	if !force && maxRPM > 0 && len(entry.timestamps)+claimed >= maxRPM {
+		return false
+	}
+	if entry.reservations == nil {
+		entry.reservations = make(map[string]time.Time)
+	}
+	entry.reservations[key] = now.Add(antigravityReservationTTL)
+	return true
+}
+
+// ReleaseReservation drops the reservation key holds on credScope, if any.
+func (l *AntigravityRateLimiter) ReleaseReservation(credScope, key string) {
+	if l == nil || credScope == "" || key == "" {
+		return
+	}
+	l.mu.Lock()
+	entry := l.entries[credScope]
+	l.mu.Unlock()
+	if entry == nil {
+		return
+	}
+	entry.mu.Lock()
+	delete(entry.reservations, key)
+	entry.mu.Unlock()
 }
 
 // ResetAntigravityRateLimiters clears all per-credential state on the
@@ -87,7 +164,8 @@ func (l *AntigravityRateLimiter) Acquire(ctx context.Context, credScope string, 
 		return nil, errCtx
 	}
 
-	entry := l.acquireEntry(credScope)
+	key, _ := ctx.Value(antigravityReservationKey{}).(string)
+	entry := l.acquireEntry(credScope, key)
 	window := l.rpmWindow()
 
 	for {
@@ -160,8 +238,21 @@ func (l *AntigravityRateLimiter) Acquire(ctx context.Context, credScope string, 
 	}
 }
 
-func (l *AntigravityRateLimiter) acquireEntry(credScope string) *antigravityRateEntry {
+func (l *AntigravityRateLimiter) acquireEntry(credScope, key string) *antigravityRateEntry {
 	l.mu.Lock()
+	entry := l.entryLocked(credScope)
+	entry.mu.Lock()
+	entry.pending++
+	// The request now counts as pending, so its own reservation is no longer needed.
+	delete(entry.reservations, key)
+	entry.mu.Unlock()
+	l.mu.Unlock()
+	return entry
+}
+
+// entryLocked returns credScope's entry, creating it when missing.
+// REQUIRES: caller holds l.mu.
+func (l *AntigravityRateLimiter) entryLocked(credScope string) *antigravityRateEntry {
 	if l.entries == nil {
 		l.entries = make(map[string]*antigravityRateEntry)
 	}
@@ -177,10 +268,6 @@ func (l *AntigravityRateLimiter) acquireEntry(credScope string) *antigravityRate
 		entry = newAntigravityRateEntry()
 		l.entries[credScope] = entry
 	}
-	entry.mu.Lock()
-	entry.pending++
-	entry.mu.Unlock()
-	l.mu.Unlock()
 	return entry
 }
 
@@ -188,7 +275,8 @@ func (l *AntigravityRateLimiter) pruneIdleLocked(now time.Time, window time.Dura
 	for scope, entry := range l.entries {
 		entry.mu.Lock()
 		entry.pruneTimestampsLocked(now, window)
-		idle := entry.pending == 0 && entry.inFlight == 0 && len(entry.timestamps) == 0
+		entry.pruneReservationsLocked(now)
+		idle := entry.pending == 0 && entry.inFlight == 0 && len(entry.timestamps) == 0 && len(entry.reservations) == 0
 		entry.mu.Unlock()
 		if idle {
 			delete(l.entries, scope)
@@ -252,6 +340,14 @@ func (e *antigravityRateEntry) releaseSlot() {
 	close(e.notify)
 	e.notify = make(chan struct{})
 	e.mu.Unlock()
+}
+
+func (e *antigravityRateEntry) pruneReservationsLocked(now time.Time) {
+	for key, expiry := range e.reservations {
+		if !expiry.After(now) {
+			delete(e.reservations, key)
+		}
+	}
 }
 
 func (e *antigravityRateEntry) pruneTimestampsLocked(now time.Time, window time.Duration) {

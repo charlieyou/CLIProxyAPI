@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util/agyutil"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -567,7 +568,7 @@ func antigravityEndpointName(usedAICode bool) string {
 	return "ccpa"
 }
 
-func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, auth *cliproxyauth.Auth) (func(), error) {
+func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) (func(), error) {
 	if e == nil || e.cfg == nil {
 		return func() {}, nil
 	}
@@ -576,7 +577,27 @@ func (e *AntigravityExecutor) acquireAntigravityRateLimit(ctx context.Context, a
 	if maxConcurrent <= 0 && maxRPM <= 0 {
 		return func() {}, nil
 	}
-	return helps.AcquireAntigravityRateLimit(ctx, antigravityTransportScope(auth), maxConcurrent, maxRPM)
+	return helps.AcquireAntigravityRateLimit(helps.WithAntigravityReservation(ctx, capacityReservationKey(opts)), antigravityTransportScope(auth), maxConcurrent, maxRPM)
+}
+
+func capacityReservationKey(opts cliproxyexecutor.Options) string {
+	key, _ := opts.Metadata[cliproxyexecutor.CapacityReservationMetadataKey].(string)
+	return key
+}
+
+// CapacityLimited reports whether antigravity.max-concurrent-requests or max-rpm is set.
+func (e *AntigravityExecutor) CapacityLimited() bool {
+	return e != nil && e.cfg != nil && (e.cfg.Antigravity.MaxConcurrentRequests > 0 || e.cfg.Antigravity.MaxRPM > 0)
+}
+
+// ReserveCapacity reserves one of auth's concurrency and RPM slots under key for
+// a request being routed to it. Unless force is set, it reports false when auth
+// would make the request wait, letting fill-first routing move on to the next credential.
+func (e *AntigravityExecutor) ReserveCapacity(auth *cliproxyauth.Auth, key string, force bool) bool {
+	if !e.CapacityLimited() {
+		return true
+	}
+	return helps.AntigravityReserve(antigravityTransportScope(auth), key, e.cfg.Antigravity.MaxConcurrentRequests, e.cfg.Antigravity.MaxRPM, force)
 }
 
 func withAntigravityLatencyTrace(ctx context.Context, req *http.Request) *http.Request {

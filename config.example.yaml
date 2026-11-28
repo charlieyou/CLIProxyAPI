@@ -181,6 +181,9 @@ access:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  # fill-first skips a credential that is at its Antigravity max-concurrent-requests or
+  # max-rpm cap while another credential in the same priority tier is free; when all are
+  # busy, the request queues on the first one.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # Sticky requests (including inherited and LCP bindings) also consume weighted credits
@@ -233,7 +236,9 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
   # Quota refresh: fetch usage windows on 429 to drive quota-aware fill-first routing
-  # (credentials whose usage window resets soonest are used first). Ignored in Home mode.
+  # (credentials whose usage window resets soonest are used first; Antigravity ranks by its
+  # Gemini weekly bucket and refetches an account only after it serves a request, never
+  # polling idle ones). Ignored in Home mode.
   # Usage windows are also refetched at half stale_threshold (with jitter); blocked accounts
   # use the same cache cadence. Usage API 429s back off 30m -> 1h -> 2h.
   # After an upstream manual reset, POST /v8/management/routing/quota/refresh with auth_index.
@@ -241,7 +246,7 @@ routing:
   #   enabled: false              # Enable quota refresh (default: false)
   #   read_only_mode: false       # If true, never modify auth state (default: false)
   #   stale_threshold: 1h         # Treat cached windows older than this as unknown
-  #   enabled_providers: []       # Providers to enable (claude, codex)
+  #   enabled_providers: []       # Providers to enable (claude, codex, antigravity)
   # Usage expiration trigger: sends minimal prompts to refresh null resets_at timestamps.
   # usage-expiration-trigger:
   #   enabled: false                        # Enable the feature (default: false)

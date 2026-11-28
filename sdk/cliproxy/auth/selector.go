@@ -1253,6 +1253,9 @@ func saturatingAddInt64(value, delta int64) int64 {
 // Pick selects the first available auth for the provider in a deterministic manner.
 // When quota-aware routing is enabled, the manager supplies quota snapshots via
 // WithQuotaSnapshots and candidates are ranked by their usage windows.
+// When the manager supplies a capacity reserver, Pick claims a slot on the first
+// candidate that can start the request without waiting on its executor's
+// concurrency or rate cap, and falls back to the first candidate when all are busy.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -1263,14 +1266,19 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 
 	qs := s.quotaSettings
-	if !qs.Enabled || qs.ReadOnlyMode || len(available) < 2 {
-		return available[0], nil
+	if qs.Enabled && !qs.ReadOnlyMode && len(available) > 1 {
+		if snapshots := quotaSnapshotsFromContext(ctx); snapshots != nil {
+			available = rankAuthsByQuota(available, snapshots, qs, now)
+		}
 	}
-	snapshots := quotaSnapshotsFromContext(ctx)
-	if snapshots == nil {
-		return available[0], nil
+	if reserve := capacityReserverFromContext(ctx); reserve != nil {
+		for _, auth := range available {
+			if reserve(auth) {
+				return auth, nil
+			}
+		}
 	}
-	return rankAuthsByQuota(available, snapshots, qs, now)[0], nil
+	return available[0], nil
 }
 
 // rankAuthsByQuota orders candidates for quota-aware fill-first selection.
@@ -1351,7 +1359,8 @@ type quotaMetrics struct {
 }
 
 // preferredQuotaWindowName returns the long window that should drive routing:
-// seven_day for Claude and secondary for Codex, avoiding short-window bias.
+// seven_day for Claude, secondary for Codex, and the Gemini weekly bucket for
+// Antigravity, avoiding short-window bias.
 func preferredQuotaWindowName(windows []QuotaWindow) string {
 	preferred := ""
 	for _, w := range windows {
@@ -1361,6 +1370,10 @@ func preferredQuotaWindowName(windows []QuotaWindow) string {
 		case "primary", "secondary":
 			if preferred == "" {
 				preferred = "secondary"
+			}
+		case "gemini-weekly", "gemini-5h":
+			if preferred == "" {
+				preferred = "gemini-weekly"
 			}
 		}
 	}
@@ -1388,6 +1401,16 @@ func preferredQuotaWindow(windows []QuotaWindow, now time.Time) (QuotaWindow, bo
 // quotaMetricsFromSnapshot extracts routing metrics from an immutable QuotaWindowState snapshot.
 // Returns the metrics for the preferred (or soonest-expiring) window and whether the data is known (not stale).
 func quotaMetricsFromSnapshot(snap QuotaWindowState, now time.Time, staleThreshold time.Duration) (metrics quotaMetrics, known bool) {
+	// Antigravity's weekly bucket keeps its reset time once usage starts it and fully
+	// refills at that time, and its usage changes only when the proxy uses the account,
+	// which refetches it. So the snapshot stays accurate however old it is: a passed or
+	// missing reset time means a full bucket with nothing about to expire.
+	if w, ok := quotaWindowNamed(snap.Windows, "gemini-weekly"); ok && !snap.LastFetchedAt.IsZero() {
+		if w.ResetAt.After(now) {
+			return quotaMetrics{timeToReset: w.ResetAt.Sub(now), usedPercent: w.UsedPercent, hasExpiration: true}, true
+		}
+		return quotaMetrics{timeToReset: math.MaxInt64}, true
+	}
 	unknown := quotaMetrics{timeToReset: math.MaxInt64, usedPercent: 100}
 	if snap.LastFetchedAt.IsZero() || now.Sub(snap.LastFetchedAt) > staleThreshold || len(snap.Windows) == 0 {
 		return unknown, false

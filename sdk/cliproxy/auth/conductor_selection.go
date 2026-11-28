@@ -2334,7 +2334,82 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m.quotaRefreshEnabled("") {
 		return false
 	}
-	return isBuiltInSelector(m.Selector())
+	selector := m.Selector()
+	// Capacity spillover needs the slot reservations that only the legacy path makes.
+	if _, fillFirst := selector.(*FillFirstSelector); fillFirst && m.hasCapacityLimitedExecutor() {
+		return false
+	}
+	return isBuiltInSelector(selector)
+}
+
+type capacityReserverContextKey struct{}
+
+// capacityReserverFromContext returns the function fill-first uses to claim a
+// slot on a candidate, or nil when no candidate has a capacity cap.
+func capacityReserverFromContext(ctx context.Context) func(*Auth) bool {
+	if ctx == nil {
+		return nil
+	}
+	reserve, _ := ctx.Value(capacityReserverContextKey{}).(func(*Auth) bool)
+	return reserve
+}
+
+func (m *Manager) hasCapacityLimitedExecutor() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, exec := range m.executors {
+		if reporter, ok := exec.(CapacityReporter); ok && reporter.CapacityLimited() {
+			return true
+		}
+	}
+	return false
+}
+
+// withCapacityReserver lets fill-first, alone or as the session-affinity
+// fallback, claim a slot on each candidate it considers, so it passes over a
+// credential that would make the request wait. Claiming while picking keeps
+// simultaneous requests from all choosing the same last free slot. The claim is
+// keyed to this attempt through opts.Metadata, so only this attempt's request
+// turns it into a slot. Call the returned function with the selected auth: it
+// reserves a slot, past any cap, when the pick made none (a session-affinity
+// binding, or every candidate busy), so every routed request counts before it
+// reaches its executor. Must be called without m.mu held.
+func (m *Manager) withCapacityReserver(ctx context.Context, selector Selector, auths []*Auth, opts cliproxyexecutor.Options) (context.Context, func(*Auth)) {
+	noClaim := func(*Auth) {}
+	if affinity, ok := selector.(*SessionAffinitySelector); ok && affinity != nil {
+		selector = affinity.fallback
+	}
+	if _, fillFirst := selector.(*FillFirstSelector); !fillFirst {
+		return ctx, noClaim
+	}
+	reporters := make(map[string]CapacityReporter)
+	for _, auth := range auths {
+		if reporter, ok := m.executorFor(executorKeyFromAuth(auth)).(CapacityReporter); ok && reporter.CapacityLimited() {
+			reporters[auth.ID] = reporter
+		}
+	}
+	if len(reporters) == 0 {
+		return ctx, noClaim
+	}
+	key := uuid.NewString()
+	opts.Metadata[cliproxyexecutor.CapacityReservationMetadataKey] = key
+	reservedID := ""
+	reserve := func(auth *Auth) bool {
+		if reporter := reporters[auth.ID]; reporter != nil && !reporter.ReserveCapacity(auth, key, false) {
+			return false
+		}
+		reservedID = auth.ID
+		return true
+	}
+	claim := func(selected *Auth) {
+		if selected == nil || selected.ID == reservedID {
+			return
+		}
+		if reporter, ok := m.executorFor(executorKeyFromAuth(selected)).(CapacityReporter); ok && reporter.CapacityLimited() {
+			reporter.ReserveCapacity(selected, key, true)
+		}
+	}
+	return context.WithValue(ctx, capacityReserverContextKey{}, reserve), claim
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -2589,10 +2664,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if quotaSnapshots != nil {
 			selectorCtx = WithQuotaSnapshots(selectorCtx, quotaSnapshots)
 		}
+		selectorCtx, claimReservation := m.withCapacityReserver(selectorCtx, selector, selectorAuths, opts)
 		if accountingAuths != nil {
 			selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
 		}
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
+		if errPick == nil {
+			claimReservation(selected)
+		}
 		if errPick != nil {
 			if isAuthNotFoundError(errPick) {
 				if errAvailable != nil {
@@ -3094,6 +3173,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if quotaSnapshots != nil {
 			selectorCtx = WithQuotaSnapshots(selectorCtx, quotaSnapshots)
 		}
+		selectorCtx, claimReservation := m.withCapacityReserver(selectorCtx, selector, selectorAuths, opts)
 		if accountingAuths != nil {
 			selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
 		}
@@ -3116,6 +3196,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			}
 		}
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
+		if errPick == nil {
+			claimReservation(selected)
+		}
 		if errPick != nil {
 			if isAuthNotFoundError(errPick) {
 				if errAvailable != nil {

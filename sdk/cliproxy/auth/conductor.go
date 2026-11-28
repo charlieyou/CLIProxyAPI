@@ -45,6 +45,19 @@ type RequestAuthPreparer interface {
 	PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error)
 }
 
+// CapacityReporter is implemented by executors that queue requests behind a
+// per-credential concurrency or rate cap. Fill-first routing uses it to move
+// past a busy credential instead of queueing behind it.
+type CapacityReporter interface {
+	// CapacityLimited reports whether any per-credential cap is configured.
+	CapacityLimited() bool
+	// ReserveCapacity reserves a slot on auth under key for a request being routed
+	// to it. Unless force is set, it reports false, reserving nothing, when auth
+	// would make the request wait. The executor receives key in the request's
+	// CapacityReservationMetadataKey metadata.
+	ReserveCapacity(auth *Auth, key string, force bool) bool
+}
+
 // HomePluginRequestAuthPreparer lets a credential provider also prepare auth
 // that a Home-selected plugin will consume without running the provider executor.
 type HomePluginRequestAuthPreparer interface {

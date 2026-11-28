@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -159,4 +160,104 @@ func TestFillFirstSelectorPick_NearbyQuotaResetsStayInSameCohort(t *testing.T) {
 			t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "rwa")
 		}
 	}
+}
+
+func TestFillFirstSelectorPick_AntigravityPrefersGeminiWeekly(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	snapshots := map[string]QuotaWindowState{
+		// Weekly bucket just reset, so Antigravity omits its reset time; the 5-hour
+		// window still carries earlier usage. Nothing weekly is about to expire here.
+		"fresh": {LastFetchedAt: now, Windows: []QuotaWindow{
+			{Name: "gemini-weekly"},
+			{Name: "gemini-5h", ResetAt: now.Add(150 * time.Minute), UsedPercent: 40},
+		}},
+		// Fetched before its weekly reset passed: the bucket has refilled since.
+		"rolled": {LastFetchedAt: now.Add(-6 * time.Hour), Windows: []QuotaWindow{
+			{Name: "gemini-weekly", ResetAt: now.Add(-time.Hour), UsedPercent: 95},
+			{Name: "gemini-5h", ResetAt: now.Add(-2 * time.Hour), UsedPercent: 10},
+		}},
+		// Soonest 5-hour reset, but the weekly bucket resets later.
+		"a": {LastFetchedAt: now, Windows: []QuotaWindow{
+			{Name: "gemini-weekly", ResetAt: now.Add(96 * time.Hour), UsedPercent: 30},
+			{Name: "gemini-5h", ResetAt: now.Add(time.Hour), UsedPercent: 30},
+		}},
+		// Idle for longer than stale_threshold: its weekly reset time is still valid,
+		// so it must keep ranking first instead of becoming "unknown".
+		"idle": {LastFetchedAt: now.Add(-5 * time.Hour), Windows: []QuotaWindow{
+			{Name: "gemini-weekly", ResetAt: now.Add(48 * time.Hour), UsedPercent: 60},
+			{Name: "gemini-5h", ResetAt: now.Add(-4 * time.Hour), UsedPercent: 10},
+		}},
+	}
+	settings := QuotaRefreshSettings{Enabled: true, StaleThreshold: time.Hour, EnabledProviders: []string{"antigravity"}}
+	auths := []*Auth{{ID: "fresh", Provider: "antigravity"}, {ID: "rolled", Provider: "antigravity"}, {ID: "a", Provider: "antigravity"}, {ID: "idle", Provider: "antigravity"}}
+	ranked := rankAuthsByQuota(auths, snapshots, settings, now)
+	got := make([]string, len(ranked))
+	for i, auth := range ranked {
+		got[i] = auth.ID
+	}
+	// Soonest weekly reset first; full buckets (0% used, tied, so by ID) last.
+	if want := []string{"idle", "a", "fresh", "rolled"}; !slices.Equal(got, want) {
+		t.Fatalf("rankAuthsByQuota() = %v, want %v", got, want)
+	}
+}
+
+// capacityTestExecutor gives each credential `slots` reservations that are never released.
+type capacityTestExecutor struct {
+	schedulerTestExecutor
+	limited  bool
+	slots    int
+	reserved map[string]int
+}
+
+func (e *capacityTestExecutor) CapacityLimited() bool { return e.limited }
+
+func (e *capacityTestExecutor) ReserveCapacity(auth *Auth, _ string, force bool) bool {
+	if !force && e.reserved[auth.ID] >= e.slots {
+		return false
+	}
+	e.reserved[auth.ID]++
+	return true
+}
+
+func TestManagerSelectAuth_FillFirstSpillsOverBusyCredential(t *testing.T) {
+	exec := &capacityTestExecutor{schedulerTestExecutor: schedulerTestExecutor{provider: "antigravity"}, limited: true, slots: 1, reserved: map[string]int{}}
+	manager := NewManager(nil, NewFillFirstSelector(QuotaRefreshSettings{}), nil)
+	manager.executors["antigravity"] = exec
+	for _, id := range []string{"a", "b"} {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: "antigravity"}); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", id, errRegister)
+		}
+	}
+	if manager.useSchedulerFastPath() {
+		t.Fatal("useSchedulerFastPath() = true, want false while a capacity cap is configured")
+	}
+
+	// Three picks before any request starts, as when a burst arrives at once:
+	// the second must see the first's slot as taken, and the third queues on
+	// the first credential in fill-first order once every slot is taken.
+	for i, want := range []string{"a", "b", "a"} {
+		got, errSelect := manager.SelectAuth(context.Background(), "antigravity", "", cliproxyexecutor.Options{})
+		if errSelect != nil || got == nil || got.ID != want {
+			t.Fatalf("pick %d: SelectAuth() = %v, %v; want %s", i+1, authIDOrNil(got), errSelect, want)
+		}
+	}
+	// The third pick made no reservation while choosing, so it reserves past the cap:
+	// a request heading to a credential always counts before it starts.
+	if exec.reserved["a"] != 2 || exec.reserved["b"] != 1 {
+		t.Fatalf("reserved = %v, want a:2 b:1", exec.reserved)
+	}
+
+	exec.limited = false
+	if !manager.useSchedulerFastPath() {
+		t.Fatal("useSchedulerFastPath() = false, want true without a capacity cap")
+	}
+}
+
+func authIDOrNil(auth *Auth) any {
+	if auth == nil {
+		return nil
+	}
+	return auth.ID
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -42,6 +43,15 @@ func (e *RateLimitedError) Is(target error) bool { return target == ErrQuotaRate
 type QuotaProvider interface {
 	ProviderKey() string
 	FetchWindows(ctx context.Context, a *Auth, model string) ([]QuotaWindow, error)
+}
+
+// ExecutorQuotaProvider is a QuotaProvider whose usage request must go through
+// the provider executor's HttpRequest, so it uses the credential's own
+// transport, proxy, and client headers. The manager calls FetchWindowsVia
+// instead of FetchWindows.
+type ExecutorQuotaProvider interface {
+	QuotaProvider
+	FetchWindowsVia(ctx context.Context, a *Auth, do func(*http.Request) (*http.Response, error)) ([]QuotaWindow, error)
 }
 
 // quotaProviders stores registered quota providers.

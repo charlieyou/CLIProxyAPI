@@ -46,6 +46,9 @@ const (
 	SelectionIDMetadataKey = "selection_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
+	// CapacityReservationMetadataKey identifies the slot reservation, if any, that
+	// routing made for this attempt on the selected credential's executor.
+	CapacityReservationMetadataKey = "capacity_reservation_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// SelectedAuthIndexMetadataKey stores the stable index of the auth selected by the scheduler.

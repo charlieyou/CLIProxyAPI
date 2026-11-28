@@ -155,7 +155,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		err = errReq
 		return nil, err
 	}
-	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth)
+	releaseRateLimit, errLimit := e.acquireAntigravityRateLimit(ctx, auth, opts)
 	if errLimit != nil {
 		err = errLimit
 		return nil, err

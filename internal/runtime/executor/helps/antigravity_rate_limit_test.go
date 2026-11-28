@@ -619,3 +619,71 @@ func TestAntigravityRateLimiter_ConcurrentStress(t *testing.T) {
 		t.Fatalf("peak concurrency %d exceeded maxConcurrent %d", gotPeak, maxConcurrent)
 	}
 }
+
+func TestAntigravityRateLimiter_Reserve(t *testing.T) {
+	clock := newFakeRateLimitClock(time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC))
+	limiter := NewAntigravityRateLimiter()
+	limiter.now = clock.Now
+	limiter.newTimer = clock.NewTimer
+	acquire := func(scope, key string, maxConcurrent, maxRPM int) func() {
+		t.Helper()
+		rel, err := limiter.Acquire(WithAntigravityReservation(context.Background(), key), scope, maxConcurrent, maxRPM)
+		if err != nil {
+			t.Fatalf("Acquire(%q) error = %v", key, err)
+		}
+		return rel
+	}
+
+	// Concurrency cap 2: requests routed at the same moment take both slots before either acquires.
+	if !limiter.Reserve("conc", "r1", 2, 0, false) || !limiter.Reserve("conc", "r2", 2, 0, false) {
+		t.Fatal("two reservations should fit a concurrency cap of 2")
+	}
+	if limiter.Reserve("conc", "r3", 2, 0, false) {
+		t.Fatal("a third simultaneous request should be told the credential is busy")
+	}
+	if !limiter.Reserve("other", "r3", 2, 0, false) {
+		t.Fatal("another credential's reservations must not count")
+	}
+	// A forced reservation (a request already bound to this credential) always counts.
+	if !limiter.Reserve("conc", "bound", 2, 0, true) {
+		t.Fatal("a forced reservation should be recorded past the cap")
+	}
+	limiter.ReleaseReservation("conc", "bound")
+	// r1's request turns its own reservation into its slot: still 1 in flight + r2 reserved.
+	relR1 := acquire("conc", "r1", 2, 0)
+	if limiter.Reserve("conc", "r4", 2, 0, false) {
+		t.Fatal("1 in flight + 1 reserved should fill a cap of 2")
+	}
+	// A reservation whose request never arrives stops holding its slot after the TTL.
+	clock.Advance(antigravityReservationTTL)
+	if !limiter.Reserve("conc", "r5", 2, 0, false) {
+		t.Fatal("r2 expired, so its slot should be free")
+	}
+	// A released reservation frees its slot at once.
+	limiter.ReleaseReservation("conc", "r5")
+	if !limiter.Reserve("conc", "r6", 2, 0, false) {
+		t.Fatal("r5 was released, so its slot should be free")
+	}
+	relR1()
+
+	// Concurrency cap 3: a request that reserved nothing must not consume anyone's
+	// reservation, or the next simultaneous request would land on a full credential.
+	if !limiter.Reserve("steal", "a", 3, 0, false) || !limiter.Reserve("steal", "b", 3, 0, false) {
+		t.Fatal("two reservations should fit a concurrency cap of 3")
+	}
+	relUnreserved := acquire("steal", "", 3, 0)
+	if limiter.Reserve("steal", "c", 3, 0, false) {
+		t.Fatal("1 in flight + a and b reserved should fill a cap of 3")
+	}
+	relUnreserved()
+
+	// RPM cap 2: one request this minute plus one reservation fill it, with nothing in flight.
+	acquire("rpm", "", 0, 2)()
+	if !limiter.Reserve("rpm", "x", 0, 2, false) || limiter.Reserve("rpm", "y", 0, 2, false) {
+		t.Fatal("1 request this minute + 1 reservation should fill an RPM cap of 2")
+	}
+	clock.Advance(time.Minute)
+	if !limiter.Reserve("rpm", "y", 0, 2, false) {
+		t.Fatal("RPM slots should free once the window passes")
+	}
+}
